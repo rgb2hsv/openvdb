@@ -374,6 +374,9 @@ Cells are the 2×2×2 voxel-centre cubes of the index grid.
      foreground connectivity is 18 or 26 and separated when it is 6;
    - interior (body-diagonal) ambiguities are joined only for 26 foreground,
      separated for 6 and 18;
+   - symmetrically, for a 26 background (FG6_BG26) body-diagonal OUT-corner
+     pairs are joined by a tube through the cube (the background stays
+     connected);
    - the generator emits edge-vertex triangle fans per resolved surface patch
      with consistent winding.
    This rule set is the one shown by Lachaud & Montanvert to give closed
