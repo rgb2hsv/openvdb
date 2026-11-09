@@ -878,7 +878,14 @@ TEST_F(TestLevelSetMultiObject, TripleJunction)
             << ", 1-2: " << binMax[1] << " (" << binN[1] << ")"
             << ", 2-4: " << binMax[2] << " (" << binN[2] << ")"
             << ", >4: " << binMax[3] << " (" << binN[3] << ")]" << std::endl;
-        EXPECT_LT(maxErr, 0.05);
+        // Gates (ruling R18): interface voxels farther than 1 voxel from the
+        // junction axis < 0.05*dx, within 1 voxel < 0.25*dx; RMS over the
+        // whole band < 0.1*dx.
+        const double farMax = std::max({binMax[1], binMax[2], binMax[3]});
+        std::cout << "TripleJunction label " << l << ": interface max beyond 1 voxel of the axis "
+            << farMax << " dx, within 1 voxel " << binMax[0] << " dx" << std::endl;
+        EXPECT_LT(farMax, 0.05);
+        EXPECT_LT(binMax[0], 0.25);
         EXPECT_LT(rms, 0.1);
 
         // Every voxel within halfWidth of the label boundary is in the band

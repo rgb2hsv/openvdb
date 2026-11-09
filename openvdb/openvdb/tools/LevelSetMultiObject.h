@@ -682,9 +682,22 @@ struct LabelRegionDiffers
 
 /// @brief Per-label reconstruction near junctions (spec 5.3, ruling R17).
 /// @details A seed q of @a out (active in @a seeds) outside the region
-/// {L == @a label} with a face neighbour (active or not) of a third label
-/// (neither @a label nor L(q)) holds the distance to its own label's
-/// boundary, which may not be the region's. Such seeds are rebuilt by a local
+/// {L == @a label} holds phi_q, the distance to its own label's boundary,
+/// which next to a third label may be a boundary with that label rather than
+/// the region's. It is rebuilt only if it has a face neighbour (active or
+/// not) of a third label (neither @a label nor L(q)) AND phi_q is provably
+/// not the distance to the region (ruling R18): for a planar region
+/// boundary with unit normal n, psi is linear, so the jump to a face
+/// neighbour p inside the region along axis i is
+/// phi_q + phi_p = dx*|n_i|, and the neighbour along the dominant axis of n
+/// (|n_i| >= 1/sqrt(3)) is always across the boundary when any is. A
+/// correct phi_q therefore has max_p (phi_q + phi_p) >= dx/sqrt(3) over its
+/// region seed neighbours p (phi_p is exact: region voxels store the distance
+/// to the region's own boundary); a smaller maximum means phi_q measures a
+/// nearer boundary with a third label. (Comparing crossing fractions
+/// phi_q/(phi_q + phi_n) towards third-label and region neighbours does not
+/// separate the cases: both are along-axis distances that bound the normal
+/// distances only from above.) Selected seeds are rebuilt by a local
 /// Godunov extension of psi = -phi inside / +phi outside: per axis the
 /// smallest known psi among the two face neighbours (label-side seeds, other
 /// outside seeds, rebuilt seeds once solved), then
@@ -701,6 +714,7 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
     tree::ValueAccessor<FloatTreeT> acc(out);
     tree::ValueAccessor<const BoolTreeT> seedAcc(seeds);
 
+    const double minJump = dx * (1.0 / std::sqrt(3.0) - 1e-4);
     std::vector<Coord> todo;
     std::vector<float> keep;
     for (auto it = seeds.cbeginValueOn(); it; ++it) {
@@ -713,6 +727,17 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
             third = ln != label && ln != lq;
         }
         if (!third) continue;
+        // Provably-wrong test (ruling R18): if phi_q is the distance to the
+        // region, the jump psi(q) - psi(p) = phi_q + phi_p to some region
+        // neighbour p is at least dx/sqrt(3) (see the function doc).
+        const float phiQ = acc.getValue(q);
+        double jump = 0.0;
+        for (int f = 0; f < 6; ++f) {
+            const Coord p = q + offs[f];
+            if (lab.getValue(p) != label || !seedAcc.isValueOn(p)) continue;
+            jump = std::max(jump, double(phiQ) + double(acc.getValue(p)));
+        }
+        if (jump >= minJump) continue;
         todo.push_back(q);
         keep.push_back(acc.getValue(q));
     }

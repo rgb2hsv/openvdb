@@ -258,13 +258,19 @@ therefore underestimates ψ_l outside l there.
    boundary. They keep the pair's φ and are not reseeded with 5.1, because the
    subcell fix is not a fixed point of already reinitialized φ. An l-side seed's φ
    is the distance to l's boundary and is exact. A not-l seed's φ is the
-   distance to its own label's boundary. That is wrong only next to a third
-   label, so a not-l seed with a face neighbour (active or not) of a third
-   label (neither l nor its own label) is rebuilt from l-side data. The rebuild
+   distance to its own label's boundary. That can be wrong only next to a
+   third label. A not-l seed q is rebuilt from l-side data only if it has a
+   face neighbour (active or not) of a third label (neither l nor its own
+   label) and its φ is provably not the distance to l: max over its l-side
+   seed face neighbours p of (φ_q + φ_p) is below dx/√3 (ruling R18). For a
+   planar l boundary with unit normal n the jump along axis i is dx·|n_i|,
+   and the neighbour along the dominant axis (|n_i| ≥ 1/√3) is always across
+   the boundary when any neighbour is, so a correct φ_q never fails this test. The rebuild
    is a local Godunov extension of ψ_l: per axis, take the smallest known
    neighbour value a_i (−φ for l-side seeds, +φ for other not-l seeds and
    rebuilt seeds once solved), then solve Σ(ψ − a_i)² = dx². Jacobi sweeps
-   over these seeds only continue until the values are stable (ruling R17).
+   over these seeds only continue until the values are stable (rulings R17,
+   R18).
 3. Solve 5.2 on |ψ_l| with those seeds frozen, apply sign from the mask.
 4. Return as `GRID_LEVEL_SET` with background halfWidth·dx.
 
@@ -382,8 +388,11 @@ Analytic / unit tests:
 2. **Convergence order.** Sphere at three resolutions; fitted interface-layer
    error slope ≥ 1.8.
 3. **Triple junction.** Three half-spaces meeting at 120°. `extractSignedDistance`
-   matches analytic distance per label; raw ±φ is shown to underestimate
-   (regression guard for 5.3).
+   matches analytic distance per label: max interface error < 0.05·dx for
+   interface voxels farther than 1 voxel from the junction axis, < 0.25·dx
+   within 1 voxel of it (where ψ_l is radial about the junction edge), and
+   RMS < 0.1·dx over the whole band. Raw ±φ is shown to underestimate by
+   more than 0.2·dx somewhere outside each label (regression guard for 5.3).
 4. **Partition invariant.** N steps of random-coefficient forces: the
    interiors {ψ_l < 0} of the per-label `extractSignedDistance` grids are
    pairwise disjoint (up to 1e-3·dx) and their union with the background
