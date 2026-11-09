@@ -13,6 +13,7 @@
 #include <openvdb/tools/VelocityFields.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
+#include "LevelSetMultiObjectFixtures.h"
 #include "LevelSetMultiObjectTopology.h"
 
 #include <gtest/gtest.h>
@@ -41,7 +42,14 @@ public:
 namespace {
 
 using namespace openvdb;
-using MLS = tools::MultiLevelSet<>;
+using MLS = lsmo_test::MLS;
+using lsmo_test::contactPairs;
+using lsmo_test::junctionSet;
+using lsmo_test::labelVoxelCounts;
+using lsmo_test::makeTwoSpheres;
+using lsmo_test::makeVelocity;
+using lsmo_test::Tornado;
+using lsmo_test::TripleJunction;
 
 // 16^3 block: label 1 for x<8, 2 for x>=8, phi = |x - 7.5|*dx clamped to 3*dx.
 MLS::Ptr
@@ -578,18 +586,6 @@ expectNoSpuriousSeeds(const MLS& m, std::function<double(Vec3d)> distToInterface
 
 struct TwoSphereErrors { double maxIface[2], rms[2]; };
 
-// Spheres of radius 10*dx at (-+15*dx, 0, 0), labels 1 and 2, via
-// fromSignedGrids.
-MLS::Ptr
-makeTwoSpheres(double dx)
-{
-    const double r = 10.0 * dx, cx = 15.0 * dx;
-    std::map<int32_t, FloatGrid::ConstPtr> in;
-    in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(-cx), 0, 0), float(dx));
-    in[2] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(cx), 0, 0), float(dx));
-    return MLS::fromSignedGrids(in);
-}
-
 // Analytic signed distance of two-sphere label @a label (1 or 2), world units.
 std::function<double(Vec3d)>
 twoSphereDistance(double dx, int label)
@@ -761,121 +757,6 @@ TEST_F(TestLevelSetMultiObject, FromSignedGridsThrows)
 }
 
 namespace {
-
-// Three labels meeting at 120 degrees along a straight junction line through
-// index point c with unit direction a. In the plane frame (u, v) normal to a
-// (u = x projected off a, v = a x u, so u = x and v = y for a z-parallel
-// line), label l (1..3) owns the polar angles
-// [theta0 + (l-1)*120deg, theta0 + l*120deg) about the line.
-struct TripleJunction
-{
-    double dx = 0.5;
-    double theta0;
-    Vec3d c, a, u, v;  // index space
-    int H;             // active box [-H, H-1]^3
-
-    TripleJunction(double th, const Vec3d& centre, const Vec3d& dir, int h = 12)
-        : theta0(th), c(centre), a(dir.unitSafe()), H(h)
-    {
-        const Vec3d ref = std::abs(a[0]) < 0.9 ? Vec3d(1, 0, 0) : Vec3d(0, 1, 0);
-        u = (ref - a * ref.dot(a)).unitSafe();
-        v = a.cross(u);
-    }
-
-    Vec2d local(const Vec3d& w) const
-    {
-        const Vec3d d = w / dx - c;
-        return Vec2d(d.dot(u), d.dot(v));
-    }
-    Vec2d ray(int k) const
-    {
-        const double t = theta0 + k * 2.0 * M_PI / 3.0;
-        return Vec2d(std::cos(t), std::sin(t));
-    }
-    int sector(const Vec3d& w) const
-    {
-        const Vec2d p = local(w);
-        double t = std::atan2(p[1], p[0]) - theta0;
-        while (t < 0.0) t += 2.0 * M_PI;
-        while (t >= 2.0 * M_PI) t -= 2.0 * M_PI;
-        return std::min(3, int(t / (2.0 * M_PI / 3.0)) + 1);
-    }
-    // Distance from p to the ray {t*r, t >= 0} (index units).
-    static double rayDist(const Vec2d& p, const Vec2d& r)
-    {
-        const double t = p.dot(r);
-        return t >= 0.0 ? (p - r * t).length() : p.length();
-    }
-    // Analytic signed distance to sector @a l, world units.
-    double signedDist(const Vec3d& w, int l) const
-    {
-        const Vec2d p = local(w);
-        const double d = std::min(rayDist(p, ray(l - 1)), rayDist(p, ray(l)));
-        return dx * (sector(w) == l ? -d : d);
-    }
-    double lineDist(const Vec3d& w) const { return local(w).length(); } // index units
-    // Chebyshev distance (index units) from the voxel centre to the box faces.
-    double boxDepth(const Coord& p) const
-    {
-        return H - std::max({std::abs(p[0] + 0.5), std::abs(p[1] + 0.5), std::abs(p[2] + 0.5)});
-    }
-
-    // The pair built directly from analytic data: phi = distance to the
-    // voxel's own sector boundary, active where phi < 3*dx inside the box,
-    // and a one-voxel inactive shell holding the labels (ruling R7b).
-    MLS::Ptr build() const
-    {
-        const int halfWidth = 3;
-        auto xform = math::Transform::createLinearTransform(dx);
-        FloatGrid::Ptr phi = FloatGrid::create(float(halfWidth * dx));
-        Int32Grid::Ptr lab = Int32Grid::create(0);
-        phi->setTransform(xform);
-        lab->setTransform(xform->copy());
-        auto pa = phi->getAccessor();
-        auto la = lab->getAccessor();
-        for (int i = -H - 1; i <= H; ++i)
-            for (int j = -H - 1; j <= H; ++j)
-                for (int k = -H - 1; k <= H; ++k) {
-                    const Coord q(i, j, k);
-                    const Vec3d w = xform->indexToWorld(q);
-                    const int l = sector(w);
-                    const double d = std::abs(signedDist(w, l));
-                    if (boxDepth(q) > 0.0 && d < halfWidth * dx) {
-                        pa.setValue(q, float(d));
-                        la.setValue(q, l);
-                    } else {
-                        pa.touchLeaf(q);
-                        la.setValueOff(q, l);
-                    }
-                }
-        return MLS::Ptr(new MLS(phi, lab, halfWidth));
-    }
-};
-
-// Seeded junction set (ruling R19): the original fixture (theta0 = 10deg,
-// z-parallel through (0.37, -0.21)), seven z-parallel lines with random
-// theta0 and sub-voxel offset, and four tilted lines. Uses its own
-// generator arithmetic so the set is the same on every platform.
-std::vector<TripleJunction>
-junctionSet()
-{
-    std::mt19937 rng(20261108u);
-    auto u01 = [&rng]() { return double(rng()) / 4294967296.0; };
-    std::vector<TripleJunction> set;
-    set.emplace_back(10.0 * M_PI / 180.0, Vec3d(0.37, -0.21, 0.0), Vec3d(0, 0, 1));
-    for (int n = 0; n < 7; ++n) {
-        const double th = u01() * 2.0 * M_PI;
-        const Vec3d c(u01() - 0.5, u01() - 0.5, u01() - 0.5);
-        set.emplace_back(th, c, Vec3d(0, 0, 1));
-    }
-    for (int n = 0; n < 4; ++n) {
-        const double th = u01() * 2.0 * M_PI;
-        const Vec3d c(u01() - 0.5, u01() - 0.5, u01() - 0.5);
-        const Vec3d dir(u01() - 0.5, u01() - 0.5, 1.0);
-        set.emplace_back(th, c, dir);
-    }
-    return set;
-}
 
 void
 expectLevelSetGrid(const FloatGrid& g, const MLS& m, int halfWidth)
@@ -1766,23 +1647,6 @@ TEST_F(TestLevelSetMultiObject, WallRetreat)
 
 namespace {
 
-// Dense Vec3SGrid over the index box @a box (voxel size @a dx), each voxel
-// set to f(its world position); background zero.
-Vec3SGrid::Ptr
-makeVelocity(const CoordBBox& box, double dx, const std::function<Vec3s(const Vec3d&)>& f)
-{
-    Vec3SGrid::Ptr vel = Vec3SGrid::create(Vec3s(0.0f));
-    vel->setTransform(math::Transform::createLinearTransform(dx));
-    vel->denseFill(box, Vec3s(0.0f), /*active=*/true);
-    tree::LeafManager<Vec3STree> leaves(vel->tree());
-    leaves.foreach([&](Vec3STree::LeafNodeType& leaf, size_t) {
-        for (auto it = leaf.beginValueOn(); it; ++it) {
-            it.setValue(f(vel->indexToWorld(it.getCoord())));
-        }
-    });
-    return vel;
-}
-
 struct ZeroSetDiff
 {
     double symDiff = 0.0;     // sub-voxel symmetric difference volume (world)
@@ -1982,38 +1846,6 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
 
 namespace {
 
-// Voxel count per label over the whole label tree (active and inactive
-// voxels, tiles counted by their voxel count; label 0 excluded).
-std::map<int32_t, Index64>
-labelVoxelCounts(const MLS& m)
-{
-    std::map<int32_t, Index64> n;
-    for (auto it = m.labels()->tree().cbeginValueAll(); it; ++it) {
-        if (*it == 0) continue;
-        n[*it] += it.getVoxelCount();
-    }
-    return n;
-}
-
-// Distinct unordered label pairs (a, b), a != b, both non-zero, with
-// face-adjacent voxels (one of them active).
-std::set<std::pair<int32_t, int32_t>>
-contactPairs(const MLS& m)
-{
-    std::set<std::pair<int32_t, int32_t>> pairs;
-    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
-    const Coord* offs = tools::lsmo_internal::faceOffsets();
-    for (auto it = m.labels()->tree().cbeginValueOn(); it; ++it) {
-        const int32_t a = *it;
-        if (a == 0) continue;
-        for (int f = 0; f < 6; ++f) {
-            const int32_t b = lab.getValue(it.getCoord() + offs[f]);
-            if (b != 0 && b != a) pairs.insert({std::min(a, b), std::max(a, b)});
-        }
-    }
-    return pairs;
-}
-
 Index64
 countNaN(const FloatGrid& g)
 {
@@ -2031,33 +1863,6 @@ insideVoxelCount(const FloatGrid& g)
     for (auto it = g.tree().cbeginValueAll(); it; ++it) n += *it < 0.0f ? it.getVoxelCount() : 0;
     return n;
 }
-
-// Tornado field (ruling R27):
-// - Rankine-style swirl about z: u_theta = swirl*(r/R) for r < R,
-//   swirl*(R/r) outside (divergence-free);
-// - radial inflow towards the ring r = rs: u_r = -inflow*tanh((r - rs)/w),
-//   i.e. translation at ~inflow away from the ring and a convergence zone of
-//   width ~w around it (compressive only inside that zone);
-// - updraft u_z = updraft*exp(-r^2/(2 R^2)) (divergence-free).
-// An exact flow never brings disjoint objects into contact, and an
-// axisymmetric flow keeps the angular gaps of objects at one radius, so
-// contact comes from objects on the same ray pressed together in the
-// convergence zone until their gap is below a voxel.
-struct Tornado
-{
-    double R = 16.0, swirl = 0.1, inflow = 0.2, rs = 38.5, w = 1.0, updraft = 0.2,
-        z0 = -20.0;
-    Vec3s operator()(const Vec3d& p) const
-    {
-        const double r = std::sqrt(p[0] * p[0] + p[1] * p[1]);
-        const double ut = swirl * (r < R ? r / R : R / r);
-        const double ur = -inflow * std::tanh((r - rs) / w);
-        const double uz = updraft * std::exp(-r * r / (2.0 * R * R));
-        Vec3d v(0.0, 0.0, uz);
-        if (r > 0.0) v += Vec3d(-p[1], p[0], 0.0) * (ut / r) + Vec3d(p[0], p[1], 0.0) * (ur / r);
-        return Vec3s(v);
-    }
-};
 
 } // anonymous namespace
 
@@ -2084,92 +1889,38 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
     // same field over the same time, each label's voxel loss lies in
     // [1.1*min(refLoss, 0) - 2%, 1.1*max(refLoss, 0) + 2%].
-    const float dx = 1.0f, hw = 3.0f;
+    // (Shapes, placement, field and schedule: lsmo_test::Tornado.)
     const Tornado tornado;
-    auto make = [&](int32_t l, const Vec3f& c) -> FloatGrid::Ptr {
-        switch (l) {
-        case 1: return tools::createLevelSetSphere<FloatGrid>(10.0f, c, dx, hw);
-        case 2: return tools::createLevelSetCube<FloatGrid>(12.0f, c, dx, hw);
-        case 3: return tools::createLevelSetTetrahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 4: return tools::createLevelSetOctahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 5: return tools::createLevelSetDodecahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 6: return tools::createLevelSetIcosahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 7:
-            return tools::createLevelSetCapsule<FloatGrid>(
-                c - Vec3f(0.0f, 0.0f, 5.0f), c + Vec3f(0.0f, 0.0f, 5.0f), 5.0f, dx, hw);
-        default: {
-            std::vector<Vec3f> verts;
-            std::vector<Vec2I> segs;
-            for (int i = 0; i < 8; ++i) {
-                const double a = i * math::pi<double>() / 4.0;
-                verts.push_back(c + Vec3f(float(7.0 * std::cos(a)), float(7.0 * std::sin(a)), 0.0f));
-                segs.push_back(Vec2I(i, (i + 1) % 8));
-            }
-            return tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 3.0f, dx, hw);
-        }
-        }
-    };
-    // extent of a shape centred at the origin along unit direction d: max of
-    // p.d - psi(p) over interior voxels (psi < 0)
-    auto extent = [](const FloatGrid& g, const Vec3d& d) {
-        double e = 0.0;
-        for (auto it = g.tree().cbeginValueOn(); it; ++it) {
-            if (*it < 0.0f) e = std::max(e, g.indexToWorld(it.getCoord()).dot(d) - double(*it));
-        }
-        return e;
-    };
-    std::map<int32_t, FloatGrid::ConstPtr> in;
-    for (int32_t l = 1; l <= 8; ++l) {
-        const double a = ((l - 1) % 4) * math::pi<double>() / 2.0;
-        const Vec3d ray(std::cos(a), std::sin(a), 0.0);
-        const bool inner = l <= 4;
-        const double e = extent(*make(l, Vec3f(0.0f)), inner ? ray : -ray);
-        const double rad = inner ? tornado.rs - 1.5 - e : tornado.rs + 1.5 + e;
-        in[l] = make(l, Vec3f(ray * rad + Vec3d(0.0, 0.0, tornado.z0)));
-    }
-    auto m = MLS::fromSignedGrids(in, int(hw));
+    const std::map<int32_t, FloatGrid::ConstPtr> in = tornado.inputs();
+    auto m = MLS::fromSignedGrids(in, 3);
     ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}));
     const std::map<int32_t, Index64> vol0 = labelVoxelCounts(*m);
     ASSERT_TRUE(contactPairs(*m).empty());
 
-    Vec3SGrid::Ptr vel = makeVelocity(CoordBBox(Coord(-64), Coord(64)), dx, tornado);
-    Forces forces;
-    forces.setAdvection(vel, 1.0f);
-    forces.setCurvatureWeight(0.01f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-
-    const double tCap = 40.0, chunk = 2.0;
-    double t = 0.0;
+    Vec3SGrid::Ptr vel = tornado.velocity();
     size_t steps = 0;
+    double tContact = -1.0;
     std::set<std::pair<int32_t, int32_t>> pairs;
     const auto start = std::chrono::steady_clock::now();
     // Ruling R31: keep going for two chunks after the first chunk with >= 4
     // contact pairs; contacts must persist.
-    int after = -1; // chunks run after the first one with >= 4 pairs
-    double tContact = -1.0;
-    while (after < 2) {
-        if (after < 0 && t >= tCap - 1e-9) break;
-        steps += lsmo.advect(t, t + chunk);
-        t += chunk;
-        std::string msg;
-        ASSERT_TRUE(m->validate(&msg)) << "t " << t << ": " << msg;
-        Index64 overlaps = 0, badCover = 0;
-        partitionErrors(*m, overlaps, badCover);
-        ASSERT_EQ(overlaps, Index64(0)) << "t " << t;
-        ASSERT_EQ(badCover, Index64(0)) << "t " << t;
-        ASSERT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << t;
-        pairs = contactPairs(*m);
-        std::cout << "Tornado: t " << t << " steps " << steps << " contacts " << pairs.size();
-        for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
-        std::cout << std::endl;
-        if (after >= 0) {
-            ++after;
-            EXPECT_GE(pairs.size(), size_t(4)) << "t " << t;
-        } else if (pairs.size() >= 4) {
-            after = 0;
-            tContact = t;
-        }
-    }
+    const double t = tornado.run(*m, vel, steps, tContact,
+        [&](double tc, size_t n, const std::set<std::pair<int32_t, int32_t>>& p, int after) {
+            std::string msg;
+            if (!m->validate(&msg)) { ADD_FAILURE() << "t " << tc << ": " << msg; return false; }
+            Index64 overlaps = 0, badCover = 0;
+            partitionErrors(*m, overlaps, badCover);
+            EXPECT_EQ(overlaps, Index64(0)) << "t " << tc;
+            EXPECT_EQ(badCover, Index64(0)) << "t " << tc;
+            EXPECT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << tc;
+            pairs = p;
+            std::cout << "Tornado: t " << tc << " steps " << n << " contacts " << p.size();
+            for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
+            std::cout << std::endl;
+            if (after > 0) EXPECT_GE(p.size(), size_t(4)) << "t " << tc;
+            return !::testing::Test::HasFailure();
+        });
+    ASSERT_FALSE(::testing::Test::HasFailure());
     std::cout << "Tornado: >= 4 contact pairs first at t " << tContact << std::endl;
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
@@ -2181,7 +1932,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     const std::map<int32_t, Index64> vol1 = labelVoxelCounts(*m);
     for (int32_t l = 1; l <= 8; ++l) {
         // reference: the same shape alone, LevelSetAdvection to the same t
-        FloatGrid::Ptr ref = in[l]->deepCopy();
+        FloatGrid::Ptr ref = in.at(l)->deepCopy();
         const double r0 = double(insideVoxelCount(*ref));
         referenceAdvect(*ref, *vel, 0.0, t);
         const double refLoss = 1.0 - double(insideVoxelCount(*ref)) / r0;

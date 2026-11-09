@@ -4,15 +4,20 @@
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetMultiObjectMesh.h>
 
+#include "LevelSetMultiObjectFixtures.h"
+#include "LevelSetMultiObjectTopology.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -414,4 +419,605 @@ TEST_F(TestLevelSetMultiObjectMesh, CaseTableAll)
         std::cout << "[CaseTableAll] " << connName(conn) << ": max triangles/case " << maxTris
                   << ", tube components " << tubes << std::endl;
     }
+}
+
+
+////////////////////////////////////////
+// multiObjectToMesh (spec section 6.2-6.4, section 8 tests 11-13)
+
+namespace {
+
+using MLS = lsmo_test::MLS;
+using tools::LabelMesh;
+const Conn kAllConn[4] = {Conn::FG26_BG6, Conn::FG6_BG26, Conn::FG18_BG6, Conn::FG6_BG18};
+
+// Doubled triangle area vectors below this length (squared world units)
+// count as zero area.
+constexpr double kZeroArea = 1e-10;
+
+Vec3d
+triNormal(const LabelMesh& m, const Vec3I& t)
+{
+    const Vec3d a(m.points[t[0]]), b(m.points[t[1]]), c(m.points[t[2]]);
+    return (b - a).cross(c - a);
+}
+
+// Closed, consistently oriented 2-manifold: every directed edge occurs once
+// and its reverse once (each edge has exactly two triangles, wound
+// oppositely), every vertex is used and its link is a single cycle, and no
+// triangle has zero area (spec test 11).
+bool
+isClosedManifold(const LabelMesh& m, double dx, std::string* why = nullptr)
+{
+    std::ostringstream err;
+    auto fail = [&](const std::string& s) { if (why) *why = s; return false; };
+    const size_t nv = m.points.size();
+    std::map<std::pair<uint32_t, uint32_t>, int> directed;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> link(nv);
+    for (size_t i = 0; i < m.triangles.size(); ++i) {
+        const Vec3I& t = m.triangles[i];
+        for (int k = 0; k < 3; ++k) {
+            if (t[k] >= nv) return fail("vertex index out of range");
+        }
+        if (t[0] == t[1] || t[1] == t[2] || t[0] == t[2]) return fail("repeated vertex in a triangle");
+        if (!(triNormal(m, t).length() > kZeroArea * dx * dx)) {
+            err << "zero-area triangle " << i;
+            return fail(err.str());
+        }
+        for (int k = 0; k < 3; ++k) {
+            ++directed[{t[k], t[(k + 1) % 3]}];
+            link[t[k]].emplace_back(t[(k + 1) % 3], t[(k + 2) % 3]);
+        }
+    }
+    for (const auto& kv : directed) {
+        if (kv.second != 1) return fail("directed edge repeated (inconsistent winding or > 2 triangles)");
+        if (!directed.count({kv.first.second, kv.first.first})) return fail("boundary edge");
+    }
+    for (size_t v = 0; v < nv; ++v) {
+        const auto& L = link[v];
+        if (L.empty()) return fail("unused vertex");
+        std::map<uint32_t, uint32_t> next;
+        for (const auto& e : L) next[e.first] = e.second;
+        size_t steps = 0;
+        uint32_t cur = L[0].first;
+        do { cur = next[cur]; ++steps; } while (cur != L[0].first && steps <= L.size());
+        if (steps != L.size()) {
+            err << "vertex " << v << " link is not one cycle";
+            return fail(err.str());
+        }
+    }
+    return true;
+}
+
+int
+components(const LabelMesh& m)
+{
+    std::vector<uint32_t> rep(m.points.size());
+    for (size_t i = 0; i < rep.size(); ++i) rep[i] = uint32_t(i);
+    std::function<uint32_t(uint32_t)> find = [&](uint32_t x) {
+        while (rep[x] != x) x = rep[x] = rep[rep[x]];
+        return x;
+    };
+    for (const Vec3I& t : m.triangles) {
+        rep[find(t[0])] = find(t[1]);
+        rep[find(t[1])] = find(t[2]);
+    }
+    std::set<uint32_t> roots;
+    for (const Vec3I& t : m.triangles) roots.insert(find(t[0]));
+    return int(roots.size());
+}
+
+// V - E + F over the vertices used by @a tris.
+int
+eulerChar(const std::vector<Vec3I>& tris)
+{
+    std::set<std::pair<uint32_t, uint32_t>> edges;
+    std::set<uint32_t> verts;
+    for (const Vec3I& t : tris)
+        for (int k = 0; k < 3; ++k) {
+            verts.insert(t[k]);
+            edges.insert({std::min(t[k], t[(k + 1) % 3]), std::max(t[k], t[(k + 1) % 3])});
+        }
+    return int(verts.size()) - int(edges.size()) + int(tris.size());
+}
+
+int
+eulerChar(const LabelMesh& m) { return eulerChar(m.triangles); }
+
+// Folded triangles (ruling R34): triangles are grouped by the cell holding
+// their centroid and by connectivity within the cell into patches. A disk
+// patch (Euler characteristic 1) must have every triangle normal along the
+// patch's vector area; a tube (an annulus around the body diagonal of two
+// in-corners or two out-corners) must have every normal pointing away from
+// (in-tube) or towards (out-tube) the diagonal.
+size_t
+countFolded(const LabelMesh& m, const MLS& mls, int32_t label, size_t* tubes = nullptr)
+{
+    const math::Transform& xf = mls.phi()->transform();
+    tree::ValueAccessor<const Int32Tree> lab(mls.labels()->tree());
+    std::map<Coord, std::vector<size_t>> cells;
+    for (size_t i = 0; i < m.triangles.size(); ++i) {
+        const Vec3I& t = m.triangles[i];
+        const Vec3d c = (Vec3d(m.points[t[0]]) + Vec3d(m.points[t[1]]) + Vec3d(m.points[t[2]])) / 3.0;
+        cells[Coord::floor(xf.worldToIndex(c))].push_back(i);
+    }
+    size_t folded = 0;
+    for (const auto& cell : cells) {
+        const auto& ids = cell.second;
+        std::vector<size_t> rep(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) rep[i] = i;
+        std::function<size_t(size_t)> find = [&](size_t x) { while (rep[x] != x) x = rep[x]; return x; };
+        for (size_t i = 0; i < ids.size(); ++i)
+            for (size_t j = i + 1; j < ids.size(); ++j) {
+                int shared = 0;
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b)
+                        shared += m.triangles[ids[i]][a] == m.triangles[ids[j]][b];
+                if (shared >= 2) rep[find(i)] = find(j);
+            }
+        std::map<size_t, std::vector<size_t>> patches;
+        for (size_t i = 0; i < ids.size(); ++i) patches[find(i)].push_back(ids[i]);
+        int inMask = 0;
+        for (int c = 0; c < 8; ++c)
+            if (lab.getValue(cell.first.offsetBy(c & 1, (c >> 1) & 1, (c >> 2) & 1)) == label)
+                inMask |= 1 << c;
+        for (const auto& p : patches) {
+            std::vector<Vec3I> sub;
+            for (size_t i : p.second) sub.push_back(m.triangles[i]);
+            const int chi = eulerChar(sub);
+            Vec3d area(0.0);
+            for (size_t i : p.second) area += triNormal(m, m.triangles[i]);
+            int axisMask = -1;
+            if (chi == 0) {
+                if (tubes) ++*tubes;
+                auto antipodal = [](int mask) {
+                    int n = 0, first = -1, second = -1;
+                    for (int c = 0; c < 8; ++c) if (mask & (1 << c)) { ++n; (first < 0 ? first : second) = c; }
+                    return n == 2 && (first ^ second) == 7;
+                };
+                axisMask = antipodal(inMask) ? inMask : (antipodal(~inMask & 255) ? (~inMask & 255) : -2);
+            }
+            for (size_t i : p.second) {
+                const Vec3I& t = m.triangles[i];
+                const Vec3d n = triNormal(m, t);
+                double d = 0.0;
+                if (axisMask == -1) {
+                    d = n.dot(area);
+                } else if (axisMask >= 0) {
+                    int a0 = -1, a1 = -1;
+                    for (int c = 0; c < 8; ++c) if (axisMask & (1 << c)) (a0 < 0 ? a0 : a1) = c;
+                    const Vec3d p0 = xf.indexToWorld(cell.first.offsetBy(a0 & 1, (a0 >> 1) & 1, (a0 >> 2) & 1));
+                    const Vec3d p1 = xf.indexToWorld(cell.first.offsetBy(a1 & 1, (a1 >> 1) & 1, (a1 >> 2) & 1));
+                    const Vec3d axis = (p1 - p0).unit();
+                    const Vec3d cen = (Vec3d(m.points[t[0]]) + Vec3d(m.points[t[1]]) + Vec3d(m.points[t[2]])) / 3.0 - p0;
+                    const Vec3d radial = cen - axis * axis.dot(cen);
+                    d = n.dot(radial) * (axisMask == inMask ? 1.0 : -1.0);
+                }
+                if (!(d > 0.0)) ++folded;
+            }
+        }
+    }
+    return folded;
+}
+
+// Random label volume (spec tests 11, 12): labels 1..nLabels drawn per
+// block of `block`^3 voxels over [0, n-1]^3, label 0 outside.
+// - randomPhi false: the pair built by MultiLevelSet::fromLabelGrid (the
+//   spec's random label volumes);
+// - randomPhi true (stress variant): phi set directly over [-2, n+1]^3,
+//   uniform in [0.02, 0.98]*dx at voxels with a differing face neighbour
+//   and in [1, 2.9]*dx elsewhere, so the vertex on every cell edge sits at
+//   an independent random position (not the zero set of any smooth field).
+MLS::Ptr
+makeRandomLabels(uint32_t seed, int n, int nLabels, int block, bool randomPhi)
+{
+    std::mt19937 rng(seed);
+    auto xform = math::Transform::createLinearTransform(1.0);
+    const int nb = (n + block - 1) / block;
+    std::vector<int32_t> blocks(size_t(nb) * nb * nb);
+    for (auto& b : blocks) b = int32_t(1 + rng() % uint32_t(nLabels));
+    auto labelAt = [&](const Coord& c) -> int32_t {
+        for (int a = 0; a < 3; ++a) if (c[a] < 0 || c[a] >= n) return 0;
+        return blocks[(size_t(c[0] / block) * nb + c[1] / block) * nb + c[2] / block];
+    };
+    Int32Grid::Ptr lab = Int32Grid::create(0);
+    lab->setTransform(xform);
+    auto la = lab->getAccessor();
+    if (!randomPhi) {
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j)
+                for (int k = 0; k < n; ++k) la.setValue(Coord(i, j, k), labelAt(Coord(i, j, k)));
+        return MLS::fromLabelGrid(*lab, 3);
+    }
+    FloatGrid::Ptr phi = FloatGrid::create(3.0f);
+    phi->setTransform(xform->copy());
+    auto pa = phi->getAccessor();
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    for (int i = -2; i <= n + 1; ++i)
+        for (int j = -2; j <= n + 1; ++j)
+            for (int k = -2; k <= n + 1; ++k) {
+                const Coord c(i, j, k);
+                bool iface = false;
+                for (int f = 0; f < 6; ++f) iface = iface || labelAt(c + offs[f]) != labelAt(c);
+                const double u = double(rng()) / 4294967296.0;
+                la.setValue(c, labelAt(c));
+                pa.setValue(c, float(iface ? 0.02 + 0.96 * u : 1.0 + 1.9 * u));
+            }
+    return MLS::Ptr(new MLS(phi, lab, 3));
+}
+
+const uint32_t kRandomSeeds[5] = {11u, 22u, 33u, 44u, 55u};
+const int kRandomBlock[5] = {1, 1, 1, 2, 3};
+
+// fromLabelGrid on a label grid filled by a predicate over [lo, hi]^3.
+MLS::Ptr
+labelFixture(const CoordBBox& box, const std::function<int32_t(const Coord&)>& f)
+{
+    Int32Grid::Ptr g = Int32Grid::create(0);
+    g->setTransform(math::Transform::createLinearTransform(1.0));
+    auto acc = g->getAccessor();
+    for (auto it = box.begin(); it; ++it) {
+        const int32_t l = f(*it);
+        if (l != 0) acc.setValue(*it, l);
+    }
+    return MLS::fromLabelGrid(*g, 3);
+}
+
+std::map<int32_t, LabelMesh>
+meshWithStats(const MLS& m, const tools::MultiObjectMeshSettings& s,
+    tools::lsmo_internal::MeshStats& stats)
+{
+    return tools::lsmo_internal::contourMultiObject(m, {}, s,
+        static_cast<util::NullInterrupter*>(nullptr), &stats);
+}
+
+void
+printStats(const std::string& name, const tools::lsmo_internal::MeshStats& s)
+{
+    std::cout << "[Mesh] " << name << ": patches " << s.patches << ", retriangulated "
+              << s.retriangulated << ", folded " << s.folded << ", junction-corrected vertices "
+              << s.corrected << std::endl;
+}
+
+void
+expectSameMeshes(const std::map<int32_t, LabelMesh>& a, const std::map<int32_t, LabelMesh>& b)
+{
+    ASSERT_EQ(a.size(), b.size());
+    for (auto ia = a.begin(), ib = b.begin(); ia != a.end(); ++ia, ++ib) {
+        ASSERT_EQ(ia->first, ib->first);
+        EXPECT_TRUE(ia->second.points == ib->second.points) << "label " << ia->first;
+        EXPECT_TRUE(ia->second.triangles == ib->second.triangles) << "label " << ia->first;
+        EXPECT_TRUE(ia->second.normals == ib->second.normals) << "label " << ia->first;
+    }
+}
+
+// Asserts closedness, manifoldness and no folded triangles for every mesh.
+void
+expectManifold(const std::string& name, const MLS& m, const std::map<int32_t, LabelMesh>& meshes,
+    size_t* totalTris = nullptr)
+{
+    for (const auto& kv : meshes) {
+        std::string why;
+        EXPECT_TRUE(isClosedManifold(kv.second, m.voxelSize(), &why))
+            << name << " label " << kv.first << ": " << why;
+        EXPECT_FALSE(kv.second.triangles.empty()) << name << " label " << kv.first;
+        EXPECT_EQ(countFolded(kv.second, m, kv.first), size_t(0)) << name << " label " << kv.first;
+        if (totalTris) *totalTris += kv.second.triangles.size();
+    }
+}
+
+} // namespace
+
+
+// Spec test 11: closed 2-manifolds, no folded or zero-area triangles.
+TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
+{
+    tools::MultiObjectMeshSettings s;
+    tools::lsmo_internal::MeshStats stats;
+    {
+        auto m = lsmo_test::makeTwoSpheres(1.0);
+        const auto meshes = meshWithStats(*m, s, stats);
+        ASSERT_EQ(meshes.size(), size_t(2));
+        size_t tris = 0;
+        expectManifold("two spheres", *m, meshes, &tris);
+        for (const auto& kv : meshes) {
+            EXPECT_EQ(components(kv.second), 1);
+            EXPECT_EQ(eulerChar(kv.second), 2);
+        }
+        printStats("two spheres (" + std::to_string(tris) + " triangles)", stats);
+    }
+    {
+        auto m = lsmo_test::Tornado().endState();
+        const auto start = std::chrono::steady_clock::now();
+        auto meshes = meshWithStats(*m, s, stats);
+        std::cout << "[Mesh] tornado end state: multiObjectToMesh "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
+                  << " s" << std::endl;
+        EXPECT_EQ(meshes.size(), size_t(8));
+        size_t tris = 0;
+        expectManifold("tornado", *m, meshes, &tris);
+        printStats("tornado end state (" + std::to_string(tris) + " triangles)", stats);
+        // identical output serial and parallel, also with normals
+        tools::MultiObjectMeshSettings serial = s, parallel = s;
+        serial.grainSize = 0;
+        serial.computeNormals = parallel.computeNormals = true;
+        parallel.grainSize = 1;
+        const auto a = tools::multiObjectToMesh(*m, {}, serial);
+        const auto b = tools::multiObjectToMesh(*m, {}, parallel);
+        expectSameMeshes(a, b);
+        for (const auto& kv : a) {
+            EXPECT_EQ(kv.second.normals.size(), kv.second.points.size());
+            EXPECT_TRUE(kv.second.triangles == meshes[kv.first].triangles);
+        }
+    }
+    for (int r = 0; r < 5; ++r) {
+        auto m = makeRandomLabels(kRandomSeeds[r], 24, 4, kRandomBlock[r], false);
+        for (Conn conn : kAllConn) {
+            s.connectivity = conn;
+            const auto meshes = meshWithStats(*m, s, stats);
+            EXPECT_EQ(meshes.size(), size_t(4));
+            size_t tris = 0;
+            const std::string name = "random " + std::to_string(r) + " " + connName(conn);
+            expectManifold(name, *m, meshes, &tris);
+            printStats(name + " (" + std::to_string(tris) + " triangles)", stats);
+        }
+    }
+    // Stress variant with an independent random vertex on every cell edge:
+    // still closed manifolds without zero-area triangles; folded triangles
+    // are reported, not asserted (a twisted 7-vertex loop may admit no
+    // unfolded triangulation of its edge vertices).
+    for (int r = 0; r < 5; ++r) {
+        auto m = makeRandomLabels(kRandomSeeds[r], 24, 4, kRandomBlock[r], true);
+        for (Conn conn : kAllConn) {
+            s.connectivity = conn;
+            const auto meshes = meshWithStats(*m, s, stats);
+            EXPECT_EQ(meshes.size(), size_t(4));
+            size_t tris = 0, folded = 0;
+            const std::string name = "random-phi " + std::to_string(r) + " " + connName(conn);
+            for (const auto& kv : meshes) {
+                std::string why;
+                EXPECT_TRUE(isClosedManifold(kv.second, 1.0, &why)) << name << " label " << kv.first << ": " << why;
+                tris += kv.second.triangles.size();
+                folded += countFolded(kv.second, *m, kv.first);
+            }
+            printStats(name + " (" + std::to_string(tris) + " triangles, " + std::to_string(folded)
+                + " folded triangles)", stats);
+        }
+    }
+}
+
+
+// Spec test 12: mesh components == foreground components + cavities and
+// chi(M) == 2 chi(R) for every label and connectivity pair.
+TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
+{
+    struct Fixture
+    {
+        std::string name;
+        MLS::Ptr mls;
+        CoordBBox domain;
+    };
+    std::vector<Fixture> fixtures;
+    // solid torus, R = 8, r = 3, about z
+    fixtures.push_back({"torus", labelFixture(CoordBBox(Coord(-13), Coord(13)), [](const Coord& c) {
+        const double rho = std::sqrt(double(c[0] * c[0] + c[1] * c[1])) - 8.0;
+        return rho * rho + double(c[2] * c[2]) <= 9.0 ? 1 : 0;
+    }), CoordBBox(Coord(-14), Coord(14))});
+    // two 4^3 cubes sharing only the z-edge line between (3,3,z) and (4,4,z)
+    fixtures.push_back({"edge cubes", labelFixture(CoordBBox(Coord(0), Coord(7)), [](const Coord& c) {
+        const bool a = c[0] <= 3 && c[1] <= 3 && c[2] <= 3;
+        const bool b = c[0] >= 4 && c[1] >= 4 && c[2] <= 3;
+        return a || b ? 1 : 0;
+    }), CoordBBox(Coord(-2), Coord(9))});
+    // two 4^3 cubes sharing only the corner between (3,3,3) and (4,4,4)
+    fixtures.push_back({"corner cubes", labelFixture(CoordBBox(Coord(0), Coord(7)), [](const Coord& c) {
+        const bool a = c[0] <= 3 && c[1] <= 3 && c[2] <= 3;
+        const bool b = c[0] >= 4 && c[1] >= 4 && c[2] >= 4;
+        return a || b ? 1 : 0;
+    }), CoordBBox(Coord(-2), Coord(9))});
+    // hollow sphere: shell 5.5 <= r <= 9 (label 1) around a cavity holding
+    // label 0 and a ball r <= 3 of label 2
+    fixtures.push_back({"hollow sphere", labelFixture(CoordBBox(Coord(-10), Coord(10)), [](const Coord& c) {
+        const double r = c.asVec3d().length();
+        return r <= 3.0 ? 2 : (r >= 5.5 && r <= 9.0 ? 1 : 0);
+    }), CoordBBox(Coord(-11), Coord(11))});
+    // 2x2x2 block minus an antipodal pair (FG6_BG18 hexagon correction)
+    fixtures.push_back({"antipodal hexagon", labelFixture(CoordBBox(Coord(0), Coord(1)), [](const Coord& c) {
+        return c == Coord(0) || c == Coord(1) ? 0 : 1;
+    }), CoordBBox(Coord(-2), Coord(3))});
+    for (int r = 0; r < 5; ++r) {
+        fixtures.push_back({"random " + std::to_string(r),
+            makeRandomLabels(kRandomSeeds[r], 24, 4, kRandomBlock[r], false), CoordBBox(Coord(-2), Coord(25))});
+    }
+
+    // explicit expectations
+    auto expected = [](const std::string& name, Conn conn, int32_t label, int& comps, int& cav, int& chi) {
+        const int fg = fgOf(conn);
+        comps = cav = chi = -1;
+        if (name == "torus") { comps = 1; cav = 0; chi = 0; }
+        if (name == "edge cubes") { comps = fg == 6 ? 2 : 1; cav = 0; chi = fg == 6 ? 2 : 1; }
+        if (name == "corner cubes") { comps = fg == 26 ? 1 : 2; cav = 0; chi = fg == 26 ? 1 : 2; }
+        if (name == "hollow sphere") {
+            if (label == 1) { comps = 1; cav = 1; chi = 2; } else { comps = 1; cav = 0; chi = 1; }
+        }
+        if (name == "antipodal hexagon") {
+            comps = 1; cav = 0;
+            chi = conn == Conn::FG6_BG26 ? 0 : 1;  // FG6_BG18: filled hexagon
+        }
+    };
+
+    for (const Fixture& fx : fixtures) {
+        const std::vector<int32_t> present = fx.mls->labelSet();
+        for (Conn conn : kAllConn) {
+            tools::MultiObjectMeshSettings s;
+            s.connectivity = conn;
+            const auto meshes = tools::multiObjectToMesh(*fx.mls, {}, s);
+            EXPECT_EQ(meshes.size(), present.size()) << fx.name << " " << connName(conn);
+            std::ostringstream row;
+            row << "[MeshTopology] " << fx.name << " " << connName(conn) << ":";
+            for (int32_t l : present) {
+                auto it = meshes.find(l);
+                ASSERT_TRUE(it != meshes.end()) << fx.name << " label " << l;
+                const LabelMesh& mesh = it->second;
+                const auto topo = lsmo_test::digitalTopology(*fx.mls->labels(), l, fx.domain, conn);
+                const int mc = components(mesh), mchi = eulerChar(mesh);
+                row << " L" << l << " comps " << mc << "=" << topo.components << "+" << topo.cavities
+                    << " chi " << mchi << "=2*" << topo.euler;
+                std::string why;
+                EXPECT_TRUE(isClosedManifold(mesh, 1.0, &why)) << fx.name << " " << connName(conn) << ": " << why;
+                EXPECT_EQ(mc, topo.components + topo.cavities)
+                    << fx.name << " " << connName(conn) << " label " << l;
+                EXPECT_EQ(mchi, 2 * topo.euler) << fx.name << " " << connName(conn) << " label " << l;
+                int comps, cav, chi;
+                expected(fx.name, conn, l, comps, cav, chi);
+                if (comps >= 0) {
+                    EXPECT_EQ(topo.components, comps) << fx.name << " " << connName(conn) << " label " << l;
+                    EXPECT_EQ(topo.cavities, cav) << fx.name << " " << connName(conn) << " label " << l;
+                    EXPECT_EQ(topo.euler, chi) << fx.name << " " << connName(conn) << " label " << l;
+                    EXPECT_EQ(mc, comps + cav) << fx.name << " " << connName(conn) << " label " << l;
+                    EXPECT_EQ(mchi, 2 * chi) << fx.name << " " << connName(conn) << " label " << l;
+                }
+            }
+            if (fx.name.compare(0, 6, "random") != 0 || conn == Conn::FG26_BG6) {
+                std::cout << row.str() << std::endl;
+            }
+        }
+    }
+}
+
+
+// Spec test 13: sphere vertices within 0.1*dx of the analytic surface.
+TEST_F(TestLevelSetMultiObjectMesh, MeshGeometrySphere)
+{
+    for (double dx : {1.0, 0.5}) {
+        const double r = 10.0 * dx;
+        const Vec3d c(0.31 * dx, -0.17 * dx, 0.23 * dx);
+        std::map<int32_t, FloatGrid::ConstPtr> in;
+        in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(c), float(dx));
+        auto m = MLS::fromSignedGrids(in);
+        tools::MultiObjectMeshSettings s;
+        s.computeNormals = true;
+        const auto meshes = tools::multiObjectToMesh(*m, {}, s);
+        ASSERT_EQ(meshes.size(), size_t(1));
+        const LabelMesh& mesh = meshes.at(1);
+        std::string why;
+        EXPECT_TRUE(isClosedManifold(mesh, dx, &why)) << why;
+        EXPECT_EQ(eulerChar(mesh), 2);
+        double maxErr = 0.0, minDot = 1.0;
+        for (size_t i = 0; i < mesh.points.size(); ++i) {
+            const Vec3d d = Vec3d(mesh.points[i]) - c;
+            maxErr = std::max(maxErr, std::abs(d.length() - r) / dx);
+            minDot = std::min(minDot, d.unit().dot(Vec3d(mesh.normals[i])));
+        }
+        std::cout << "[MeshGeometrySphere] dx " << dx << ": " << mesh.points.size() << " vertices, "
+                  << mesh.triangles.size() << " triangles, max vertex error " << maxErr
+                  << " dx, min normal . radial " << minDot << std::endl;
+        EXPECT_LT(maxErr, 0.1);
+        EXPECT_GT(minDot, 0.95);
+        // outward winding: positive enclosed volume
+        double vol = 0.0;
+        for (const Vec3I& t : mesh.triangles) {
+            vol += Vec3d(mesh.points[t[0]]).dot(Vec3d(mesh.points[t[1]]).cross(Vec3d(mesh.points[t[2]])));
+        }
+        vol /= 6.0;
+        EXPECT_NEAR(vol, 4.0 / 3.0 * M_PI * r * r * r, 0.02 * 4.0 / 3.0 * M_PI * r * r * r);
+    }
+}
+
+
+// Spec test 13: junction correction lowers the max vertex error at triple
+// junctions. Asserted on the test 3 fixture (junction 0 of the seeded set)
+// and on the worst case over the whole set (ruling R19); every junction's
+// numbers are printed. Vertices within 3 voxels of the box faces are skipped
+// (the box boundary is not part of the analytic partition).
+TEST_F(TestLevelSetMultiObjectMesh, MeshJunctionCorrection)
+{
+    const auto set = lsmo_test::junctionSet();
+    double worst[2] = {0.0, 0.0};
+    for (size_t n = 0; n < set.size(); ++n) {
+        const lsmo_test::TripleJunction& tj = set[n];
+        auto m = tj.build();
+        double err[2] = {0.0, 0.0};
+        for (int corr = 0; corr < 2; ++corr) {
+            tools::MultiObjectMeshSettings s;
+            s.junctionCorrection = corr == 1;
+            tools::lsmo_internal::MeshStats stats;
+            const auto meshes = meshWithStats(*m, s, stats);
+            ASSERT_EQ(meshes.size(), size_t(3));
+            for (const auto& kv : meshes) {
+                for (const Vec3s& p : kv.second.points) {
+                    const Vec3d w(p);
+                    const Vec3d x = m->phi()->transform().worldToIndex(w);
+                    const double depth = tj.H - std::max({std::abs(x[0] + 0.5),
+                        std::abs(x[1] + 0.5), std::abs(x[2] + 0.5)});
+                    if (depth < 3.0) continue; // box faces: not part of the analytic partition
+                    err[corr] = std::max(err[corr], std::abs(tj.signedDist(w, kv.first)) / tj.dx);
+                }
+            }
+            if (n == 0) printStats(std::string("junction 0 correction ") + (corr ? "on" : "off"), stats);
+        }
+        std::cout << "[MeshJunctionCorrection] junction " << n << ": max vertex error off "
+                  << err[0] << " dx, on " << err[1] << " dx" << std::endl;
+        if (n == 0) EXPECT_LT(err[1], err[0]) << "test 3 fixture";
+        worst[0] = std::max(worst[0], err[0]);
+        worst[1] = std::max(worst[1], err[1]);
+    }
+    std::cout << "[MeshJunctionCorrection] worst over " << set.size() << " junctions: off "
+              << worst[0] << " dx, on " << worst[1] << " dx" << std::endl;
+    EXPECT_LT(worst[1], worst[0]);
+}
+
+
+// Review focus 2 and 3: empty input, label ids, requested labels.
+TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
+{
+    {
+        auto xform = math::Transform::createLinearTransform(1.0);
+        FloatGrid::Ptr phi = FloatGrid::create(3.0f);
+        Int32Grid::Ptr lab = Int32Grid::create(0);
+        phi->setTransform(xform);
+        lab->setTransform(xform->copy());
+        MLS empty(phi, lab, 3);
+        EXPECT_TRUE(tools::multiObjectToMesh(empty).empty());
+        // background-only band: active voxels, all label 0
+        for (int i = 0; i < 10; ++i) {
+            phi->tree().setValue(Coord(i, 0, 0), 1.0f);
+            lab->tree().setValue(Coord(i, 0, 0), 0);
+        }
+        MLS bgOnly(phi, lab, 3);
+        EXPECT_TRUE(tools::multiObjectToMesh(bgOnly).empty());
+        EXPECT_TRUE(tools::multiObjectToMesh(bgOnly, {0}).empty());
+    }
+    const int32_t big = int32_t(1) << 30;
+    auto m = labelFixture(CoordBBox(Coord(0), Coord(11)), [big](const Coord& c) -> int32_t {
+        if (c[1] > 5 || c[2] > 5) return 0;
+        return c[0] <= 5 ? -7 : big; // two touching boxes
+    });
+    for (Conn conn : kAllConn) {
+        tools::MultiObjectMeshSettings s;
+        s.connectivity = conn;
+        const auto meshes = tools::multiObjectToMesh(*m, {}, s);
+        ASSERT_EQ(meshes.size(), size_t(2)) << connName(conn);
+        for (int32_t l : {-7, big}) {
+            ASSERT_TRUE(meshes.count(l)) << l;
+            const LabelMesh& mesh = meshes.at(l);
+            std::string why;
+            EXPECT_TRUE(isClosedManifold(mesh, 1.0, &why)) << l << ": " << why;
+            EXPECT_EQ(components(mesh), 1) << l;
+            EXPECT_EQ(eulerChar(mesh), 2) << l;
+            EXPECT_EQ(countFolded(mesh, *m, l), size_t(0)) << l;
+        }
+    }
+    // an interrupter that fires yields an empty result
+    struct Stop: public util::NullInterrupter
+    {
+        bool wasInterrupted(int = -1) override { return true; }
+    } stop;
+    EXPECT_TRUE(tools::multiObjectToMesh(*m, {}, tools::MultiObjectMeshSettings(), &stop).empty());
+    // requested labels: exactly those keys (absent ones empty), label 0 ignored
+    const auto some = tools::multiObjectToMesh(*m, {big, 5, 0});
+    ASSERT_EQ(some.size(), size_t(2));
+    EXPECT_FALSE(some.at(big).triangles.empty());
+    EXPECT_TRUE(some.at(5).points.empty() && some.at(5).triangles.empty());
+    EXPECT_TRUE(some.at(big).triangles == tools::multiObjectToMesh(*m).at(big).triangles);
 }

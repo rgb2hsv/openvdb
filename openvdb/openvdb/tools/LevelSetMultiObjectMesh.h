@@ -9,8 +9,66 @@
 /// digital voxel region under a chosen (foreground, background) adjacency
 /// pair, MultiObjectConnectivity.
 ///
-/// This header currently provides the settings struct and the
-/// connectivity-consistent marching-cubes case tables (spec 6.3 step 3).
+/// @par Usage
+/// @code
+/// auto mls = tools::MultiLevelSet<>::fromSignedGrids(grids);
+/// tools::MultiObjectMeshSettings settings;
+/// settings.connectivity = tools::MultiObjectConnectivity::FG26_BG6;
+/// std::map<int32_t, tools::LabelMesh> meshes = tools::multiObjectToMesh(*mls, {}, settings);
+/// for (const auto& [label, mesh] : meshes) { /* mesh.points, mesh.triangles */ }
+/// @endcode
+///
+/// @par Algorithm (spec 6.3, 6.4)
+/// - Cells are enumerated in blocks of LeafNodeType::DIM^3 minimum corners:
+///   every leaf of the label tree and its seven lower neighbour blocks (a
+///   cell whose minimum corner lies one voxel below a leaf has corners in
+///   it). A block reads its labels plus a one-voxel upper halo once; cells
+///   whose eight labels agree are skipped, so the work is proportional to the
+///   number of leaves near interfaces. Interfaces inside tiles (which valid
+///   MultiLevelSets never have) are not seen.
+/// - Classification is by labels, never by the sign of phi: for every
+///   non-zero label l among a mixed cell's corners the case index has bit i
+///   set when corner i has label l (inactive labels count, ruling R7b), so the
+///   meshes follow exactly the digital regions R_l.
+/// - The case table of the connectivity pair gives the cell's surface
+///   patches (disks, and tubes around body diagonals for 26-adjacency).
+/// - A vertex lies on the cell edge from p (in l) to q (not in l) at
+///   theta = phi_p / (phi_p + psi_q) from p, the linear zero crossing of
+///   psi_l, with theta clamped to [1e-3, 1 - 1e-3]. psi_q = phi_q, except
+///   with junctionCorrection on edges of a cell with three or more distinct
+///   labels (label 0 included), where psi_q is re-estimated within its proven
+///   bounds (see lsmo_internal::MeshContext::correctedOutside). Vertices are
+///   functions of (edge, label) only, so cells sharing an edge agree.
+/// - Ruling R34: the table's triangulation was tuned for edge midpoints. A
+///   patch whose triangulation, with the interpolated vertices, has a
+///   triangle of signed quality below 0.01 (folded against the patch's
+///   vector area, or near-degenerate; for a tube, against the radial
+///   direction of its diagonal) is re-triangulated: disks by the max-min
+///   quality polygon triangulation, tubes by the max-min quality strip over
+///   all start chords. Chords between two vertices on a common cube face are
+///   never used, so neighbouring cells cannot share an interior edge. Only the
+///   triangulation of a loop changes, never which vertices and loops exist,
+///   so the topology is the table's.
+/// - Vertices are deduplicated per block with a hash map keyed by (edge,
+///   label); vertices on edges shared with other blocks are merged in a final
+///   serial pass in block order, so the output is identical for every grain
+///   size.
+/// - Normals (optional) are the normalised gradient of psi_l (central
+///   differences) interpolated along the edge.
+///
+/// @par Guarantees
+/// Each label's mesh is a closed, consistently wound (counter-clockwise seen
+/// from outside) 2-manifold without zero-area triangles, with one component
+/// per boundary of the region (outer boundaries plus enclosed cavities) and
+/// Euler characteristic twice that of the digital region under the chosen
+/// connectivity pair. Interfaces between labels are not shared: two touching
+/// labels have coincident but separate surfaces.
+///
+/// @par References
+/// - J.-O. Lachaud, A. Montanvert, "Continuous analogs of digital
+///   boundaries: a topological approach to iso-surfaces", Graphical Models
+///   62(3), 2000.
+/// - W. E. Lorensen, H. E. Cline, "Marching cubes", SIGGRAPH 1987.
 ///
 /// @par Cube numbering (independent of VolumeToMesh.h)
 /// A cell is the 2x2x2 block of voxel centres with minimum corner ijk.
@@ -50,12 +108,23 @@
 #include <openvdb/Types.h>
 #include <openvdb/Exceptions.h>
 #include <openvdb/tools/LevelSetMultiObject.h>
+#include <openvdb/thread/Threading.h>
+#include <openvdb/tree/ValueAccessor.h>
+#include <openvdb/util/NullInterrupter.h>
+
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 
@@ -73,6 +142,18 @@ struct MultiObjectMeshSettings
     bool junctionCorrection = true;
     /// Also output per-vertex normals.
     bool computeNormals = false;
+    /// TBB grain size in blocks of cells; zero or negative runs serially.
+    /// The output does not depend on it.
+    int grainSize = 1;
+};
+
+
+/// @brief Triangle mesh of one label (spec 6.2).
+struct LabelMesh
+{
+    std::vector<Vec3s> points;     ///< world space
+    std::vector<Vec3I> triangles;  ///< counter-clockwise seen from outside the label
+    std::vector<Vec3s> normals;    ///< per point, unit, outward; empty unless requested
 };
 
 
@@ -362,7 +443,695 @@ caseTable(MultiObjectConnectivity conn)
     OPENVDB_THROW(ValueError, "unknown MultiObjectConnectivity");
 }
 
+////////////////////////////////////////
+// Contouring (spec 6.3, 6.4)
+
+
+/// Bit f is set when edge @a e lies on cube face f (f = 2*axis + side).
+inline uint8_t
+cubeEdgeFaces(int e)
+{
+    const int a = e / 4, k = e % 4;
+    const int b = a == 0 ? 1 : 0, c = a == 2 ? 1 : 2;
+    return uint8_t((1 << (2 * b + (k & 1))) | (1 << (2 * c + (k >> 1))));
+}
+
+/// @brief One surface patch of a case: a disk bounded by one loop or a tube
+/// (annulus) bounded by two, with the table's triangles.
+/// @details Loops list edge ids in boundary order, i.e. the order in which
+/// the patch's counter-clockwise triangles traverse them.
+struct CasePatch
+{
+    std::vector<std::array<uint8_t, 3>> tris;
+    std::vector<uint8_t> loop[2];
+    int tubeAxis[2] = {-1, -1};  ///< tube: the two antipodal corners it surrounds
+    bool tubeIn = false;         ///< tube around two in-corners (else two out-corners)
+    bool isTube() const { return !loop[1].empty(); }
+};
+
+using CasePatches = std::array<std::vector<CasePatch>, 256>;
+
+/// @brief Splits every case of @a table into its patches (connected
+/// components of triangles sharing an edge) and their boundary loops.
+/// @throw ValueError if a patch is neither a disk nor a tube around a body
+/// diagonal (the table generator never produces one).
+inline CasePatches
+buildCasePatches(const CaseTable& table)
+{
+    CasePatches out;
+    for (int c = 1; c < 255; ++c) {
+        const CaseTriangulation& ct = table[c];
+        const int n = ct.count;
+        int rep[16];
+        for (int i = 0; i < n; ++i) rep[i] = i;
+        auto find = [&](int x) { while (rep[x] != x) x = rep[x]; return x; };
+        for (int i = 0; i < n; ++i)
+            for (int j = i + 1; j < n; ++j) {
+                int shared = 0;
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) shared += ct.tris[i][a] == ct.tris[j][b];
+                if (shared >= 2) rep[find(i)] = find(j);
+            }
+        for (int root = 0; root < n; ++root) {
+            if (find(root) != root) continue;
+            CasePatch patch;
+            for (int i = 0; i < n; ++i)
+                if (find(i) == root) patch.tris.push_back(ct.tris[i]);
+            auto hasDirected = [&](int a, int b) {
+                for (const auto& t : patch.tris)
+                    for (int k = 0; k < 3; ++k)
+                        if (t[k] == a && t[(k + 1) % 3] == b) return true;
+                return false;
+            };
+            int next[12];
+            for (int e = 0; e < 12; ++e) next[e] = -1;
+            for (const auto& t : patch.tris)
+                for (int k = 0; k < 3; ++k) {
+                    const int a = t[k], b = t[(k + 1) % 3];
+                    if (hasDirected(b, a)) continue;
+                    if (next[a] != -1) {
+                        OPENVDB_THROW(ValueError, "multi-object mesh: non-manifold case patch");
+                    }
+                    next[a] = b;
+                }
+            bool seen[12] = {false};
+            int nLoops = 0;
+            for (int e = 0; e < 12; ++e) {
+                if (next[e] < 0 || seen[e]) continue;
+                if (nLoops == 2) {
+                    OPENVDB_THROW(ValueError, "multi-object mesh: case patch with > 2 loops");
+                }
+                for (int cur = e; !seen[cur]; cur = next[cur]) {
+                    seen[cur] = true;
+                    patch.loop[nLoops].push_back(uint8_t(cur));
+                }
+                ++nLoops;
+            }
+            if (patch.isTube()) {
+                int ins = 0, outs = 0;
+                for (const auto& t : patch.tris)
+                    for (int k = 0; k < 3; ++k) {
+                        const int c0 = kCubeEdgeCorners[t[k]][0], c1 = kCubeEdgeCorners[t[k]][1];
+                        const bool in0 = (c >> c0) & 1;
+                        ins |= 1 << (in0 ? c0 : c1);
+                        outs |= 1 << (in0 ? c1 : c0);
+                    }
+                auto antipodal = [](int mask, int* pair) {
+                    int m = 0;
+                    for (int i = 0; i < 8; ++i) if (mask & (1 << i)) { if (m < 2) pair[m] = i; ++m; }
+                    return m == 2 && (pair[0] ^ pair[1]) == 7;
+                };
+                if (antipodal(ins, patch.tubeAxis)) patch.tubeIn = true;
+                else if (!antipodal(outs, patch.tubeAxis)) {
+                    OPENVDB_THROW(ValueError, "multi-object mesh: tube patch without a diagonal axis");
+                }
+            }
+            out[c].push_back(std::move(patch));
+        }
+    }
+    return out;
+}
+
+/// The patches of caseTable(@a conn), built on first use.
+inline const CasePatches&
+casePatches(MultiObjectConnectivity conn)
+{
+    switch (conn) {
+        case MultiObjectConnectivity::FG26_BG6: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
+        case MultiObjectConnectivity::FG6_BG26: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
+        case MultiObjectConnectivity::FG18_BG6: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
+        case MultiObjectConnectivity::FG6_BG18: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
+    }
+    OPENVDB_THROW(ValueError, "unknown MultiObjectConnectivity");
+}
+
+/// Vertices stay at least this fraction of a cell edge away from its corners
+/// (so no triangle collapses when phi vanishes at a voxel centre).
+constexpr double kMeshThetaMin = 1e-3;
+
+/// A patch whose table triangulation has a triangle of quality below this
+/// is re-triangulated (ruling R34).
+constexpr double kMeshMinQuality = 1e-2;
+
+/// @brief Signed triangle quality 2*sqrt(3)*(n . ref) / (sum of squared edge
+/// lengths), with n = (b - a) x (c - a) and @a ref a unit reference normal:
+/// 1 for an equilateral triangle facing @a ref, 0 for a degenerate one,
+/// negative for a triangle folded against @a ref.
+inline double
+triangleQuality(const Vec3d& a, const Vec3d& b, const Vec3d& c, const Vec3d& ref)
+{
+    const Vec3d n = (b - a).cross(c - a);
+    const double s = (b - a).lengthSqr() + (c - b).lengthSqr() + (a - c).lengthSqr();
+    if (!(s > 0.0)) return -1.0;
+    return 2.0 * std::sqrt(3.0) * n.dot(ref) / s;
+}
+
+/// @brief Triangulation of the loop of edge ids @a e[0..n-1] (n <= 12) that
+/// maximises the minimum of quality(i, j, k) over its triangles (i < j < k
+/// loop positions, wound in loop order); chords between two vertices on a
+/// common cube face are not used (they could coincide with a neighbouring
+/// cell's edge). O(n^3) dynamic programming.
+/// @return the minimum quality, or -infinity if no triangulation exists
+/// (never for table loops, whose fan is one).
+template<typename QualityFn>
+inline double
+bestDiskTriangulation(const uint8_t* e, int n, const QualityFn& quality,
+    std::vector<std::array<int, 3>>& tris)
+{
+    constexpr double kNone = -std::numeric_limits<double>::infinity();
+    double best[12][12];
+    int arg[12][12];
+    auto chordOk = [&](int i, int j) {
+        return j == i + 1 || (i == 0 && j == n - 1) || (cubeEdgeFaces(e[i]) & cubeEdgeFaces(e[j])) == 0;
+    };
+    for (int i = 0; i + 1 < n; ++i) { best[i][i + 1] = std::numeric_limits<double>::infinity(); arg[i][i + 1] = -1; }
+    for (int len = 2; len < n; ++len) {
+        for (int i = 0; i + len < n; ++i) {
+            const int j = i + len;
+            best[i][j] = kNone;
+            arg[i][j] = -1;
+            for (int k = i + 1; k < j; ++k) {
+                if (!chordOk(i, k) || !chordOk(k, j)) continue;
+                if (best[i][k] == kNone || best[k][j] == kNone) continue;
+                const double v = std::min({best[i][k], best[k][j], quality(i, k, j)});
+                if (arg[i][j] < 0 || v > best[i][j]) { best[i][j] = v; arg[i][j] = k; }
+            }
+        }
+    }
+    tris.clear();
+    if (n < 3 || arg[0][n - 1] < 0) return kNone;
+    std::vector<std::pair<int, int>> stack{{0, n - 1}};
+    while (!stack.empty()) {
+        const auto ij = stack.back();
+        stack.pop_back();
+        const int k = arg[ij.first][ij.second];
+        if (k < 0) continue;
+        tris.push_back({ij.first, k, ij.second});
+        stack.push_back({ij.first, k});
+        stack.push_back({k, ij.second});
+    }
+    return best[0][n - 1];
+}
+
+/// @brief Triangle strip between loops @a A (m edges) and @a B (n edges) of
+/// a tube that maximises the minimum quality, over every start chord.
+/// @details Vertices are numbered 0..m-1 for A and m..m+n-1 for B. Walking
+/// forward along A and backward along B, each triangle is either
+/// (A[i], A[i+1], B[j]) or (B[j-1], B[j], A[i]), which keeps the winding of
+/// both loops. Chords between vertices on a common cube face are not used.
+/// @return the minimum quality, or -infinity if no strip exists (never for
+/// table tubes, whose strip is one).
+template<typename QualityFn>
+inline double
+bestTubeTriangulation(const uint8_t* A, int m, const uint8_t* B, int n, const QualityFn& quality,
+    std::vector<std::array<int, 3>>& tris)
+{
+    constexpr double kNone = -std::numeric_limits<double>::infinity();
+    auto chordOk = [&](int a, int b) { return (cubeEdgeFaces(A[a]) & cubeEdgeFaces(B[b])) == 0; };
+    double bestQ = kNone;
+    std::vector<std::array<int, 3>> cur;
+    double f[13][13];
+    int from[13][13]; // 0: A step, 1: B step
+    for (int i0 = 0; i0 < m; ++i0) {
+        for (int j0 = 0; j0 < n; ++j0) {
+            if (!chordOk(i0, j0)) continue;
+            auto ai = [&](int s) { return (i0 + s) % m; };
+            auto bj = [&](int t) { return ((j0 - t) % n + n) % n; };
+            for (int s = 0; s <= m; ++s) {
+                for (int t = 0; t <= n; ++t) {
+                    f[s][t] = kNone;
+                    from[s][t] = -1;
+                    if (s == 0 && t == 0) { f[0][0] = std::numeric_limits<double>::infinity(); continue; }
+                    if ((s == m && t == 0) || (s == 0 && t == n)) continue; // start chord reused
+                    if (!chordOk(ai(s), bj(t))) continue;
+                    if (s > 0 && f[s - 1][t] != kNone) {
+                        const double v = std::min(f[s - 1][t],
+                            quality(ai(s - 1), ai(s), m + bj(t)));
+                        if (from[s][t] < 0 || v > f[s][t]) { f[s][t] = v; from[s][t] = 0; }
+                    }
+                    if (t > 0 && f[s][t - 1] != kNone) {
+                        const double v = std::min(f[s][t - 1],
+                            quality(m + bj(t), m + bj(t - 1), ai(s)));
+                        if (from[s][t] < 0 || v > f[s][t]) { f[s][t] = v; from[s][t] = 1; }
+                    }
+                }
+            }
+            if (from[m][n] < 0 || !(f[m][n] > bestQ)) continue;
+            bestQ = f[m][n];
+            tris.clear();
+            for (int s = m, t = n; s > 0 || t > 0;) {
+                if (from[s][t] == 0) { tris.push_back({ai(s - 1), ai(s), m + bj(t)}); --s; }
+                else { tris.push_back({m + bj(t), m + bj(t - 1), ai(s)}); --t; }
+            }
+        }
+    }
+    return bestQ;
+}
+
+/// Counters of one contouring run (for tests and reports).
+struct MeshStats
+{
+    size_t patches = 0;         ///< (cell, label) surface patches
+    size_t retriangulated = 0;  ///< patches whose table triangulation was replaced (R34)
+    size_t folded = 0;          ///< patches left with a triangle of quality <= 0
+    size_t corrected = 0;       ///< vertex placements moved by junction correction (6.4; a vertex on an edge shared by two blocks counts twice)
+
+    MeshStats& operator+=(const MeshStats& o)
+    {
+        patches += o.patches; retriangulated += o.retriangulated;
+        folded += o.folded; corrected += o.corrected;
+        return *this;
+    }
+};
+
+/// Output of one block of cells, in block-local vertex numbering.
+struct MeshBlock
+{
+    struct Vertex
+    {
+        int32_t label;
+        Coord lo;       ///< lower end of the cell edge
+        uint8_t axis;   ///< direction of the cell edge
+        bool shared;    ///< the edge also belongs to cells of other blocks
+        Vec3s point;    ///< world space
+        Vec3s normal;
+    };
+    struct Triangle { int32_t label; uint32_t v[3]; };
+    std::vector<Vertex> vertices;
+    std::vector<Triangle> triangles;
+    MeshStats stats;
+};
+
+/// @brief Per-task contouring state: accessors and settings.
+template<typename FloatTreeT, typename LabelTreeT>
+struct MeshContext
+{
+    using LabelT = typename LabelTreeT::ValueType;
+
+    MeshContext(const FloatTreeT& phiTree, const LabelTreeT& labelTree,
+        const math::Transform& xf, const MultiObjectMeshSettings& s,
+        const std::vector<LabelT>* req)
+        : phi(phiTree), lab(labelTree), xform(xf), settings(s), requested(req)
+        , patches(casePatches(s.connectivity)), dx(xf.voxelSize()[0]) {}
+
+    /// psi_l(x): -phi inside label l, +phi elsewhere (labels via getValue).
+    double psi(const Coord& x, LabelT l)
+    {
+        const double v = double(phi.getValue(x));
+        return lab.getValue(x) == l ? -v : v;
+    }
+
+    /// True if one of the four cells around the edge (lo, lo + e_axis)
+    /// has three or more distinct labels (spec 6.4).
+    bool junctionEdge(const Coord& lo, int axis)
+    {
+        const int b = axis == 0 ? 1 : 0, c = axis == 2 ? 1 : 2;
+        LabelT seen[2] = {0, 0};
+        int n = 0;
+        for (int da = 0; da <= 1; ++da)
+            for (int db = -1; db <= 1; ++db)
+                for (int dc = -1; dc <= 1; ++dc) {
+                    Coord x = lo;
+                    x[axis] += da; x[b] += db; x[c] += dc;
+                    const LabelT v = lab.getValue(x);
+                    if ((n > 0 && v == seen[0]) || (n > 1 && v == seen[1])) continue;
+                    if (n == 2) return true;
+                    seen[n++] = v;
+                }
+        return false;
+    }
+
+    /// @brief Junction-corrected psi_l at the endpoint @a q outside label
+    /// @a l of a junction edge (spec 6.4).
+    /// @details phi_q is the distance to the boundary of q's own label, which
+    /// next to a third label may be that label's boundary rather than l's.
+    /// As in MultiLevelSet::extractSignedDistance (rulings R17, R19) two
+    /// bounds hold: psi_l(q) >= phi_q, and psi_l(q) <= |q - p| - phi_p for
+    /// every voxel p of label l (its ball of radius phi_p lies in l); the
+    /// latter is taken over the 5x5x5 neighbourhood of q. The estimate is one
+    /// local Godunov step on psi_l (per axis the smaller psi_l of the two
+    /// face neighbours, -phi in l and +phi elsewhere), clamped to
+    /// [phi_q, max(phi_q, upper bound)]. It depends only on q and l, so every
+    /// cell sharing the edge places the same vertex.
+    double correctedOutside(const Coord& q, LabelT l, double phiQ)
+    {
+        double upper = std::numeric_limits<double>::max();
+        for (int k = -2; k <= 2; ++k)
+            for (int j = -2; j <= 2; ++j)
+                for (int i = -2; i <= 2; ++i) {
+                    const Coord p = q.offsetBy(i, j, k);
+                    if (lab.getValue(p) != l) continue;
+                    upper = std::min(upper,
+                        dx * std::sqrt(double(i * i + j * j + k * k)) - double(phi.getValue(p)));
+                }
+        double abar[3], coef[3] = {1.0, 1.0, 1.0};
+        int m = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            Coord lo = q, hi = q;
+            lo[axis] -= 1;
+            hi[axis] += 1;
+            abar[m++] = std::min(psi(lo, l), psi(hi, l));
+        }
+        const double est = solveGodunov(abar, coef, m, dx);
+        return std::min(std::max(est, phiQ), std::max(upper, phiQ));
+    }
+
+    tree::ValueAccessor<const FloatTreeT> phi;
+    tree::ValueAccessor<const LabelTreeT> lab;
+    const math::Transform& xform;
+    const MultiObjectMeshSettings& settings;
+    const std::vector<LabelT>* requested;
+    const CasePatches& patches;
+    double dx;
+};
+
+/// @brief Contours the cells whose minimum corner lies in the block
+/// [o, o + dim - 1]^3 (spec 6.3 steps 1-4).
+template<typename FloatTreeT, typename LabelTreeT>
+void
+contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, MeshBlock& out)
+{
+    using LabelT = typename LabelTreeT::ValueType;
+    const int P = dim + 1;
+    std::vector<LabelT> L(size_t(P) * P * P);
+    auto at = [P](int x, int y, int z) { return (size_t(x) * P + y) * P + z; };
+    bool uniform = true;
+    for (int x = 0; x < P; ++x)
+        for (int y = 0; y < P; ++y)
+            for (int z = 0; z < P; ++z) {
+                L[at(x, y, z)] = ctx.lab.getValue(o.offsetBy(x, y, z));
+                uniform = uniform && L[at(x, y, z)] == L[0];
+            }
+    if (uniform) return;
+
+    std::unordered_map<uint64_t, uint32_t> vertexIds;
+    std::vector<Vec3d> indexPos; // index-space position of every block vertex
+    const bool normals = ctx.settings.computeNormals;
+    const bool correct = ctx.settings.junctionCorrection;
+
+    // vertex of label l on the edge (lo, lo + e_axis), lo block-local
+    auto vertex = [&](int lx, int ly, int lz, int axis, LabelT l, bool cellJunction,
+                      Vec3d& pos) -> uint32_t {
+        const uint64_t key = (uint64_t(uint32_t(l)) << 32)
+            | uint64_t(((size_t(lx) * P + ly) * P + lz) * 3 + axis);
+        auto it = vertexIds.find(key);
+        const Coord lo = o.offsetBy(lx, ly, lz);
+        if (it != vertexIds.end()) {
+            pos = indexPos[it->second];
+            return it->second;
+        }
+        Coord hi = lo;
+        hi[axis] += 1;
+        const bool loIn = ctx.lab.getValue(lo) == l;
+        const Coord p = loIn ? lo : hi, q = loIn ? hi : lo;
+        const double phiP = double(ctx.phi.getValue(p));
+        double psiQ = double(ctx.phi.getValue(q));
+        if (correct && (cellJunction || ctx.junctionEdge(lo, axis))) {
+            const double c = ctx.correctedOutside(q, l, psiQ);
+            if (c != psiQ) ++out.stats.corrected;
+            psiQ = c;
+        }
+        double theta = phiP + psiQ > 0.0 ? phiP / (phiP + psiQ) : 0.5;
+        theta = std::min(std::max(theta, kMeshThetaMin), 1.0 - kMeshThetaMin);
+        pos = p.asVec3d() + (q.asVec3d() - p.asVec3d()) * theta;
+        MeshBlock::Vertex v;
+        v.label = int32_t(l);
+        v.lo = lo;
+        v.axis = uint8_t(axis);
+        const int b = axis == 0 ? 1 : 0, c = axis == 2 ? 1 : 2;
+        const int lb = (b == 0 ? lx : (b == 1 ? ly : lz)), lc = (c == 1 ? ly : lz);
+        v.shared = lb == 0 || lb == dim || lc == 0 || lc == dim;
+        v.point = Vec3s(ctx.xform.indexToWorld(pos));
+        v.normal = Vec3s(0.0f);
+        if (normals) {
+            auto grad = [&](const Coord& x) {
+                Vec3d g;
+                for (int a = 0; a < 3; ++a) {
+                    Coord m = x, n = x;
+                    m[a] -= 1; n[a] += 1;
+                    g[a] = 0.5 * (ctx.psi(n, l) - ctx.psi(m, l));
+                }
+                return g;
+            };
+            Vec3d g = grad(p) * (1.0 - theta) + grad(q) * theta;
+            g = ctx.xform.baseMap()->applyIJT(g);
+            if (!(g.length() > 0.0)) g = ctx.xform.baseMap()->applyIJT(q.asVec3d() - p.asVec3d());
+            v.normal = Vec3s(g.unit());
+        }
+        const uint32_t id = uint32_t(out.vertices.size());
+        out.vertices.push_back(v);
+        indexPos.push_back(pos);
+        vertexIds.emplace(key, id);
+        return id;
+    };
+
+    std::vector<std::array<int, 3>> dpTris;
+    for (int x = 0; x < dim; ++x)
+        for (int y = 0; y < dim; ++y)
+            for (int z = 0; z < dim; ++z) {
+                LabelT cl[8];
+                bool mixed = false;
+                for (int c = 0; c < 8; ++c) {
+                    cl[c] = L[at(x + (c & 1), y + ((c >> 1) & 1), z + ((c >> 2) & 1))];
+                    mixed = mixed || cl[c] != cl[0];
+                }
+                if (!mixed) continue;
+                LabelT uniq[8];
+                int nu = 0;
+                for (int c = 0; c < 8; ++c) {
+                    bool found = false;
+                    for (int u = 0; u < nu && !found; ++u) found = uniq[u] == cl[c];
+                    if (!found) uniq[nu++] = cl[c];
+                }
+                std::sort(uniq, uniq + nu);
+                const bool cellJunction = nu >= 3;
+                const Vec3d cellMin = o.offsetBy(x, y, z).asVec3d();
+                for (int u = 0; u < nu; ++u) {
+                    const LabelT l = uniq[u];
+                    if (l == LabelT(0)) continue;
+                    if (ctx.requested && !std::binary_search(
+                            ctx.requested->begin(), ctx.requested->end(), l)) continue;
+                    int caseIdx = 0;
+                    for (int c = 0; c < 8; ++c) caseIdx |= int(cl[c] == l) << c;
+                    for (const CasePatch& patch : ctx.patches[caseIdx]) {
+                        ++out.stats.patches;
+                        // vertices of the patch, by edge id
+                        uint32_t vid[12];
+                        Vec3d pos[12];
+                        for (int k = 0; k < 2; ++k)
+                            for (uint8_t e : patch.loop[k]) {
+                                const int c0 = kCubeEdgeCorners[e][0];
+                                vid[e] = vertex(x + (c0 & 1), y + ((c0 >> 1) & 1),
+                                    z + ((c0 >> 2) & 1), e / 4, l, cellJunction, pos[e]);
+                            }
+                        // reference normal of the patch (ruling R34)
+                        Vec3d diskRef(0.0), axisLo, axisDir;
+                        if (patch.isTube()) {
+                            auto corner = [&](int c) {
+                                return cellMin + Vec3d(c & 1, (c >> 1) & 1, (c >> 2) & 1);
+                            };
+                            axisLo = corner(patch.tubeAxis[0]);
+                            axisDir = (corner(patch.tubeAxis[1]) - axisLo).unit();
+                        } else {
+                            const auto& lp = patch.loop[0];
+                            const Vec3d& p0 = pos[lp[0]];
+                            for (size_t i = 1; i + 1 < lp.size(); ++i)
+                                diskRef += (pos[lp[i]] - p0).cross(pos[lp[i + 1]] - p0);
+                            if (diskRef.length() > 0.0) diskRef.normalize();
+                        }
+                        auto quality = [&](int e0, int e1, int e2) {
+                            const Vec3d &a = pos[e0], &b = pos[e1], &c = pos[e2];
+                            if (!patch.isTube()) return triangleQuality(a, b, c, diskRef);
+                            const Vec3d cen = (a + b + c) / 3.0 - axisLo;
+                            Vec3d radial = cen - axisDir * axisDir.dot(cen);
+                            if (radial.length() > 0.0) radial.normalize();
+                            return triangleQuality(a, b, c, patch.tubeIn ? radial : -radial);
+                        };
+                        double minQ = std::numeric_limits<double>::infinity();
+                        for (const auto& t : patch.tris)
+                            minQ = std::min(minQ, quality(t[0], t[1], t[2]));
+                        bool replaced = false;
+                        if (minQ < kMeshMinQuality) {
+                            double q;
+                            if (patch.isTube()) {
+                                const auto &A = patch.loop[0], &B = patch.loop[1];
+                                const int m = int(A.size());
+                                auto edgeOf = [&](int i) { return i < m ? A[i] : B[i - m]; };
+                                q = bestTubeTriangulation(A.data(), m, B.data(), int(B.size()),
+                                    [&](int i, int j, int k) {
+                                        return quality(edgeOf(i), edgeOf(j), edgeOf(k)); }, dpTris);
+                                for (auto& t : dpTris) for (int& i : t) i = edgeOf(i);
+                            } else {
+                                const auto& lp = patch.loop[0];
+                                q = bestDiskTriangulation(lp.data(), int(lp.size()),
+                                    [&](int i, int j, int k) {
+                                        return quality(lp[i], lp[j], lp[k]); }, dpTris);
+                                for (auto& t : dpTris) for (int& i : t) i = lp[i];
+                            }
+                            if (q > minQ) {
+                                replaced = true;
+                                minQ = q;
+                                ++out.stats.retriangulated;
+                            }
+                        }
+                        if (!(minQ > 0.0)) ++out.stats.folded;
+                        if (replaced) {
+                            for (const auto& t : dpTris)
+                                out.triangles.push_back({int32_t(l), {vid[t[0]], vid[t[1]], vid[t[2]]}});
+                        } else {
+                            for (const auto& t : patch.tris)
+                                out.triangles.push_back({int32_t(l), {vid[t[0]], vid[t[1]], vid[t[2]]}});
+                        }
+                    }
+                }
+            }
+}
+
+/// Key of a vertex shared between blocks.
+struct MeshEdgeKey
+{
+    Coord lo;
+    int32_t label;
+    uint8_t axis;
+    bool operator==(const MeshEdgeKey& o) const
+    {
+        return lo == o.lo && label == o.label && axis == o.axis;
+    }
+};
+
+struct MeshEdgeKeyHash
+{
+    size_t operator()(const MeshEdgeKey& k) const
+    {
+        size_t h = std::hash<Coord>()(k.lo);
+        h ^= (size_t(uint32_t(k.label)) * 0x9E3779B97F4A7C15ull) + size_t(k.axis) + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+/// @brief multiObjectToMesh with optional statistics (spec 6.3, 6.4).
+template<typename MultiLevelSetT, typename InterruptT>
+std::map<int32_t, LabelMesh>
+contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels,
+    const MultiObjectMeshSettings& settings, InterruptT* interrupter, MeshStats* stats)
+{
+    using FloatTreeT = typename MultiLevelSetT::FloatGridT::TreeType;
+    using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
+    using LabelT = typename LabelTreeT::ValueType;
+
+    const FloatTreeT& phiTree = mls.phi()->tree();
+    const LabelTreeT& labelTree = mls.labels()->tree();
+    const math::Transform& xform = mls.phi()->transform();
+
+    std::map<int32_t, LabelMesh> result;
+    std::vector<LabelT> requested;
+    for (int32_t l : labels) {
+        if (l == 0) continue;
+        requested.push_back(LabelT(l));
+        result[l];
+    }
+    std::sort(requested.begin(), requested.end());
+    requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+    const bool all = labels.empty();
+    if (!all && requested.empty()) return result; // only label 0 was requested
+
+    // blocks: every leaf of the label tree and its lower neighbours (cells
+    // whose minimum corner is one voxel below a leaf have corners in it)
+    const int dim = int(LabelTreeT::LeafNodeType::DIM);
+    std::vector<Coord> blocks;
+    for (auto leaf = labelTree.cbeginLeaf(); leaf; ++leaf) {
+        const Coord o = leaf->origin();
+        for (int d = 0; d < 8; ++d)
+            blocks.push_back(o.offsetBy(-dim * (d & 1), -dim * ((d >> 1) & 1), -dim * ((d >> 2) & 1)));
+    }
+    std::sort(blocks.begin(), blocks.end());
+    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+
+    if (interrupter) interrupter->start("Contouring multi-object level set");
+    std::vector<MeshBlock> results(blocks.size());
+    bool interrupted = false;
+    auto body = [&](const tbb::blocked_range<size_t>& r) {
+        MeshContext<FloatTreeT, LabelTreeT> ctx(phiTree, labelTree, xform, settings,
+            all ? nullptr : &requested);
+        for (size_t i = r.begin(); i != r.end(); ++i) {
+            if (util::wasInterrupted(interrupter)) {
+                interrupted = true;
+                thread::cancelGroupExecution();
+                return;
+            }
+            contourBlock(ctx, blocks[i], dim, results[i]);
+        }
+    };
+    if (settings.grainSize > 0) {
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, blocks.size(), size_t(settings.grainSize)), body);
+    } else {
+        body(tbb::blocked_range<size_t>(0, blocks.size()));
+    }
+    if (interrupted) {
+        if (interrupter) interrupter->end();
+        return {};
+    }
+
+    // serial merge in block order (deterministic for any grain size)
+    const bool flip = xform.baseMap()->determinant() < 0.0;
+    std::unordered_map<MeshEdgeKey, uint32_t, MeshEdgeKeyHash> shared;
+    MeshStats total;
+    std::vector<uint32_t> remap;
+    for (MeshBlock& block : results) {
+        total += block.stats;
+        remap.resize(block.vertices.size());
+        int32_t lastLabel = 0;
+        LabelMesh* mesh = nullptr;
+        auto meshOf = [&](int32_t l) -> LabelMesh& {
+            if (!mesh || l != lastLabel) { mesh = &result[l]; lastLabel = l; }
+            return *mesh;
+        };
+        for (size_t i = 0; i < block.vertices.size(); ++i) {
+            const MeshBlock::Vertex& v = block.vertices[i];
+            LabelMesh& m = meshOf(v.label);
+            if (v.shared) {
+                auto ins = shared.emplace(MeshEdgeKey{v.lo, v.label, v.axis}, uint32_t(m.points.size()));
+                if (!ins.second) { remap[i] = ins.first->second; continue; }
+            }
+            remap[i] = uint32_t(m.points.size());
+            m.points.push_back(v.point);
+            if (settings.computeNormals) m.normals.push_back(v.normal);
+        }
+        for (const MeshBlock::Triangle& t : block.triangles) {
+            LabelMesh& m = meshOf(t.label);
+            if (flip) m.triangles.emplace_back(remap[t.v[0]], remap[t.v[2]], remap[t.v[1]]);
+            else m.triangles.emplace_back(remap[t.v[0]], remap[t.v[1]], remap[t.v[2]]);
+        }
+        MeshBlock().vertices.swap(block.vertices);
+        MeshBlock().triangles.swap(block.triangles);
+    }
+    if (stats) *stats = total;
+    if (interrupter) interrupter->end();
+    return result;
+}
+
+
 } // namespace lsmo_internal
+
+
+/// @brief Contours every requested label of a multi-object level set into a
+/// closed, consistently wound 2-manifold triangle mesh whose topology matches
+/// the label's digital region under settings.connectivity (spec 6).
+/// @details See the file documentation.
+/// @param mls     the phi / label pair
+/// @param labels  labels to mesh; empty meshes every non-zero label that has a
+///                boundary. Label 0 is never meshed. A requested label always
+///                has a key in the result (with an empty mesh if absent).
+/// @param settings connectivity, junction correction, normals, grain size
+/// @param interrupter checked once per block of cells; if it fires, the
+///                result is empty
+template<typename MultiLevelSetT, typename InterruptT = util::NullInterrupter>
+std::map<int32_t, LabelMesh>
+multiObjectToMesh(const MultiLevelSetT& mls, const std::vector<int32_t>& labels = {},
+    const MultiObjectMeshSettings& settings = {}, InterruptT* interrupter = nullptr)
+{
+    return lsmo_internal::contourMultiObject(mls, labels, settings, interrupter, nullptr);
+}
 
 } // namespace tools
 } // namespace OPENVDB_VERSION_NAME
