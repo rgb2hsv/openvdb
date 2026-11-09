@@ -897,14 +897,19 @@ contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, 
                     mixed = mixed || cl[c] != cl[0];
                 }
                 if (!mixed) continue;
+                // distinct labels of the cell, sorted ascending (insertion
+                // sort: at most 8 values, and std::sort on a stack array draws
+                // a false -Warray-bounds from GCC 14)
                 LabelT uniq[8];
                 int nu = 0;
                 for (int c = 0; c < 8; ++c) {
                     bool found = false;
                     for (int u = 0; u < nu && !found; ++u) found = uniq[u] == cl[c];
-                    if (!found) uniq[nu++] = cl[c];
+                    if (found) continue;
+                    int pos = nu++;
+                    while (pos > 0 && uniq[pos - 1] > cl[c]) { uniq[pos] = uniq[pos - 1]; --pos; }
+                    uniq[pos] = cl[c];
                 }
-                std::sort(uniq, uniq + nu);
                 const bool cellJunction = nu >= 3;
                 const Vec3d cellMin = o.offsetBy(x, y, z).asVec3d();
                 for (int u = 0; u < nu; ++u) {

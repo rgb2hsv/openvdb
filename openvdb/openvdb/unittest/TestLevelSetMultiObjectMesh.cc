@@ -312,8 +312,12 @@ checkCase(Conn conn, int caseIdx, const tools::lsmo_internal::CaseTriangulation&
     // 4. winding. (a) at the cube boundary, n_face x (b - a) points from the
     // in-corner to the out-corner of both endpoint edges;
     for (const auto& s : boundary) {
-        const int f = [&] { for (int g = 0; g < 6; ++g)
-            if (C.faceMask[s.first] & C.faceMask[s.second] & (1 << g)) return g; return -1; }();
+        const int f = [&] {
+            for (int g = 0; g < 6; ++g) {
+                if (C.faceMask[s.first] & C.faceMask[s.second] & (1 << g)) return g;
+            }
+            return -1;
+        }();
         const Vec3d side = C.faceNormal[f].cross(C.mid[s.second] - C.mid[s.first]);
         for (int e : {s.first, s.second})
             if (side.dot(C.corner[outC(e)] - C.corner[inC(e)]) <= 0.0) {
@@ -962,7 +966,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshJunctionCorrection)
         }
         std::cout << "[MeshJunctionCorrection] junction " << n << ": max vertex error off "
                   << err[0] << " dx, on " << err[1] << " dx" << std::endl;
-        if (n == 0) EXPECT_LT(err[1], err[0]) << "test 3 fixture";
+        if (n == 0) { EXPECT_LT(err[1], err[0]) << "test 3 fixture"; }
         worst[0] = std::max(worst[0], err[0]);
         worst[1] = std::max(worst[1], err[1]);
     }

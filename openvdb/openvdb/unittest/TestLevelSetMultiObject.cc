@@ -880,7 +880,7 @@ TEST_F(TestLevelSetMultiObject, ExtractMatchesRoundTrip)
         // the sign is right everywhere and deep values have the right sign
         for (auto it = g->tree().cbeginValueOn(); it; ++it) {
             const Vec3d w = g->indexToWorld(it.getCoord());
-            if (std::abs(analytic(w)) > 0.5 * dx) EXPECT_EQ(*it < 0.0f, analytic(w) < 0.0);
+            if (std::abs(analytic(w)) > 0.5 * dx) { EXPECT_EQ(*it < 0.0f, analytic(w) < 0.0); }
         }
         EXPECT_LT(g->tree().getValue(g->transform().worldToIndexCellCentered(
             Vec3d(l == 2 ? 15.0 : -15.0, 0, 0))), 0.0f);
@@ -1016,8 +1016,10 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
     for (int i = -1; i <= 1; ++i)
         for (int j = -1; j <= 1; ++j)
             for (int k = -1; k <= 1; ++k) {
-                const float d = 0.8f + 0.35f * i - 0.2f * j + 0.1f * k + 0.07f * i * i
-                    + 0.05f * j * j - 0.03f * k * k + 0.04f * i * j - 0.02f * i * k + 0.06f * j * k;
+                const float fi = float(i), fj = float(j), fk = float(k);
+                const float d = 0.8f + 0.35f * fi - 0.2f * fj + 0.1f * fk + 0.07f * fi * fi
+                    + 0.05f * fj * fj - 0.03f * fk * fk + 0.04f * fi * fj - 0.02f * fi * fk
+                    + 0.06f * fj * fk;
                 pa.setValue(Coord(i, j, k), d);
                 la.setValue(Coord(i, j, k), 1);
                 v[i + 1][j + 1][k + 1] = -d;
@@ -1717,7 +1719,7 @@ referenceAdvect(FloatGrid& ref, const Vec3SGrid& vel, double t0, double t1)
     tools::LevelSetAdvection<FloatGrid, Field> adv(ref, field);
     adv.setSpatialScheme(math::FIRST_BIAS);
     adv.setTemporalScheme(math::TVD_RK1);
-    adv.advect(t0, t1);
+    adv.advect(float(t0), float(t1));
 }
 
 void
@@ -1917,7 +1919,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
             std::cout << "Tornado: t " << tc << " steps " << n << " contacts " << p.size();
             for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
             std::cout << std::endl;
-            if (after > 0) EXPECT_GE(p.size(), size_t(4)) << "t " << tc;
+            if (after > 0) { EXPECT_GE(p.size(), size_t(4)) << "t " << tc; }
             return !::testing::Test::HasFailure();
         });
     ASSERT_FALSE(::testing::Test::HasFailure());
