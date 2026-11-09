@@ -18,7 +18,7 @@
 /// for (const auto& [label, mesh] : meshes) { /* mesh.points, mesh.triangles */ }
 /// @endcode
 ///
-/// @par Algorithm (spec 6.3, 6.4)
+/// @par Algorithm
 /// - Cells are enumerated in blocks of LeafNodeType::DIM^3 minimum corners:
 ///   every leaf of the label tree and its seven lower neighbour blocks (a
 ///   cell whose minimum corner lies one voxel below a leaf has corners in
@@ -28,8 +28,9 @@
 ///   MultiLevelSets never have) are not seen.
 /// - Classification is by labels, never by the sign of phi: for every
 ///   non-zero label l among a mixed cell's corners the case index has bit i
-///   set when corner i has label l (inactive labels count, ruling R7b), so the
-///   meshes follow exactly the digital regions R_l.
+///   set when corner i has label l (inactive labels count: they hold the
+///   label of the region they lie in), so the meshes follow exactly the
+///   digital regions R_l.
 /// - The case table of the connectivity pair gives the cell's surface
 ///   patches (disks, and tubes around body diagonals for 26-adjacency).
 /// - A vertex lies on the cell edge from p (in l) to q (not in l) at
@@ -39,7 +40,8 @@
 ///   labels (label 0 included), where psi_q is re-estimated within its proven
 ///   bounds (see lsmo_internal::MeshContext::correctedOutside). Vertices are
 ///   functions of (edge, label) only, so cells sharing an edge agree.
-/// - Ruling R34: the table's triangulation was tuned for edge midpoints. A
+/// - Re-triangulation: the table's triangulation is designed for vertices
+///   at edge midpoints, and interpolated vertices can fold it. A
 ///   patch whose triangulation, with the interpolated vertices, has a
 ///   triangle of signed quality below 0.01 (folded against the patch's
 ///   vector area, or near-degenerate; for a tube, against the radial
@@ -63,6 +65,12 @@
 /// Euler characteristic twice that of the digital region under the chosen
 /// connectivity pair. Interfaces between labels are not shared: two touching
 /// labels have coincident but separate surfaces.
+///
+/// Vertex positions, unlike the topology, depend on phi: when phi is not a
+/// distance field near the interface (e.g. an unredistanced or noisy grid),
+/// interpolated vertices can be placed inconsistently and a triangle can
+/// fold (face against its patch), even after re-triangulation. The topology
+/// guarantees above still hold.
 ///
 /// @par References
 /// - J.-O. Lachaud, A. Montanvert, "Continuous analogs of digital
@@ -135,12 +143,14 @@ OPENVDB_USE_VERSION_NAMESPACE
 namespace OPENVDB_VERSION_NAME {
 namespace tools {
 
-/// @brief Settings of the multi-label mesher (spec 6.2).
+/// @brief Settings of the multi-label mesher.
 struct MultiObjectMeshSettings
 {
     /// Digital (foreground, background) adjacency the meshes are consistent with.
     MultiObjectConnectivity connectivity = MultiObjectConnectivity::FG26_BG6;
-    /// Snap vertices at junctions of three or more labels (spec 6.4).
+    /// Re-estimate vertices at junctions of three or more labels, where phi
+    /// may be the distance to a third label's boundary (see
+    /// lsmo_internal::MeshContext::correctedOutside).
     bool junctionCorrection = true;
     /// Also output per-vertex normals.
     bool computeNormals = false;
@@ -150,7 +160,7 @@ struct MultiObjectMeshSettings
 };
 
 
-/// @brief Triangle mesh of one label (spec 6.2).
+/// @brief Triangle mesh of one label.
 struct LabelMesh
 {
     std::vector<Vec3s> points;     ///< world space
@@ -230,7 +240,8 @@ generateCaseTable(int fg, int bg)
     };
     auto fail = [&](int caseIdx, const char* what) {
         std::ostringstream os;
-        os << "multi-object case table (" << fg << "," << bg << "), case " << caseIdx << ": " << what;
+        os << "multi-object case table (" << fg << "," << bg << "), case " << caseIdx
+           << ": " << what;
         OPENVDB_THROW(ValueError, os.str());
     };
 
@@ -360,9 +371,12 @@ generateCaseTable(int fg, int bg)
                         for (size_t q = 0; q < loops.size() && lb < 0; ++q) {
                             if (p == q || !loops[p].disk || !loops[q].disk) continue;
                             const Loop &P = loops[p], &Q = loops[q];
-                            const int pr = in ? P.inRegion : P.outRegion, qr = in ? Q.inRegion : Q.outRegion;
-                            const int po = in ? P.outRegion : P.inRegion, qo = in ? Q.outRegion : Q.inRegion;
-                            if (find(pr) == find(a) && find(qr) == find(b) && find(po) == find(qo)) {
+                            const int pr = in ? P.inRegion : P.outRegion;
+                            const int qr = in ? Q.inRegion : Q.outRegion;
+                            const int po = in ? P.outRegion : P.inRegion;
+                            const int qo = in ? Q.outRegion : Q.inRegion;
+                            if (find(pr) == find(a) && find(qr) == find(b)
+                                && find(po) == find(qo)) {
                                 la = int(p); lb = int(q);
                             }
                         }
@@ -437,16 +451,28 @@ inline const CaseTable&
 caseTable(MultiObjectConnectivity conn)
 {
     switch (conn) {
-        case MultiObjectConnectivity::FG26_BG6: { static const CaseTable t = generateCaseTable(26, 6); return t; }
-        case MultiObjectConnectivity::FG6_BG26: { static const CaseTable t = generateCaseTable(6, 26); return t; }
-        case MultiObjectConnectivity::FG18_BG6: { static const CaseTable t = generateCaseTable(18, 6); return t; }
-        case MultiObjectConnectivity::FG6_BG18: { static const CaseTable t = generateCaseTable(6, 18); return t; }
+        case MultiObjectConnectivity::FG26_BG6: {
+            static const CaseTable t = generateCaseTable(26, 6);
+            return t;
+        }
+        case MultiObjectConnectivity::FG6_BG26: {
+            static const CaseTable t = generateCaseTable(6, 26);
+            return t;
+        }
+        case MultiObjectConnectivity::FG18_BG6: {
+            static const CaseTable t = generateCaseTable(18, 6);
+            return t;
+        }
+        case MultiObjectConnectivity::FG6_BG18: {
+            static const CaseTable t = generateCaseTable(6, 18);
+            return t;
+        }
     }
     OPENVDB_THROW(ValueError, "unknown MultiObjectConnectivity");
 }
 
 ////////////////////////////////////////
-// Contouring (spec 6.3, 6.4)
+// Contouring
 
 
 /// Bit f is set when edge @a e lies on cube face f (f = 2*axis + side).
@@ -540,12 +566,15 @@ buildCasePatches(const CaseTable& table)
                     }
                 auto antipodal = [](int mask, int* pair) {
                     int m = 0;
-                    for (int i = 0; i < 8; ++i) if (mask & (1 << i)) { if (m < 2) pair[m] = i; ++m; }
+                    for (int i = 0; i < 8; ++i) {
+                        if (mask & (1 << i)) { if (m < 2) pair[m] = i; ++m; }
+                    }
                     return m == 2 && (pair[0] ^ pair[1]) == 7;
                 };
                 if (antipodal(ins, patch.tubeAxis)) patch.tubeIn = true;
                 else if (!antipodal(outs, patch.tubeAxis)) {
-                    OPENVDB_THROW(ValueError, "multi-object mesh: tube patch without a diagonal axis");
+                    OPENVDB_THROW(ValueError,
+                        "multi-object mesh: tube patch without a diagonal axis");
                 }
             }
             out[c].push_back(std::move(patch));
@@ -559,10 +588,22 @@ inline const CasePatches&
 casePatches(MultiObjectConnectivity conn)
 {
     switch (conn) {
-        case MultiObjectConnectivity::FG26_BG6: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
-        case MultiObjectConnectivity::FG6_BG26: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
-        case MultiObjectConnectivity::FG18_BG6: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
-        case MultiObjectConnectivity::FG6_BG18: { static const CasePatches p = buildCasePatches(caseTable(conn)); return p; }
+        case MultiObjectConnectivity::FG26_BG6: {
+            static const CasePatches p = buildCasePatches(caseTable(conn));
+            return p;
+        }
+        case MultiObjectConnectivity::FG6_BG26: {
+            static const CasePatches p = buildCasePatches(caseTable(conn));
+            return p;
+        }
+        case MultiObjectConnectivity::FG18_BG6: {
+            static const CasePatches p = buildCasePatches(caseTable(conn));
+            return p;
+        }
+        case MultiObjectConnectivity::FG6_BG18: {
+            static const CasePatches p = buildCasePatches(caseTable(conn));
+            return p;
+        }
     }
     OPENVDB_THROW(ValueError, "unknown MultiObjectConnectivity");
 }
@@ -572,7 +613,7 @@ casePatches(MultiObjectConnectivity conn)
 constexpr double kMeshThetaMin = 1e-3;
 
 /// A patch whose table triangulation has a triangle of quality below this
-/// is re-triangulated (ruling R34).
+/// is re-triangulated (see the file documentation).
 constexpr double kMeshMinQuality = 1e-2;
 
 /// @brief Signed triangle quality 2*sqrt(3)*(n . ref) / (sum of squared edge
@@ -604,9 +645,13 @@ bestDiskTriangulation(const uint8_t* e, int n, const QualityFn& quality,
     double best[12][12];
     int arg[12][12];
     auto chordOk = [&](int i, int j) {
-        return j == i + 1 || (i == 0 && j == n - 1) || (cubeEdgeFaces(e[i]) & cubeEdgeFaces(e[j])) == 0;
+        return j == i + 1 || (i == 0 && j == n - 1)
+            || (cubeEdgeFaces(e[i]) & cubeEdgeFaces(e[j])) == 0;
     };
-    for (int i = 0; i + 1 < n; ++i) { best[i][i + 1] = std::numeric_limits<double>::infinity(); arg[i][i + 1] = -1; }
+    for (int i = 0; i + 1 < n; ++i) {
+        best[i][i + 1] = std::numeric_limits<double>::infinity();
+        arg[i][i + 1] = -1;
+    }
     for (int len = 2; len < n; ++len) {
         for (int i = 0; i + len < n; ++i) {
             const int j = i + len;
@@ -663,7 +708,10 @@ bestTubeTriangulation(const uint8_t* A, int m, const uint8_t* B, int n, const Qu
                 for (int t = 0; t <= n; ++t) {
                     f[s][t] = kNone;
                     from[s][t] = -1;
-                    if (s == 0 && t == 0) { f[0][0] = std::numeric_limits<double>::infinity(); continue; }
+                    if (s == 0 && t == 0) {
+                        f[0][0] = std::numeric_limits<double>::infinity();
+                        continue;
+                    }
                     if ((s == m && t == 0) || (s == 0 && t == n)) continue; // start chord reused
                     if (!chordOk(ai(s), bj(t))) continue;
                     if (s > 0 && f[s - 1][t] != kNone) {
@@ -694,9 +742,13 @@ bestTubeTriangulation(const uint8_t* A, int m, const uint8_t* B, int n, const Qu
 struct MeshStats
 {
     size_t patches = 0;         ///< (cell, label) surface patches
-    size_t retriangulated = 0;  ///< patches whose table triangulation was replaced (R34)
-    size_t folded = 0;          ///< patches left with a triangle of quality <= 0
-    size_t corrected = 0;       ///< vertex placements moved by junction correction (6.4; a vertex on an edge shared by two blocks counts twice)
+    /// patches whose table triangulation was replaced
+    size_t retriangulated = 0;
+    /// patches left with a triangle of quality <= 0
+    size_t folded = 0;
+    /// vertex placements moved by junction correction (a vertex on an edge
+    /// shared by two blocks counts twice)
+    size_t corrected = 0;
 
     MeshStats& operator+=(const MeshStats& o)
     {
@@ -728,6 +780,8 @@ struct MeshBlock
 template<typename FloatTreeT, typename LabelTreeT>
 struct MeshContext
 {
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
     using LabelT = typename LabelTreeT::ValueType;
 
     MeshContext(const FloatTreeT& phiTree, const LabelTreeT& labelTree,
@@ -743,8 +797,13 @@ struct MeshContext
         return lab.getValue(x) == l ? -v : v;
     }
 
-    /// True if one of the four cells around the edge (lo, lo + e_axis)
-    /// has three or more distinct labels (spec 6.4).
+    /// True if the 18 voxels of the four cells around the edge
+    /// (lo, lo + e_axis), i.e. the union of their corners (2 along the
+    /// axis by 3x3 across it), hold three or more distinct labels. This is
+    /// slightly wider than "some cell around the edge has three labels", so
+    /// a few edges next to a junction are corrected too; the correction is
+    /// a function of the edge's endpoint and label only, so it stays
+    /// consistent between cells.
     bool junctionEdge(const Coord& lo, int axis)
     {
         const int b = axis == 0 ? 1 : 0, c = axis == 2 ? 1 : 2;
@@ -764,11 +823,11 @@ struct MeshContext
     }
 
     /// @brief Junction-corrected psi_l at the endpoint @a q outside label
-    /// @a l of a junction edge (spec 6.4).
+    /// @a l of a junction edge.
     /// @details phi_q is the distance to the boundary of q's own label, which
     /// next to a third label may be that label's boundary rather than l's.
-    /// As in MultiLevelSet::extractSignedDistance (rulings R17, R19) two
-    /// bounds hold: psi_l(q) >= phi_q, and psi_l(q) <= |q - p| - phi_p for
+    /// As in MultiLevelSet::extractSignedDistance two bounds hold:
+    /// psi_l(q) >= phi_q, and psi_l(q) <= |q - p| - phi_p for
     /// every voxel p of label l (its ball of radius phi_p lies in l); the
     /// latter is taken over the 5x5x5 neighbourhood of q. The estimate is one
     /// local Godunov step on psi_l (per axis the smaller psi_l of the two
@@ -808,13 +867,11 @@ struct MeshContext
 };
 
 /// @brief Contours the cells whose minimum corner lies in the block
-/// [o, o + dim - 1]^3 (spec 6.3 steps 1-4).
+/// [o, o + dim - 1]^3.
 template<typename FloatTreeT, typename LabelTreeT>
 void
 contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, MeshBlock& out)
 {
-    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
-        "the distance tree must have float values");
     using LabelT = typename LabelTreeT::ValueType;
     const int P = dim + 1;
     std::vector<LabelT> L(size_t(P) * P * P);
@@ -933,7 +990,7 @@ contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, 
                                 vid[e] = vertex(x + (c0 & 1), y + ((c0 >> 1) & 1),
                                     z + ((c0 >> 2) & 1), e / 4, l, cellJunction, pos[e]);
                             }
-                        // reference normal of the patch (ruling R34)
+                        // reference normal of the patch, for re-triangulation
                         Vec3d diskRef(0.0), axisLo, axisDir;
                         if (patch.isTube()) {
                             auto corner = [&](int c) {
@@ -986,10 +1043,12 @@ contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, 
                         if (!(minQ > 0.0)) ++out.stats.folded;
                         if (replaced) {
                             for (const auto& t : dpTris)
-                                out.triangles.push_back({int32_t(l), {vid[t[0]], vid[t[1]], vid[t[2]]}});
+                                out.triangles.push_back(
+                                    {int32_t(l), {vid[t[0]], vid[t[1]], vid[t[2]]}});
                         } else {
                             for (const auto& t : patch.tris)
-                                out.triangles.push_back({int32_t(l), {vid[t[0]], vid[t[1]], vid[t[2]]}});
+                                out.triangles.push_back(
+                                    {int32_t(l), {vid[t[0]], vid[t[1]], vid[t[2]]}});
                         }
                     }
                 }
@@ -1013,12 +1072,13 @@ struct MeshEdgeKeyHash
     size_t operator()(const MeshEdgeKey& k) const
     {
         size_t h = std::hash<Coord>()(k.lo);
-        h ^= (size_t(uint32_t(k.label)) * 0x9E3779B97F4A7C15ull) + size_t(k.axis) + (h << 6) + (h >> 2);
+        h ^= (size_t(uint32_t(k.label)) * 0x9E3779B97F4A7C15ull) + size_t(k.axis)
+            + (h << 6) + (h >> 2);
         return h;
     }
 };
 
-/// @brief multiObjectToMesh with optional statistics (spec 6.3, 6.4).
+/// @brief multiObjectToMesh with optional statistics.
 template<typename MultiLevelSetT, typename InterruptT>
 std::map<int32_t, LabelMesh>
 contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels,
@@ -1051,7 +1111,8 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
     for (auto leaf = labelTree.cbeginLeaf(); leaf; ++leaf) {
         const Coord o = leaf->origin();
         for (int d = 0; d < 8; ++d)
-            blocks.push_back(o.offsetBy(-dim * (d & 1), -dim * ((d >> 1) & 1), -dim * ((d >> 2) & 1)));
+            blocks.push_back(o.offsetBy(
+                -dim * (d & 1), -dim * ((d >> 1) & 1), -dim * ((d >> 2) & 1)));
     }
     std::sort(blocks.begin(), blocks.end());
     blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
@@ -1073,7 +1134,8 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
         }
     };
     if (parallel) {
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, blocks.size(), size_t(settings.grainSize)), body);
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, blocks.size(), size_t(settings.grainSize)), body);
     } else {
         body(tbb::blocked_range<size_t>(0, blocks.size()));
     }
@@ -1100,7 +1162,8 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
             const MeshBlock::Vertex& v = block.vertices[i];
             LabelMesh& m = meshOf(v.label);
             if (v.shared) {
-                auto ins = shared.emplace(MeshEdgeKey{v.lo, v.label, v.axis}, uint32_t(m.points.size()));
+                auto ins = shared.emplace(MeshEdgeKey{v.lo, v.label, v.axis},
+                    uint32_t(m.points.size()));
                 if (!ins.second) { remap[i] = ins.first->second; continue; }
             }
             remap[i] = uint32_t(m.points.size());
@@ -1126,7 +1189,7 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
 
 /// @brief Contours every requested label of a multi-object level set into a
 /// closed, consistently wound 2-manifold triangle mesh whose topology matches
-/// the label's digital region under settings.connectivity (spec 6).
+/// the label's digital region under settings.connectivity.
 /// @details See the file documentation.
 /// @param mls     the phi / label pair
 /// @param labels  labels to mesh; empty meshes every non-zero label that has a

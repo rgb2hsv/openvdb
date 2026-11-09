@@ -436,7 +436,7 @@ namespace {
 // active band x in [4, 11] (four voxels on each side), y, z in [0, 15].
 // Layers x in [7 - halo, 8 + halo] hold the exact distances (halo 0: the two
 // interface layers, enough for redistance(); halo 1: also the outer
-// neighbours read by the spec 5.1 reseed); if @a exact is false the remaining
+// neighbours read by the subcell reseed); if @a exact is false the remaining
 // band voxels hold garbage (alternating 0.5*dx and halfWidth*dx).
 MLS::Ptr
 makePlanar(double dx, bool exact, int halo = 1)
@@ -461,7 +461,7 @@ makePlanar(double dx, bool exact, int halo = 1)
                 la.setValue(c, i <= 7 ? 1 : 2);
             }
     // One inactive shell around the band holding the deep-interior labels
-    // (ruling R7b), with phi leaves kept in lockstep at the background.
+    // (inactive labels keep their region's label), with phi leaves kept in lockstep at the background.
     for (int i = 3; i <= 12; ++i)
         for (int j = -1; j <= 16; ++j)
             for (int k = -1; k <= 16; ++k) {
@@ -529,7 +529,7 @@ namespace {
 
 // Ball of radius R (index units) at @a ctr: label 1 inside, 2 outside; band
 // |r - R| <= 3 voxels with phi = |r - R|*dx, and every other voxel of the
-// box [lo, hi]^3 inactive with its deep-interior label (ruling R7b).
+// box [lo, hi]^3 inactive with its deep-interior label (inactive labels keep their region's label).
 MLS::Ptr
 makeBall(double dx, const Vec3d& ctr, double R, int lo, int hi)
 {
@@ -615,9 +615,9 @@ TEST_F(TestLevelSetMultiObject, RedistanceCurvedNoDrift)
         }
     }
     ASSERT_GT(nPairs, Index64(100));
-    // Regression guard only (ruling R13): the spec 5.1 formula's curvature
-    // bias measures 0.0262*dx here, and the exact field scores 0.0109*dx on
-    // this metric. The spec accuracy gates are tested in Task 3.
+    // Regression guard only: the subcell reseed's curvature bias measures
+    // 0.0262*dx here, and the exact field scores 0.0109*dx on this metric.
+    // The accuracy gates are tested by the round-trip tests.
     EXPECT_LT(sumErr / double(nPairs), 0.03);
 }
 
@@ -625,7 +625,7 @@ TEST_F(TestLevelSetMultiObject, RedistanceOrderIndependent)
 {
     // Three labels over several leaves: a ball split into labels 1 | 2 by the
     // plane x = 11.5, label 3 outside; phi starts as a rough guess. Inactive
-    // voxels of [-1, 24]^3 hold their deep-interior label (ruling R7b).
+    // voxels of [-1, 24]^3 hold their deep-interior label (inactive labels keep their region's label).
     auto build = []() {
         const double dx = 0.25;
         auto xform = math::Transform::createLinearTransform(dx);
@@ -776,7 +776,7 @@ rawSignedGrid(const MLS& m, int32_t label, std::function<bool(Vec3d)> keep)
     return g;
 }
 
-// Ruling R11: every seed (an active voxel with a face neighbour, active or
+// Every seed (an active voxel with a face neighbour, active or
 // not, of a different label, as the redistancer sees it) lies within one
 // voxel of the true interface; distToInterface takes world coordinates.
 void
@@ -930,7 +930,7 @@ TEST_F(TestLevelSetMultiObject, FromLabelGrid)
     });
 
     // Every interface voxel keeps its frozen face-midpoint seed, 0.5*dx
-    // (fromLabelGrid redistances without reseeding, ruling R16).
+    // (fromLabelGrid redistances without reseeding).
     const Coord* offs = tools::lsmo_internal::faceOffsets();
     const auto& lab = m->labels()->tree();
     Index64 nFace = 0;
@@ -1026,7 +1026,7 @@ TEST_F(TestLevelSetMultiObject, TripleJunction)
                 ++binN[b];
                 binMax[b] = std::max(binMax[b], std::abs(*it - analytic(w)) / dx);
             }
-            // Gates (ruling R19; psi_l is not smooth at the junction line):
+            // Gates (first order near the line: psi_l is not smooth there):
             // < 0.05*dx at least 2 voxels from the line, < 0.5*dx within 2
             // voxels, RMS over the whole band < 0.1*dx.
             const double farMax = std::max(binMax[2], binMax[3]);
@@ -1057,7 +1057,7 @@ TEST_F(TestLevelSetMultiObject, TripleJunction)
             }
             EXPECT_EQ(missing, Index64(0));
 
-            // Regression guard (spec 5.3): raw +-phi underestimates psi_l
+            // Regression guard: raw +-phi underestimates psi_l
             // outside l near the junction.
             auto raw = rawSignedGrid(*m, l, [&tj, l](Vec3d w) { return tj.sector(w) != l; });
             double maxUnder = 0.0;
@@ -1130,7 +1130,7 @@ TEST_F(TestLevelSetMultiObject, ExtractAbsentLabel)
 }
 
 // ---------------------------------------------------------------------------
-// LabelAwareStencil and MultiObjectForces (Task 5)
+// LabelAwareStencil and MultiObjectForces
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1259,7 +1259,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
     s.moveTo(Coord(0, 0, 0), 1);
     const float got = f(Coord(0, 0, 0), 1, s);
 
-    // Wedge pressureAndAdvectionMotion, evaluated by hand (dx = 1).
+    // Reference pressure and advection motion, evaluated by hand (dx = 1).
     auto V = [&](int i, int j, int k) { return v[i + 1][j + 1][k + 1]; };
     const float v111 = V(0, 0, 0);
     const float DxNeg = v111 - V(-1, 0, 0), DxPos = V(1, 0, 0) - v111;
@@ -1283,7 +1283,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
     const float numer = 0.5f * ((Dyy + Dzz) * Dx * Dx + (Dxx + Dzz) * Dy * Dy
         + (Dxx + Dyy) * Dz * Dz - 2 * Dx * Dy * Dxy - 2 * Dx * Dz * Dxz - 2 * Dy * Dz * Dyz);
     const float denom = Dx * Dx + Dy * Dy + Dz * Dz;
-    // R26: interface curvature k_x/(1 - psi*k_x) (deviation from wedge)
+    // interface curvature k_x/(1 - psi*k_x) (the reference uses k_x)
     float kn = numer / denom;
     const float pk = v111 * kn / std::sqrt(denom);
     EXPECT_LT(std::abs(pk), 0.5f); // the correction branch is exercised
@@ -1317,7 +1317,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
 TEST_F(TestLevelSetMultiObject, ForcesFixedAndInactive)
 {
     Forces f;
-    // Label 0 is passive in the evolver (R3/R20), not fixed in the functor.
+    // Label 0 is passive in the evolver, not fixed in the functor.
     EXPECT_FALSE(f.isFixed(0));
     EXPECT_FALSE(f.isFixed(3));
     EXPECT_TRUE(f.isActive(3));
@@ -1348,7 +1348,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMissingGrid)
 
 
 ////////////////////////////////////////
-// Evolver (spec section 4, tests 4-7)
+// Evolver
 
 namespace {
 
@@ -1465,7 +1465,7 @@ maxActivePhi(const MLS& m)
     return mx;
 }
 
-// Spec section 8 test 4: the interiors {psi_l < 0} of the per-label
+// The interiors {psi_l < 0} of the per-label
 // extractSignedDistance grids are pairwise disjoint (up to 1e-3*dx;
 // @a overlaps counts violations) and, with the background region, cover the
 // band consistently with the labels (@a badCover counts violations).
@@ -1627,7 +1627,7 @@ TEST_F(TestLevelSetMultiObject, BandMaintenance)
         ++n;
         ASSERT_TRUE(m->phi()->tree().hasSameTopology(m->labels()->tree())) << "step " << n;
         ASSERT_LE(maxActivePhi(*m), float((m->halfWidth() + 1) * dx)) << "step " << n;
-        // inactive phi is the background (R7b)
+        // inactive phi is the background
         for (auto it = m->phi()->tree().cbeginValueOff(); it; ++it) {
             ASSERT_EQ(*it, m->phi()->background()) << "step " << n;
         }
@@ -1758,7 +1758,7 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
 {
     // Review probe: label 1 slab x < 10, label 2 block x in [10,13), y < 3,
     // in contact; label 2 is faster. Along the contact shell (10, y, 12)
-    // label 2 may advance at most half a voxel per step (ruling R24).
+    // label 2 may advance at most half a voxel per step (the evolver caps dt so interfaces move <= 0.5*dx per step).
     Int32Grid::Ptr labels = Int32Grid::create(0);
     {
         auto acc = labels->getAccessor();
@@ -1849,7 +1849,7 @@ TEST_F(TestLevelSetMultiObject, WallRetreat)
     const Coord wallSide(7, 8, 8), retreat(8, 8, 8);
     const float wallPhi = m->phi()->tree().getValue(wallSide);
     ASSERT_EQ(m->labels()->tree().getValue(retreat), 1);
-    // two steps of dt = 0.5*cfl (R24) move the label-1 boundary ~1 voxel
+    // two steps of dt = 0.5*cfl (half-voxel step cap) move the label-1 boundary ~1 voxel
     lsmo.step(1.0f);
     lsmo.step(1.0f);
     std::string msg;
@@ -1861,7 +1861,7 @@ TEST_F(TestLevelSetMultiObject, WallRetreat)
 
 
 ////////////////////////////////////////
-// Spec section 8, test 8: single-object equivalence with OpenVDB's single
+// Single-object equivalence with OpenVDB's single
 // level set path (LevelSetAdvection / LevelSetFilter, FIRST_BIAS + TVD_RK1).
 
 namespace {
@@ -1967,9 +1967,9 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
               << "%), Hausdorff " << d.hausdorff / dx << " dx" << std::endl;
     EXPECT_LT(d.hausdorff, 1.0 * dx);
     if (exactRadius > 0.0) {
-        // Ruling R28: mean zero-crossing radius about the exact centre @a c;
-        // MOGAC's radius error at most max(1.1 x the reference's,
-        // the reference's + @a radiusSlack (ruling R30), 0.25*dx).
+        // Mean zero-crossing radius about the exact centre @a c; MOGAC's
+        // radius error at most max(1.1 x the reference's, the reference's +
+        // @a radiusSlack, 0.25*dx).
         const double rm = meanRadius(zeroCrossings(*sdf), c);
         const double rr = meanRadius(zeroCrossings(ref), c);
         const double em = std::abs(rm - exactRadius), er = std::abs(rr - exactRadius);
@@ -1980,7 +1980,7 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
         return;
     }
     ASSERT_TRUE(analytic) << "give an exact grid or an exact radius";
-    // Ruling R25: both first-order schemes diffuse, by different amounts, so
+    // Both first-order schemes diffuse, by different amounts, so
     // MOGAC must be at least as close to the exact solution as the reference
     // (10% slack) instead of within 1% of the reference.
     const ZeroSetDiff dm = compareZeroSets(*sdf, *analytic), dr = compareZeroSets(ref, *analytic);
@@ -2049,7 +2049,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 10.0);
     // exact: r^2 = r0^2 - 2t about the centre rotated by 0.05*10 radians.
-    // Ruling R30: 0.1*dx extra slack over the reference's radius error. The
+    // 0.1*dx extra slack over the reference's radius error. The
     // curvature limit stableDt = dx^2/(6w) caps every MOGAC step, which forces
     // the advection to CFL ~0.13, where first-order upwinding is most
     // diffusive (advection alone at that dt: radius error 0.347 dx vs 0.255 dx
@@ -2061,7 +2061,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
 
 
 ////////////////////////////////////////
-// Spec section 8, test 9: eight objects in a tornado vortex.
+// Eight objects in a tornado vortex.
 
 namespace {
 
@@ -2087,7 +2087,7 @@ insideVoxelCount(const FloatGrid& g)
 
 TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
 {
-    // Parameters (ruling R27; the brief's first set dissolved every object
+    // Parameters (a first parameter set dissolved every object
     // through first-order upwind diffusion before any contact, and a ring of
     // objects at one radius cannot touch in an axisymmetric flow):
     // - eight shapes, labels 1-8, circumradius 10 (all >= 10 voxels across):
@@ -2103,8 +2103,8 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     //   rs = 38.5 with zone width 1, updraft 0.2; dense over [-64, 64]^3;
     //   advection weight 1, curvature weight 0.01.
     // - Advect in chunks of 2 until >= 4 contact pairs (capped at t = 40),
-    //   then two more chunks (ruling R31); contacts must stay >= 4.
-    // Volume gate (two-sided, ruling R31): with refLoss the loss of the same
+    //   then two more chunks; contacts must stay >= 4.
+    // Volume gate (two-sided): with refLoss the loss of the same
     // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
     // same field over the same time, each label's voxel loss lies in
     // [1.1*min(refLoss, 0) - 2%, 1.1*max(refLoss, 0) + 2%].
@@ -2121,7 +2121,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     double tContact = -1.0;
     std::set<std::pair<int32_t, int32_t>> pairs;
     const auto start = std::chrono::steady_clock::now();
-    // Ruling R31: keep going for two chunks after the first chunk with >= 4
+    // Keep going for two chunks after the first chunk with >= 4
     // contact pairs; contacts must persist.
     const double t = tornado.run(*m, vel, steps, tContact,
         [&](double tc, size_t n, const std::set<std::pair<int32_t, int32_t>>& p, int after) {
@@ -2161,7 +2161,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
         std::cout << "Tornado: label " << l << " voxels " << v0 << " -> " << v1 << " (loss "
                   << 100.0 * loss << "%), reference loss " << 100.0 * refLoss << "%" << std::endl;
         EXPECT_GE(v1, 1.0) << "label " << l;
-        // ruling R31: two-sided (a reference gain bounds MOGAC's gain too)
+        // two-sided (a reference gain bounds MOGAC's gain too)
         EXPECT_LE(loss, 1.1 * std::max(refLoss, 0.0) + 0.02) << "label " << l;
         EXPECT_GE(loss, 1.1 * std::min(refLoss, 0.0) - 0.02) << "label " << l;
     }
@@ -2169,7 +2169,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
 
 
 ////////////////////////////////////////
-// Topology-preserving evolution (spec section 4.7, test 15)
+// Topology-preserving evolution
 
 namespace {
 
@@ -2392,7 +2392,7 @@ struct CubeRunResult
     MLS::Ptr state;         // final state
 };
 
-// Spec section 8 test 15: cube (label 1, side 40 voxels, [0,39]^3) advected
+// Cube (label 1, side 40 voxels, [0,39]^3) advected
 // along +x by side + sphere diameter + 8 = 56 voxels through three fixed
 // voxelised balls of radius 4 (labels 2-4) centred at x = 48 at distinct
 // (y, z). With @a protect, label 1 is topology-preserving (FG26_BG6) and the

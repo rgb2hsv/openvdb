@@ -53,8 +53,10 @@
 ///   numbers, used for topology preservation).
 /// - J.-O. Lachaud, A. Montanvert, "Continuous analogs of digital boundaries:
 ///   a topological approach to iso-surfaces", Graphical Models 62(3), 2000.
-/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, MOGAC/MUSCLE: multi-object
-///   geodesic active contours (venue and year pending the author).
+/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, "Multi-object geodesic active
+///   contours (MOGAC)".
+/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, "Multi-object spring level sets
+///   (MUSCLE)".
 
 #ifndef OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
 #define OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
@@ -560,7 +562,7 @@ inline double solveGodunov(double* abar, double* coef, int n, double dx)
     return result;
 }
 
-/// @brief Outer-layer solver (spec 5.2) on the unsigned distance @a phi.
+/// @brief Outer-layer solver on the unsigned distance @a phi.
 /// @details Active voxels of @a phi that are not active in @a seeds are reset
 /// and solve |grad phi| = 1 by parallel Jacobi iteration with the seeds as
 /// Dirichlet data: second-order one-sided upwind differences (Chopp 2001)
@@ -569,7 +571,9 @@ inline double solveGodunov(double* abar, double* coef, int n, double dx)
 /// otherwise. Inactive neighbours are not used. Iteration stops when
 /// max|delta phi| < @a tolerance, after @a maxIter iterations, or on
 /// interrupt; voxels left unreached get the background of @a phi.
-/// With @a signedReflection (evolver, ruling R24) a face neighbour q of p
+/// With @a signedReflection (used by the evolver, which freezes only the
+/// voxels it just projected and must re-solve their other neighbours on both
+/// sides of a moving interface) a face neighbour q of p
 /// contributes +phi_q if !differs(p, q), -phi_q if differs(p, q) and q is a
 /// seed, and nothing otherwise; the second-order term then also needs q on
 /// p's side, and results are clamped to >= 0. This is exact for planar
@@ -692,14 +696,14 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
 } // namespace lsmo_internal
 
 
-/// @brief Second-order label-aware redistancing of a MultiLevelSet (spec 5).
+/// @brief Second-order label-aware redistancing of a MultiLevelSet.
 ///
 /// @details Restores phi = distance to the voxel's own label boundary over
 /// the active band while keeping the interface fixed:
 /// -# Interface voxels (an active voxel with a face neighbour, active or
 ///    not, of a different label) are frozen. redistance() keeps their
 ///    current values, so repeated calls never move a crossing (use it every
-///    evolution step). reinitialize() first reseeds them with the spec 5.1
+///    evolution step). reinitialize() first reseeds them with the
 ///    Russo-Smereka subcell distance, computed from a snapshot of phi; the
 ///    reseed is not a fixed point of itself on curved interfaces, so
 ///    reinitialize() is meant for one-shot use (factories, per-label
@@ -718,11 +722,12 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
 /// (halfWidth*dx); deactivating such voxels is left to band maintenance.
 ///
 /// @pre The label tree holds the correct (deep-interior) label at the
-/// inactive face neighbours of the band (ruling R7b). A band-edge voxel
+/// inactive face neighbours of the band (inactive label voxels keep the
+/// label of the region they lie in, see MultiLevelSet). A band-edge voxel
 /// whose inactive neighbour reads the label background instead becomes a
 /// spurious interface voxel.
 ///
-/// @note FastSweeping.h was evaluated for reuse (spec 5.2) and rejected: its
+/// @note FastSweeping.h was evaluated for reuse and rejected: its
 /// update is first-order Godunov only, it sweeps in place (Gauss-Seidel), and
 /// its boundary voxels are found from sign changes of the input field (or a
 /// mask) through private initialisers, so an all-positive field with
@@ -752,13 +757,14 @@ public:
     /// @return the number of Jacobi iterations performed.
     int redistance() { return this->run(/*reseed=*/false); }
 
-    /// @brief Reseed the interface voxels with the spec 5.1 subcell distance,
+    /// @brief Reseed the interface voxels with the Russo-Smereka subcell distance,
     /// then redistance phi in place.
     /// @return the number of Jacobi iterations performed.
     int reinitialize() { return this->run(/*reseed=*/true); }
 
     /// @brief Redistance with only the active voxels of @a freeze kept
-    /// (evolver step, ruling R24). Every other active voxel solves spec 5.2
+    /// (used by the evolver after each step, with the voxels it projected
+    /// frozen). Every other active voxel solves |grad phi| = 1 as above,
     /// with signed reflection: a face neighbour of the same label gives
     /// +phi, a frozen face neighbour of a different label gives -phi, other
     /// neighbours of a different label are ignored. Unlike redistance(),
@@ -781,7 +787,7 @@ public:
         return iter;
     }
 
-    /// @brief Interface seeding only (spec 5.1), for per-label reconstruction.
+    /// @brief Interface seeding only, for per-label reconstruction.
     /// @details An active voxel p of @a out is a seed if some face neighbour
     /// q has isInside(p) != isInside(q). Its value is the Russo-Smereka
     /// subcell distance |psi_p| / |grad psi| (see lsmo_internal::seedInterface)
@@ -810,8 +816,8 @@ private:
 
         if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
 
-        // Interface voxels: frozen as they are, or reseeded (5.1) from a
-        // read-only snapshot.
+        // Interface voxels: frozen as they are, or reseeded (subcell fix)
+        // from a read-only snapshot.
         BoolTreeT seeds(false);
         const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
         if (reseed) {
@@ -822,7 +828,7 @@ private:
                 /*writeValues=*/false);
         }
 
-        // 5.2: outer layers
+        // outer layers
         const int iter = lsmo_internal::solveOuterLayers(phi, seeds, differs, dx,
             mTolerance, maxIter, mGrainSize, mInterrupter);
 
@@ -868,7 +874,8 @@ struct LabelRegionDiffers
     bool requireActive;
 };
 
-/// @brief Per-label reconstruction near junctions (spec 5.3, rulings R17, R19).
+/// @brief Per-label reconstruction of seeds near junctions, for
+/// MultiLevelSet::extractSignedDistance.
 /// @details Let psi be the signed distance to the region {L == @a label}
 /// and q a seed of @a out (active in @a seeds) outside the region. Its value
 /// phi_q is the distance to its own label's boundary, which next to a third
@@ -924,7 +931,8 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
                     const Coord p = q + Coord(i, j, k);
                     float v;
                     if (lab.getValue(p) != label || !acc.probeValue(p, v)) continue;
-                    ball = std::min(ball, dx * std::sqrt(double(i * i + j * j + k * k)) - double(v));
+                    ball = std::min(ball,
+                        dx * std::sqrt(double(i * i + j * j + k * k)) - double(v));
                 }
             }
         }
@@ -1000,8 +1008,9 @@ struct LabelGridSampler
 
 /// @brief Factory sampler for MultiLevelSet::fromSignedGrids. Candidates are
 /// (psi_l, l) for every input and (psi_0 = -min_l psi_l, 0) for the
-/// background (ruling R2); the label is the smallest candidate (ties to the
-/// smaller label) and phi = (v_b - v_a)/2 for the two smallest v_a <= v_b.
+/// background (the region outside every object); the label is the smallest
+/// candidate (ties to the smaller label) and phi = (v_b - v_a)/2 for the two
+/// smallest v_a <= v_b.
 /// Copied once per task.
 template<typename FloatTreeT>
 struct SignedGridsSampler
@@ -1058,8 +1067,9 @@ private:
 ///    label leaf touched by the band or its face shell gets the sampled
 ///    label at all its voxels, active exactly on the band.
 /// -# phi mirrors the label tree's structure; band voxels get the sampled
-///    phi; then reinitialize() (spec 5.1 reseed + 5.2 solve) if @a reseed,
-///    else redistance() (sampled interface values frozen + 5.2 solve).
+///    phi; then reinitialize() (subcell reseed of the interface voxels, then
+///    the outer-layer solve) if @a reseed, else redistance() (sampled
+///    interface values frozen, then the outer-layer solve).
 /// -# Voxels with phi >= halfWidth*dx are deactivated (labels kept), then
 ///    pruneInactive().
 template<typename FloatTreeT, typename LabelTreeT>
@@ -1568,34 +1578,42 @@ private:
 };
 
 
-/// @brief Built-in speed functor reproducing wedge's multi-object force
-/// model: curvature + upwind pressure + upwind advection (spec 3.4).
-/// @note Deviation from wedge (ruling R26): the curvature term uses the
-/// interface curvature k_x/(1 - psi*k_x) instead of the voxel-centre mean
-/// curvature k_x (fallback k_x when |psi*k_x| >= 0.5), which makes the
-/// evaluation point exact for a sphere. It does not remove the measured bias
-/// of mean curvature flow (a sphere shrinks ~3.5% fast; R26 changes r^2 at
-/// t = 20 only from 58.32 to 58.53 against 60): that residual comes from an
-/// ~0.01*dx error of the interface-voxel phi, amplified by the second
-/// differences (ruling R28 gates it against the reference's error).
-/// @details Satisfies the speed functor concept of spec 3.3. Label 0 is
-/// handled by the evolver as passive (rulings R3, R20), so isFixed(0) is
-/// false here. Speeds are world-space; with unit voxel size they equal
-/// wedge's index-space values. operator() is const and thread-safe.
+/// @brief Built-in speed functor: the MOGAC multi-object force model of
+/// curvature + upwind pressure + upwind advection, as in the reference
+/// implementation this port follows.
+/// @details For label l at a voxel it returns dpsi_l/dt =
+/// w_c*kappa*|grad psi| (clamped to the maximum curvature force)
+/// - (upwind advection v . grad psi) - (upwind pressure F*|grad psi|).
+/// It satisfies the SpeedT concept of LevelSetMultiObject. Label 0 is
+/// handled by the evolver as passive (its value is the complement of the
+/// other candidates, so it never needs a speed), so isFixed(0) is false
+/// here. Speeds are world-space; with unit voxel size they equal the
+/// reference implementation's index-space values. operator() is const and
+/// thread-safe.
+/// @note Unlike the reference implementation, the curvature term uses the
+/// curvature of the interface, k_x/(1 - psi*k_x), rather than the mean
+/// curvature k_x of the level set through the voxel centre (falling back to
+/// k_x when |psi*k_x| >= 0.5), which makes the evaluation point exact for a
+/// sphere. It does not remove the measured bias of mean curvature flow (a
+/// sphere shrinks about 3.5% too fast; the correction changes r^2 at t = 20
+/// only from 58.32 to 58.53 against the exact 60): that residual comes from
+/// an error of about 0.01*dx in the interface-voxel phi, amplified by the
+/// second differences, and is comparable to that of a single-object
+/// LevelSetAdvection reference on the same problem.
 template<typename MultiLevelSetT>
 class MultiObjectForces
 {
 public:
     /// Curvature weight w: speed w*kappa*|grad psi| (clamped), with kappa the
-    /// interface mean curvature k_x/(1 - psi*k_x) (ruling R26).
+    /// interface mean curvature k_x/(1 - psi*k_x) (see the class note).
     void setCurvatureWeight(float w) { mCurvatureWeight = w; }
     void setMaxCurvatureForce(float m = 10.0f) { mMaxCurvatureForce = m; }
 
-    /// @brief Pressure force field. A deep copy is rescaled once (wedge
-    /// rescale()): values are shifted by @a target and the negative and
+    /// @brief Pressure force field. A deep copy is rescaled once, as in the
+    /// reference implementation: values are shifted by @a target and the negative and
     /// positive parts scaled independently to [-1, 1] (scale 1 for a part
-    /// whose extreme magnitude is at most 1e-4). A NaN @a target skips the
-    /// rescale, as in wedge.
+    /// whose extreme magnitude is at most 1e-4). A NaN @a target (the
+    /// default) skips the rescale.
     /// @throw ValueError if @a pressure is null.
     void setPressure(FloatGrid::ConstPtr pressure, float weight,
         float target = std::numeric_limits<float>::quiet_NaN())
@@ -1656,11 +1674,10 @@ public:
 
         float kappa = 0.0f;
         if (mCurvatureWeight != 0.0f) {
-            // Interface curvature (ruling R26): the voxel's level set has mean
-            // curvature k_x; the interface, at signed distance -psi along the
-            // normal, has k = k_x / (1 - psi*k_x) for a sphere (a first-order
+            // Interface curvature: the voxel's level set has mean curvature
+            // k_x; the interface, at signed distance -psi along the normal,
+            // has k = k_x / (1 - psi*k_x) for a sphere (a first-order
             // correction otherwise). Falls back to k_x when |psi*k_x| >= 0.5.
-            // Wedge uses k_x directly.
             float kn = s.meanCurvatureNormGrad(); // k_x * |grad psi|
             const float g = s.gradient().length();
             if (g > 0.0f) {
@@ -1699,7 +1716,7 @@ public:
     }
 
     /// True for labels declared fixed. Label 0 is NOT fixed here: the
-    /// evolver treats it as passive and never asks the functor (R3, R20).
+    /// evolver treats it as passive and never asks the functor for its speed.
     bool isFixed(int32_t label) const { return label != 0 && mFixed.count(label) != 0; }
     bool isActive(int32_t label) const { return mInactive.count(label) == 0; }
 
@@ -1725,7 +1742,7 @@ private:
 
 
 /// @brief Digital adjacency pair (foreground, background) used by
-/// topology-preserving evolution (spec 4.7) and the multi-label mesher.
+/// topology-preserving evolution and the multi-label mesher.
 enum class MultiObjectConnectivity { FG26_BG6, FG6_BG26, FG18_BG6, FG6_BG18 };
 
 
@@ -1834,32 +1851,37 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 } // namespace lsmo_internal
 
 
-/// @brief Multi-object level set evolver (MOGAC / MCLS, spec section 4).
+/// @brief Multi-object level set evolver (multi-object geodesic active
+/// contours, MOGAC).
 ///
 /// @details One forward Euler step of step() does:
 /// -# <b>Projected set and candidates.</b> Every active voxel that is not of
 ///    a fixed label and has phi <= 0.5*dx or a face neighbour (active or
-///    not) of a different label is projected (ruling R24). Its candidates
-///    are its own label and the labels of its face neighbours, minus fixed
-///    labels (rulings R3, R21). Label 0 is passive: it is a candidate only
-///    if it is the voxel's or a face neighbour's label or the voxel touches a
-///    fixed label, and its value is the complement v_0 = -min v_l over the
-///    non-zero candidates, so object/background interfaces move at the
-///    object's full speed. The speed functor is called (on time-n data
-///    through a LabelAwareStencil) only for non-zero candidates; labels with
-///    isActive() false get +0.999 (R4).
+///    not) of a different label is projected: these are the only voxels
+///    whose label can change in one step (see Time step), so the update is
+///    restricted to them. Its candidates are its own label and the labels
+///    of its face neighbours, minus fixed labels. Label 0 is passive: it is a
+///    candidate only if it is the voxel's or a face neighbour's label or the
+///    voxel touches a fixed label, and its value is the complement
+///    v_0 = -min v_l over the non-zero candidates, so object/background
+///    interfaces move at the object's full speed (and a voxel next to a
+///    retreating fixed label falls back to label 0). The speed functor is
+///    called (on time-n data through a LabelAwareStencil) only for non-zero
+///    candidates; labels with isActive() false get dpsi/dt = +0.999, so
+///    they slowly retreat from their neighbours.
 /// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx)),
-///    so an interface moves at most half a voxel per step (R24); with
+///    so an interface moves at most half a voxel per step; with
 ///    setClampSpeed(true), F is clamped to [-1, 1] and
-///    dt = min(maxDt, 0.5*dx, speed.stableDt(dx)). Since psi_l >= phi at
-///    every voxel, no voxel outside the projected set can change label by projection (orphan
-///    cleanup can still relabel).
+///    dt = min(maxDt, 0.5*dx, speed.stableDt(dx)). The half-voxel cap is
+///    what makes the projected set sufficient: since psi_l >= phi at every
+///    voxel, no voxel outside it can change label by projection (orphan
+///    cleanup can still relabel), so no separate propagation pass is needed.
 /// -# <b>Projection.</b> v_l = psi_l + dt*F_l with psi_l = -phi for the own
 ///    label and +phi otherwise; the new label is the smallest v (ties to the
 ///    smaller label) and phi = |v_1 - v_2|/2 over the two smallest values, or
 ///    |v_1| with one candidate. Results are written to copies of both trees
 ///    (time-n data stays readable until both are swapped in together).
-/// -# <b>Topology preservation</b> (4.7, opt-in): with
+/// -# <b>Topology preservation</b> (opt-in): with
 ///    setTopologyPreservingLabels(), a projected change a -> b that involves
 ///    a protected label is deferred and applied in 27 coloured passes
 ///    (coordinates mod 3) only if the voxel is a simple point
@@ -1869,22 +1891,24 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    Orphan cleanup and band activation never change a protected label's
 ///    region except by simple changes, so its components, cavities and
 ///    tunnels are preserved. With no protected label nothing changes.
-/// -# <b>Orphan cleanup</b> (4.5): a voxel whose label occurs nowhere in its
+/// -# <b>Orphan cleanup</b>: a voxel whose label occurs nowhere in its
 ///    26-neighbourhood takes the label and phi of its smallest-phi active
 ///    neighbour (fixed labels excluded) and is redistanced (not frozen).
-/// -# <b>Band maintenance</b> (4.6): both trees are swapped in; inactive face
+/// -# <b>Band maintenance</b>: both trees are swapped in; inactive face
 ///    neighbours of active voxels with phi < (halfWidth-1)*dx are activated
 ///    (phi = background, label of the smallest-phi active face neighbour);
 ///    MultiLevelSetRedistance::redistance(freeze) keeps the projected voxels
 ///    and the fixed-label voxels and solves all others with signed
-///    reflection (R24); voxels with phi >= halfWidth*dx are deactivated in
-///    both trees (labels kept, R7b); pruneInactive(). Debug builds assert
-///    validate().
+///    reflection, so voxels the interface just passed are re-solved from
+///    both sides; voxels with phi >= halfWidth*dx are deactivated in
+///    both trees (labels kept, so the interior label stays known);
+///    pruneInactive(). Builds with OPENVDB_ENABLE_ASSERTS check validate()
+///    after every step.
 ///
 /// Voxels of fixed labels never change label or phi and no label can
 /// capture them; a step with no non-zero candidate anywhere changes nothing.
 ///
-/// @par SpeedT concept (spec 3.3)
+/// @par SpeedT concept
 /// @code
 /// float operator()(const Coord& ijk, int32_t label,
 ///                  const LabelAwareStencil<MultiLevelSetT>& s) const; // dpsi/dt
@@ -1928,13 +1952,14 @@ public:
         mCfl = cfl;
     }
     /// @brief Clamp speeds to [-1, 1] and take dt = min(maxDt, 0.5*dx)
-    /// (capped by speed.stableDt), as wedge's clampSpeed.
+    /// (capped by speed.stableDt), as the reference implementation's
+    /// clampSpeed option.
     void setClampSpeed(bool on) { mClampSpeed = on; }
     /// @brief TBB grain size in leaves; zero or negative runs serially.
     void setGrainSize(int grainSize) { mGrainSize = grainSize; }
     /// @brief Redistance tolerance in world units (default 1e-4*dx).
     void setRedistanceTolerance(float tolWorld) { mTolerance = tolWorld; }
-    /// @brief Labels whose digital topology is preserved (spec 4.7; default
+    /// @brief Labels whose digital topology is preserved (default
     /// none): a label change a -> b at a voxel is applied only if the voxel is
     /// a simple point of every protected label in {a, b}.
     void setTopologyPreservingLabels(std::set<int32_t> labels) { mProtected = std::move(labels); }
@@ -2036,13 +2061,13 @@ private:
         return true;
     }
 
-    /// A projected label change involving a protected label (spec 4.7).
+    /// A projected label change involving a protected label.
     struct Deferred { Coord ijk; int32_t from, to; float phi; };
     void applyDeferred(const std::vector<std::vector<Deferred>>& deferred,
         FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze);
 
-    /// Add @a l to @a e's candidates (R21): label 0 and fixed labels only
-    /// make passive label 0 participate.
+    /// Add @a l to @a e's candidates: label 0 and fixed labels only make
+    /// passive label 0 participate (a fixed label can never be captured).
     void addCandidate(VoxelEntry& e, int32_t l) const
     {
         if (l == 0 || mSpeed.isFixed(l)) { e.zero = true; return; } // passive 0 / wall
@@ -2054,7 +2079,7 @@ private:
     {
         float f;
         if (!mSpeed.isActive(label)) {
-            f = 0.999f; // R4
+            f = 0.999f; // inactive labels retreat
         } else {
             s.moveTo(ijk, label);
             f = mSpeed(ijk, label, s);
@@ -2086,7 +2111,7 @@ private:
             consider(l, v);
             minV = std::min(minV, v);
         }
-        if (e.zero) consider(0, -minV); // passive complement (R3)
+        if (e.zero) consider(0, -minV); // passive label 0: complement
         label = l1;
         phi = (count > 1) ? std::abs(0.5f * (v1 - v2)) : std::abs(v1);
         return true;
@@ -2131,7 +2156,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         for (auto leaf = phi.cbeginLeaf(); leaf; ++leaf) acc.touchLeaf(leaf->origin());
     }
 
-    // Freeze mask: projected voxels and fixed-label voxels (R24).
+    // Freeze mask: projected voxels and fixed-label voxels.
     BoolTreeT freeze(phi, false, TopologyCopy());
     freeze.voxelizeActiveTiles();
     for (auto leaf = freeze.beginLeaf(); leaf; ++leaf) leaf->setValuesOff();
@@ -2181,7 +2206,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     bool any = false;
     for (const LeafData& d : data) { maxSpeed = std::max(maxSpeed, d.maxSpeed); any |= d.any; }
 
-    // 3. time step: interfaces move at most half a voxel (R24)
+    // 3. time step: interfaces move at most half a voxel, so only projected
+    // voxels can change label
     float dt = std::min(maxDt, mSpeed.stableDt(float(dx)));
     if (!any) return dt; // no non-zero candidate anywhere: nothing moves
     if (mClampSpeed) dt = std::min(dt, halfDx);
@@ -2190,7 +2216,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     // 4. two-smallest projection, written to copies of both trees
     typename FloatTreeT::Ptr newPhi(new FloatTreeT(phi));
     typename LabelTreeT::Ptr newLabels(new LabelTreeT(labels));
-    // changes involving a protected label are deferred (spec 4.7)
+    // changes involving a protected label are deferred (topology preservation)
     std::vector<std::vector<Deferred>> deferred(mProtected.empty() ? 0 : leafCount);
     forEachIndex(leafCount, [&](size_t i) {
         const LeafData& d = data[i];
@@ -2262,7 +2288,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
     for (const auto& list : fixes) {
         for (const Fix& fx : list) {
-            // protected labels (spec 4.7): only simple changes, tested on the
+            // protected labels: only simple changes, tested on the
             // labels as updated by the fixes applied so far (serial order)
             const int32_t own = static_cast<int32_t>(labAcc.getValue(fx.ijk));
             const int32_t to = static_cast<int32_t>(fx.label);
@@ -2390,7 +2416,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
     }
 
     // c. redistance: projected and fixed voxels frozen, the rest solved with
-    // signed reflection (R24)
+    // signed reflection
     {
         MultiLevelSetRedistance<MultiLevelSetT> redist(mMls);
         redist.setTolerance(mTolerance);
@@ -2398,7 +2424,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
         redist.redistance(freeze);
     }
 
-    // d. deactivate phi >= halfWidth*dx in both trees (labels kept, R7b)
+    // d. deactivate phi >= halfWidth*dx in both trees (labels kept)
     {
         tree::LeafManager<FloatTreeT> leafs(phi);
         forEachIndex(leafs.leafCount(), [&](size_t i) {

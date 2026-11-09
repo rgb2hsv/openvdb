@@ -39,7 +39,7 @@ using namespace openvdb;
 using Conn = tools::MultiObjectConnectivity;
 
 // Cube geometry, rebuilt here from the numbering documented in
-// LevelSetMultiObjectMesh.h (ruling R5) rather than taken from the generator:
+// LevelSetMultiObjectMesh.h rather than taken from the generator:
 // corner bit i <-> (x,y,z) = (i&1, (i>>1)&1, (i>>2)&1); edges 0-3 run along
 // x, 4-7 along y, 8-11 along z; edge 4a+k has its two free coordinates
 // (in ascending axis order) equal to (k&1, k>>1).
@@ -431,7 +431,7 @@ TEST_F(TestLevelSetMultiObjectMesh, CaseTableAll)
 
 
 ////////////////////////////////////////
-// multiObjectToMesh (spec section 6.2-6.4, section 8 tests 11-13)
+// multiObjectToMesh
 
 namespace {
 
@@ -453,7 +453,7 @@ triNormal(const LabelMesh& m, const Vec3I& t)
 // Closed, consistently oriented 2-manifold: every directed edge occurs once
 // and its reverse once (each edge has exactly two triangles, wound
 // oppositely), every vertex is used and its link is a single cycle, and no
-// triangle has zero area (spec test 11).
+// triangle has zero area.
 bool
 isClosedManifold(const LabelMesh& m, double dx, std::string* why = nullptr)
 {
@@ -532,7 +532,7 @@ eulerChar(const std::vector<Vec3I>& tris)
 int
 eulerChar(const LabelMesh& m) { return eulerChar(m.triangles); }
 
-// Folded triangles (ruling R34): triangles are grouped by the cell holding
+// Folded triangles: triangles are grouped by the cell holding
 // their centroid and by connectivity within the cell into patches. A disk
 // patch (Euler characteristic 1) must have every triangle normal along the
 // patch's vector area; a tube (an annulus around the body diagonal of two
@@ -608,10 +608,10 @@ countFolded(const LabelMesh& m, const MLS& mls, int32_t label, size_t* tubes = n
     return folded;
 }
 
-// Random label volume (spec tests 11, 12): labels 1..nLabels drawn per
+// Random label volume: labels 1..nLabels drawn per
 // block of `block`^3 voxels over [0, n-1]^3, label 0 outside.
 // - randomPhi false: the pair built by MultiLevelSet::fromLabelGrid (the
-//   spec's random label volumes);
+//   reference random label volumes);
 // - randomPhi true (stress variant): phi set directly over [-2, n+1]^3,
 //   uniform in [0.02, 0.98]*dx at voxels with a differing face neighbour
 //   and in [1, 2.9]*dx elsewhere, so the vertex on every cell edge sits at
@@ -717,7 +717,7 @@ expectManifold(const std::string& name, const MLS& m, const std::map<int32_t, La
 } // namespace
 
 
-// Spec test 11: closed 2-manifolds, no folded or zero-area triangles.
+// Closed 2-manifolds, no folded or zero-area triangles.
 TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
 {
     tools::MultiObjectMeshSettings s;
@@ -795,7 +795,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
 }
 
 
-// Spec test 12: mesh components == foreground components + cavities and
+// Mesh components == foreground components + cavities and
 // chi(M) == 2 chi(R) for every label and connectivity pair.
 TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
 {
@@ -894,7 +894,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
 }
 
 
-// Spec test 13: sphere vertices within 0.1*dx of the analytic surface.
+// Sphere vertices within 0.1*dx of the analytic surface.
 TEST_F(TestLevelSetMultiObjectMesh, MeshGeometrySphere)
 {
     for (double dx : {1.0, 0.5}) {
@@ -933,9 +933,9 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshGeometrySphere)
 }
 
 
-// Spec test 13: junction correction lowers the max vertex error at triple
-// junctions. Asserted on the test 3 fixture (junction 0 of the seeded set)
-// and on the worst case over the whole set (ruling R19); every junction's
+// Junction correction lowers the max vertex error at triple
+// junctions. Asserted on the original triple-junction fixture (junction 0 of the seeded set)
+// and on the worst case over the whole set; every junction's
 // numbers are printed. Vertices within 3 voxels of the box faces are skipped
 // (the box boundary is not part of the analytic partition).
 TEST_F(TestLevelSetMultiObjectMesh, MeshJunctionCorrection)

@@ -5,8 +5,7 @@
 ///
 /// @brief Test-only digital topology of one label of a label grid: number of
 /// foreground components, enclosed background cavities and the Euler
-/// characteristic of the digital region (spec section 4.7, section 8 tests
-/// 12 and 15). Header-only; shared by TestLevelSetMultiObject.cc and
+/// characteristic of the digital region. Header-only; shared by TestLevelSetMultiObject.cc and
 /// TestLevelSetMultiObjectMesh.cc.
 
 #ifndef OPENVDB_UNITTEST_LEVEL_SET_MULTI_OBJECT_TOPOLOGY_HAS_BEEN_INCLUDED

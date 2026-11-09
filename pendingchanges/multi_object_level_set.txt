@@ -1,4 +1,8 @@
 OpenVDB:
   New Features:
-  - Added tools::LevelSetMultiObject, multi-object geodesic active contours (MOGAC) on a paired unsigned-distance/label grid (tools::MultiLevelSet), with second-order per-label signed distance extraction and opt-in topology-preserving evolution.
-  - Added tools::multiObjectToMesh, topology-constrained multi-label contouring.
+  - Added tools::LevelSetMultiObject, multi-object geodesic active contours
+    (MOGAC) on a paired unsigned-distance/label grid (tools::MultiLevelSet),
+    with second-order per-label signed distance extraction and opt-in
+    topology-preserving evolution.
+  - Added tools::multiObjectToMesh, topology-constrained multi-label
+    contouring.

@@ -4,9 +4,8 @@
 /// @file unittest/LevelSetMultiObjectFixtures.h
 ///
 /// @brief Test-only fixture builders shared by TestLevelSetMultiObject.cc and
-/// TestLevelSetMultiObjectMesh.cc (ruling R6): two spheres (spec section 8,
-/// test 2), the seeded triple-junction set (test 3, ruling R19) and the
-/// eight-object tornado (test 9, rulings R27, R29, R31).
+/// TestLevelSetMultiObjectMesh.cc: two spheres, the seeded triple-junction
+/// set and the eight-object tornado.
 
 #ifndef OPENVDB_UNITTEST_LEVEL_SET_MULTI_OBJECT_FIXTURES_HAS_BEEN_INCLUDED
 #define OPENVDB_UNITTEST_LEVEL_SET_MULTI_OBJECT_FIXTURES_HAS_BEEN_INCLUDED
@@ -35,7 +34,7 @@ using Forces = openvdb::tools::MultiObjectForces<MLS>;
 
 
 ////////////////////////////////////////
-// Two spheres (spec section 8, test 2)
+// Two spheres
 
 /// Spheres of radius 10*dx at (-+15*dx, 0, 0), labels 1 and 2, via
 /// fromSignedGrids.
@@ -52,7 +51,7 @@ makeTwoSpheres(double dx)
 
 
 ////////////////////////////////////////
-// Triple junction (spec section 8, test 3)
+// Triple junction
 
 /// Three labels meeting at 120 degrees along a straight junction line through
 /// index point c with unit direction a. In the plane frame (u, v) normal to a
@@ -117,7 +116,7 @@ struct TripleJunction
 
     /// The pair built directly from analytic data: phi = distance to the
     /// voxel's own sector boundary, active where phi < 3*dx inside the box,
-    /// and a one-voxel inactive shell holding the labels (ruling R7b).
+    /// and a one-voxel inactive shell holding the labels.
     MLS::Ptr build() const
     {
         using namespace openvdb;
@@ -148,7 +147,7 @@ struct TripleJunction
     }
 };
 
-/// Seeded junction set (ruling R19): the original fixture (theta0 = 10deg,
+/// Seeded junction set: the original fixture (theta0 = 10deg,
 /// z-parallel through (0.37, -0.21)), seven z-parallel lines with random
 /// theta0 and sub-voxel offset, and four tilted lines. Uses its own
 /// generator arithmetic so the set is the same on every platform; random
@@ -179,7 +178,7 @@ junctionSet()
 
 
 ////////////////////////////////////////
-// Velocity fields and the tornado (spec section 8, test 9)
+// Velocity fields and the tornado
 
 /// Dense Vec3SGrid over the index box @a box (voxel size @a dx), each voxel
 /// set to f(its world position); background zero.
@@ -233,7 +232,7 @@ contactPairs(const MLS& m)
     return pairs;
 }
 
-/// Tornado field (ruling R27):
+/// Tornado field:
 /// - Rankine-style swirl about z: u_theta = swirl*(r/R) for r < R,
 ///   swirl*(R/r) outside (divergence-free);
 /// - radial inflow towards the ring r = rs: u_r = -inflow*tanh((r - rs)/w),
@@ -329,7 +328,7 @@ struct Tornado
 
     /// @brief Run the tornado schedule on @a m: advection weight 1, curvature
     /// weight 0.01, chunks of 2 until >= 4 contact pairs (capped at t = 40),
-    /// then two more chunks (ruling R31).
+    /// then two more chunks.
     /// @details perChunk(t, steps, pairs, afterContact) runs after every
     /// chunk (afterContact: chunks completed after the first chunk with
     /// >= 4 pairs, -1 before); returning false stops the run.
