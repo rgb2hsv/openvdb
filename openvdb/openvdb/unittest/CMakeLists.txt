@@ -122,6 +122,7 @@ else()
     TestLeafOrigin.cc
     TestLevelSetDilatedMesh.cc
     TestLevelSetFilter.cc
+    TestLevelSetMultiObject.cc
     TestLevelSetRayIntersector.cc
     TestLevelSetTubes.cc
     TestLevelSetUtil.cc
