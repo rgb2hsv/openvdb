@@ -1181,7 +1181,12 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
     const float numer = 0.5f * ((Dyy + Dzz) * Dx * Dx + (Dxx + Dzz) * Dy * Dy
         + (Dxx + Dyy) * Dz * Dz - 2 * Dx * Dy * Dxy - 2 * Dx * Dz * Dxz - 2 * Dy * Dz * Dyz);
     const float denom = Dx * Dx + Dy * Dy + Dz * Dz;
-    float kappa = wc * numer / denom;
+    // R26: interface curvature k_x/(1 - psi*k_x) (deviation from wedge)
+    float kn = numer / denom;
+    const float pk = v111 * kn / std::sqrt(denom);
+    EXPECT_LT(std::abs(pk), 0.5f); // the correction branch is exercised
+    kn /= (1.0f - pk);
+    float kappa = wc * kn;
     kappa = std::max(-10.0f, std::min(10.0f, kappa));
     const float fx = wa * vel[0], fy = wa * vel[1], fz = wa * vel[2];
     float adv = 0;
@@ -1858,7 +1863,7 @@ referenceCurvature(FloatGrid& ref)
 
 void
 checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t steps,
-    double angle)
+    double angle, const FloatGrid* analytic = nullptr)
 {
     std::string msg;
     ASSERT_TRUE(m.validate(&msg)) << msg;
@@ -1874,8 +1879,19 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
               << ", symmetric difference " << d.symDiff << " (" << 100.0 * d.symDiff / vol
               << "%), sign-count " << d.symDiffSign << " (" << 100.0 * d.symDiffSign / vol
               << "%), Hausdorff " << d.hausdorff / dx << " dx" << std::endl;
-    EXPECT_LT(d.symDiff, 0.01 * vol);
     EXPECT_LT(d.hausdorff, 1.0 * dx);
+    if (!analytic) {
+        EXPECT_LT(d.symDiff, 0.01 * vol);
+        return;
+    }
+    // Ruling R25: both first-order schemes diffuse, by different amounts, so
+    // MOGAC must be at least as close to the exact solution as the reference
+    // (10% slack) instead of within 1% of the reference.
+    const ZeroSetDiff dm = compareZeroSets(*sdf, *analytic), dr = compareZeroSets(ref, *analytic);
+    std::cout << name << ": vs analytic: MOGAC symmetric difference " << dm.symDiff
+              << " Hausdorff " << dm.hausdorff / dx << " dx; reference " << dr.symDiff
+              << " Hausdorff " << dr.hausdorff / dx << " dx" << std::endl;
+    EXPECT_LE(dm.symDiff, 1.1 * dr.symDiff);
 }
 
 } // anonymous namespace
@@ -1892,7 +1908,12 @@ TEST_F(TestLevelSetMultiObject, SingleObjectAdvection)
     forces.setAdvection(vel, 1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 20.0);
-    checkEquivalence("SingleObjectAdvection", *m, *ref, steps, 0.05 * 20.0);
+    // exact solution: the sphere rotated by 0.05*20 = 1 radian about z
+    const double angle = 0.05 * 20.0;
+    FloatGrid::Ptr exact = tools::createLevelSetSphere<FloatGrid>(float(kEqRadius),
+        Vec3f(float(kEqCenter[0] * std::cos(angle)), float(kEqCenter[0] * std::sin(angle)), 0.0f),
+        1.0f);
+    checkEquivalence("SingleObjectAdvection", *m, *ref, steps, angle, exact.get());
 }
 
 TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
@@ -1978,102 +1999,160 @@ countNaN(const FloatGrid& g)
     return n;
 }
 
+// Voxels with psi < 0 of a level set grid (active and inactive, tiles by
+// voxel count).
+Index64
+insideVoxelCount(const FloatGrid& g)
+{
+    Index64 n = 0;
+    for (auto it = g.tree().cbeginValueAll(); it; ++it) n += *it < 0.0f ? it.getVoxelCount() : 0;
+    return n;
+}
+
+// Tornado field (ruling R27):
+// - Rankine-style swirl about z: u_theta = swirl*(r/R) for r < R,
+//   swirl*(R/r) outside (divergence-free);
+// - radial inflow towards the ring r = rs: u_r = -inflow*tanh((r - rs)/w),
+//   i.e. translation at ~inflow away from the ring and a convergence zone of
+//   width ~w around it (compressive only inside that zone);
+// - updraft u_z = updraft*exp(-r^2/(2 R^2)) (divergence-free).
+// An exact flow never brings disjoint objects into contact, and an
+// axisymmetric flow keeps the angular gaps of objects at one radius, so
+// contact comes from objects on the same ray pressed together in the
+// convergence zone until their gap is below a voxel.
+struct Tornado
+{
+    double R = 16.0, swirl = 0.1, inflow = 0.2, rs = 38.5, w = 1.0, updraft = 0.2,
+        z0 = -20.0;
+    Vec3s operator()(const Vec3d& p) const
+    {
+        const double r = std::sqrt(p[0] * p[0] + p[1] * p[1]);
+        const double ut = swirl * (r < R ? r / R : R / r);
+        const double ur = -inflow * std::tanh((r - rs) / w);
+        const double uz = updraft * std::exp(-r * r / (2.0 * R * R));
+        Vec3d v(0.0, 0.0, uz);
+        if (r > 0.0) v += Vec3d(-p[1], p[0], 0.0) * (ut / r) + Vec3d(p[0], p[1], 0.0) * (ur / r);
+        return Vec3s(v);
+    }
+};
+
 } // anonymous namespace
 
 TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
 {
-    // Eight shapes (labels 1-8) of characteristic size 8 (sphere radius,
-    // Platonic factory scale, capsule half-extent, ring outer radius) at
-    // radius 40 in the z = -20 plane, angles k*45 degrees; dx = 1,
-    // halfWidth 3, no rotations.
-    const float dx = 1.0f, hw = 3.0f, size = 8.0f;
-    auto center = [](int k) {
-        const double a = k * math::pi<double>() / 4.0;
-        return Vec3f(float(40.0 * std::cos(a)), float(40.0 * std::sin(a)), -20.0f);
+    // Parameters (ruling R27; the brief's first set dissolved every object
+    // through first-order upwind diffusion before any contact, and a ring of
+    // objects at one radius cannot touch in an axisymmetric flow):
+    // - eight shapes, labels 1-8, circumradius 10 (all >= 10 voxels across):
+    //   sphere r = 10; cube side 12; tetrahedron, octahedron, dodecahedron,
+    //   icosahedron with factory scale (circumradius) 10; capsule along z with
+    //   radius 5 and axis endpoints +-5; closed ring = 8-segment polygon of
+    //   radius 7 in the xy plane with tube radius 3. No rotations.
+    // - four rays at angles k*90 degrees in the z = -20 plane; label k+1
+    //   inside and label k+5 outside the ring r = rs = 38.5 (between voxel
+    //   centres) on ray k, each placed so its surface point nearest the ring
+    //   is 1.5 voxels from it (facing gap 3 voxels); dx = 1, halfWidth 3.
+    // - Tornado field (see Tornado): R = 16, swirl 0.1, inflow 0.2 towards
+    //   rs = 38.5 with zone width 1, updraft 0.2; dense over [-64, 64]^3;
+    //   advection weight 1, curvature weight 0.01.
+    // - Advect in chunks of 2 until >= 4 contact pairs, capped at t = 40.
+    // Volume gate: each label's voxel loss <= 1.1 x the loss of the same
+    // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
+    // same field over the same time, + 2% absolute.
+    const float dx = 1.0f, hw = 3.0f;
+    const Tornado tornado;
+    auto make = [&](int32_t l, const Vec3f& c) -> FloatGrid::Ptr {
+        switch (l) {
+        case 1: return tools::createLevelSetSphere<FloatGrid>(10.0f, c, dx, hw);
+        case 2: return tools::createLevelSetCube<FloatGrid>(12.0f, c, dx, hw);
+        case 3: return tools::createLevelSetTetrahedron<FloatGrid>(10.0f, c, dx, hw);
+        case 4: return tools::createLevelSetOctahedron<FloatGrid>(10.0f, c, dx, hw);
+        case 5: return tools::createLevelSetDodecahedron<FloatGrid>(10.0f, c, dx, hw);
+        case 6: return tools::createLevelSetIcosahedron<FloatGrid>(10.0f, c, dx, hw);
+        case 7:
+            return tools::createLevelSetCapsule<FloatGrid>(
+                c - Vec3f(0.0f, 0.0f, 5.0f), c + Vec3f(0.0f, 0.0f, 5.0f), 5.0f, dx, hw);
+        default: {
+            std::vector<Vec3f> verts;
+            std::vector<Vec2I> segs;
+            for (int i = 0; i < 8; ++i) {
+                const double a = i * math::pi<double>() / 4.0;
+                verts.push_back(c + Vec3f(float(7.0 * std::cos(a)), float(7.0 * std::sin(a)), 0.0f));
+                segs.push_back(Vec2I(i, (i + 1) % 8));
+            }
+            return tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 3.0f, dx, hw);
+        }
+        }
+    };
+    // extent of a shape centred at the origin along unit direction d: max of
+    // p.d - psi(p) over interior voxels (psi < 0)
+    auto extent = [](const FloatGrid& g, const Vec3d& d) {
+        double e = 0.0;
+        for (auto it = g.tree().cbeginValueOn(); it; ++it) {
+            if (*it < 0.0f) e = std::max(e, g.indexToWorld(it.getCoord()).dot(d) - double(*it));
+        }
+        return e;
     };
     std::map<int32_t, FloatGrid::ConstPtr> in;
-    in[1] = tools::createLevelSetSphere<FloatGrid>(size, center(0), dx, hw);
-    in[2] = tools::createLevelSetCube<FloatGrid>(size, center(1), dx, hw);
-    in[3] = tools::createLevelSetTetrahedron<FloatGrid>(size, center(2), dx, hw);
-    in[4] = tools::createLevelSetOctahedron<FloatGrid>(size, center(3), dx, hw);
-    in[5] = tools::createLevelSetDodecahedron<FloatGrid>(size, center(4), dx, hw);
-    in[6] = tools::createLevelSetIcosahedron<FloatGrid>(size, center(5), dx, hw);
-    {
-        // capsule along z: radius 4, axis endpoints +-4 (extent 16 x 8)
-        const Vec3f c = center(6);
-        in[7] = tools::createLevelSetCapsule<FloatGrid>(
-            c - Vec3f(0.0f, 0.0f, 4.0f), c + Vec3f(0.0f, 0.0f, 4.0f), 4.0f, dx, hw);
-    }
-    {
-        // closed ring: 8-segment polygon of radius 6 in the xy plane, tube radius 2
-        const Vec3f c = center(7);
-        std::vector<Vec3f> verts;
-        std::vector<Vec2I> segs;
-        for (int i = 0; i < 8; ++i) {
-            const double a = i * math::pi<double>() / 4.0;
-            verts.push_back(c + Vec3f(float(6.0 * std::cos(a)), float(6.0 * std::sin(a)), 0.0f));
-            segs.push_back(Vec2I(i, (i + 1) % 8));
-        }
-        in[8] = tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 2.0f, dx, hw);
+    for (int32_t l = 1; l <= 8; ++l) {
+        const double a = ((l - 1) % 4) * math::pi<double>() / 2.0;
+        const Vec3d ray(std::cos(a), std::sin(a), 0.0);
+        const bool inner = l <= 4;
+        const double e = extent(*make(l, Vec3f(0.0f)), inner ? ray : -ray);
+        const double rad = inner ? tornado.rs - 1.5 - e : tornado.rs + 1.5 + e;
+        in[l] = make(l, Vec3f(ray * rad + Vec3d(0.0, 0.0, tornado.z0)));
     }
     auto m = MLS::fromSignedGrids(in, int(hw));
     ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}));
     const std::map<int32_t, Index64> vol0 = labelVoxelCounts(*m);
     ASSERT_TRUE(contactPairs(*m).empty());
 
-    // Rankine-style vortex about z (core radius R = 16): swirl
-    // u_theta = r/R (r < R) or R/r, inflow u_r = -0.3*exp(-(z+20)^2/200),
-    // updraft u_z = 0.4*exp(-r^2/(2 R^2)); dense over [-64, 64]^3.
-    const double R = 16.0;
-    Vec3SGrid::Ptr vel = makeVelocity(CoordBBox(Coord(-64), Coord(64)), dx,
-        [R](const Vec3d& p) {
-            const double r = std::sqrt(p[0] * p[0] + p[1] * p[1]);
-            const double ut = r < R ? r / R : R / r;
-            const double ur = -0.3 * std::exp(-(p[2] + 20.0) * (p[2] + 20.0) / 200.0);
-            const double uz = 0.4 * std::exp(-r * r / (2.0 * R * R));
-            Vec3d v(0.0, 0.0, uz);
-            if (r > 0.0) v += Vec3d(-p[1], p[0], 0.0) * (ut / r) + Vec3d(p[0], p[1], 0.0) * (ur / r);
-            return Vec3s(v);
-        });
-
+    Vec3SGrid::Ptr vel = makeVelocity(CoordBBox(Coord(-64), Coord(64)), dx, tornado);
     Forces forces;
     forces.setAdvection(vel, 1.0f);
-    forces.setCurvatureWeight(0.05f);
+    forces.setCurvatureWeight(0.01f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
 
-    const double tEnd = 120.0, chunk = 10.0;
+    const double tCap = 40.0, chunk = 2.0;
+    double t = 0.0;
     size_t steps = 0;
+    std::set<std::pair<int32_t, int32_t>> pairs;
     const auto start = std::chrono::steady_clock::now();
-    for (double t = 0.0; t < tEnd - 1e-9; t += chunk) {
+    while (t < tCap - 1e-9 && pairs.size() < 4) {
         steps += lsmo.advect(t, t + chunk);
+        t += chunk;
         std::string msg;
-        ASSERT_TRUE(m->validate(&msg)) << "t " << t + chunk << ": " << msg;
+        ASSERT_TRUE(m->validate(&msg)) << "t " << t << ": " << msg;
         Index64 overlaps = 0, badCover = 0;
         partitionErrors(*m, overlaps, badCover);
-        ASSERT_EQ(overlaps, Index64(0)) << "t " << t + chunk;
-        ASSERT_EQ(badCover, Index64(0)) << "t " << t + chunk;
-        ASSERT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << t + chunk;
-        std::cout << "Tornado: t " << t + chunk << " steps " << steps << " contacts "
-                  << contactPairs(*m).size() << " active " << m->phi()->activeVoxelCount();
+        ASSERT_EQ(overlaps, Index64(0)) << "t " << t;
+        ASSERT_EQ(badCover, Index64(0)) << "t " << t;
+        ASSERT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << t;
+        pairs = contactPairs(*m);
+        std::cout << "Tornado: t " << t << " steps " << steps << " contacts " << pairs.size();
         for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
         std::cout << std::endl;
     }
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-
-    const auto pairs = contactPairs(*m);
-    std::cout << "Tornado: " << steps << " steps, " << secs << " s, contact pairs";
+    std::cout << "Tornado: t " << t << ", " << steps << " steps, " << secs << " s, contact pairs";
     for (const auto& pr : pairs) std::cout << " " << pr.first << "-" << pr.second;
     std::cout << std::endl;
     EXPECT_GE(pairs.size(), size_t(4));
 
     const std::map<int32_t, Index64> vol1 = labelVoxelCounts(*m);
     for (int32_t l = 1; l <= 8; ++l) {
+        // reference: the same shape alone, LevelSetAdvection to the same t
+        FloatGrid::Ptr ref = in[l]->deepCopy();
+        const double r0 = double(insideVoxelCount(*ref));
+        referenceAdvect(*ref, *vel, 0.0, t);
+        const double refLoss = 1.0 - double(insideVoxelCount(*ref)) / r0;
         const double v0 = double(vol0.at(l));
         const double v1 = vol1.count(l) ? double(vol1.at(l)) : 0.0;
-        std::cout << "Tornado: label " << l << " voxels " << v0 << " -> " << v1 << " ("
-                  << 100.0 * (v1 - v0) / v0 << "%)" << std::endl;
+        const double loss = 1.0 - v1 / v0;
+        std::cout << "Tornado: label " << l << " voxels " << v0 << " -> " << v1 << " (loss "
+                  << 100.0 * loss << "%), reference loss " << 100.0 * refLoss << "%" << std::endl;
         EXPECT_GE(v1, 1.0) << "label " << l;
-        EXPECT_NEAR(v1, v0, 0.25 * v0) << "label " << l;
+        EXPECT_LE(loss, 1.1 * refLoss + 0.02) << "label " << l;
     }
 }

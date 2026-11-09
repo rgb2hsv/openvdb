@@ -144,6 +144,10 @@ Reproduces wedge's force model:
 - Speed = −advection·∇⁻ψ (upwind, per axis on sign of velocity component)
   + κ (clamped) + pressure·|∇ψ| (Godunov upwind on sign of pressure force),
   matching wedge's `pressureAndAdvectionMotion`.
+- Deviation from wedge (ruling R26): the curvature term is evaluated at the
+  interface rather than the voxel centre, κ_Γ = κ_x / (1 − ψ·κ_x) with κ_x
+  the voxel's mean curvature and ψ its ψ_l (falls back to κ_x when
+  |ψ·κ_x| ≥ 0.5), then weighted and clamped as before.
 
 ### 3.5 `LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT = util::NullInterrupter>`
 
@@ -421,21 +425,32 @@ Required integration tests:
    - curvature only: mean-curvature flow via `LevelSetFilter::meanCurvature`
      iterations matched to the same total time;
    - combined advection + curvature.
-   Compare `extractSignedDistance(1)` against the reference grid: symmetric
-   difference volume < 1% of object volume and zero-set Hausdorff distance
-   < 1·dx.
-9. **Eight objects in a tornado vortex.** Eight shapes with **eight distinct
-   labels** (sphere, cube, tetrahedron, octahedron, dodecahedron, icosahedron,
-   capsule, torus-like tube; via `LevelSetSphere`, `LevelSetPlatonic`,
-   `LevelSetTubes`), spaced apart in a ring around the z axis. Velocity field:
-   Rankine-style swirl about z (solid-body core, 1/r outer decay), radial
-   inflow near the bottom, updraft near the core. Evolve with advection plus a
-   small curvature weight.
-   - Every N steps: `validate()`, partition invariant, no NaN.
-   - At end: objects have come into contact (count of distinct label pairs
-     sharing a face > 0, expected ≥ 4); per-label volume drift within a stated
-     tolerance (velocity is near divergence-free); every label still owns
-     at least one voxel (no label vanishes).
+   Compare `extractSignedDistance(1)` against the reference grid: zero-set
+   Hausdorff distance < 1·dx in every case. Curvature only and combined:
+   symmetric difference volume < 1% of object volume. Advection only (ruling
+   R25; both first-order schemes diffuse by different amounts): MOGAC's
+   symmetric difference against the exact (rotated) solution is at most
+   1.1 × the reference's symmetric difference against it.
+9. **Eight objects in a tornado vortex** (parameters per ruling R27). Eight
+   shapes with **eight distinct labels** (sphere, cube, tetrahedron,
+   octahedron, dodecahedron, icosahedron, capsule, closed tube ring; via
+   `LevelSetSphere`, `LevelSetPlatonic`, `LevelSetTubes`), each of
+   circumradius 10·dx, dx = 1. They sit in pairs on four rays (angles k·90°)
+   in the plane z = −20, one inside and one outside the ring r = 38.5, each
+   with its nearest surface point 1.5·dx from the ring. Velocity field:
+   Rankine-style swirl about z (core R = 16, amplitude 0.1), radial inflow
+   towards the ring u_r = −0.2·tanh(r − 38.5), updraft 0.2·exp(−r²/(2R²)).
+   (An exact flow never makes disjoint objects touch and an axisymmetric
+   flow keeps the angular gaps of objects at one radius, so contact comes
+   from pairs pressed together in the convergence zone until their gap is
+   below a voxel.) Advection weight 1, curvature weight 0.01; advect in
+   chunks of 2 until ≥ 4 contact pairs, capped at t = 40.
+   - Every chunk: `validate()`, partition invariant, no NaN.
+   - At end: ≥ 4 distinct label pairs sharing a face; every label still owns
+     at least one voxel; each label's voxel-count loss ≤ 1.1 × the volume loss
+     of the same shape advected alone by `LevelSetAdvection`
+     (FIRST_BIAS/TVD_RK1) in the same field over the same time, + 2%
+     absolute.
    - Different labels never merge; contact means shared interfaces.
 
 Contouring tests (`TestLevelSetMultiObjectMesh.cc`):

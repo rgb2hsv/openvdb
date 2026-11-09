@@ -1357,6 +1357,11 @@ private:
 
 /// @brief Built-in speed functor reproducing wedge's multi-object force
 /// model: curvature + upwind pressure + upwind advection (spec 3.4).
+/// @note Deviation from wedge (ruling R26): the curvature term uses the
+/// interface curvature k_x/(1 - psi*k_x) instead of the voxel-centre mean
+/// curvature k_x (fallback k_x when |psi*k_x| >= 0.5), so that voxels on both
+/// sides of the interface move it at its own curvature. Without it, mean
+/// curvature flow of a sphere runs ~3.5% fast with this method's band.
 /// @details Satisfies the speed functor concept of spec 3.3. Label 0 is
 /// handled by the evolver as passive (rulings R3, R20), so isFixed(0) is
 /// false here. Speeds are world-space; with unit voxel size they equal
@@ -1365,7 +1370,8 @@ template<typename MultiLevelSetT>
 class MultiObjectForces
 {
 public:
-    /// Curvature weight w: speed w*kappa*|grad psi| (clamped).
+    /// Curvature weight w: speed w*kappa*|grad psi| (clamped), with kappa the
+    /// interface mean curvature k_x/(1 - psi*k_x) (ruling R26).
     void setCurvatureWeight(float w) { mCurvatureWeight = w; }
     void setMaxCurvatureForce(float m = 10.0f) { mMaxCurvatureForce = m; }
 
@@ -1430,8 +1436,22 @@ public:
         float dneg[3], dpos[3];
         s.upwindDifferences(dneg, dpos);
 
-        float kappa = mCurvatureWeight * s.meanCurvatureNormGrad();
-        kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
+        float kappa = 0.0f;
+        if (mCurvatureWeight != 0.0f) {
+            // Interface curvature (ruling R26): the voxel's level set has mean
+            // curvature k_x; the interface, at signed distance -psi along the
+            // normal, has k = k_x / (1 - psi*k_x) for a sphere (a first-order
+            // correction otherwise). Falls back to k_x when |psi*k_x| >= 0.5.
+            // Wedge uses k_x directly.
+            float kn = s.meanCurvatureNormGrad(); // k_x * |grad psi|
+            const float g = s.gradient().length();
+            if (g > 0.0f) {
+                const float pk = s.template getValue<0, 0, 0>() * kn / g; // psi*k_x
+                if (std::abs(pk) < 0.5f) kn /= (1.0f - pk);
+            }
+            kappa = mCurvatureWeight * kn;
+            kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
+        }
 
         float advection = 0.0f;
         if (mAdvection) {
