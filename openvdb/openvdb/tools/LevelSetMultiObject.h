@@ -5,8 +5,9 @@
 ///
 /// @brief Multi-object level sets: a single unsigned distance grid phi
 /// paired with an integer grid of object labels (MOGAC). This header
-/// currently provides the MultiLevelSet data holder and the second-order
-/// label-aware redistancer MultiLevelSetRedistance.
+/// currently provides the MultiLevelSet data holder (with its factories
+/// fromLabelGrid and fromSignedGrids) and the second-order label-aware
+/// redistancer MultiLevelSetRedistance.
 
 #ifndef OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
 #define OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
@@ -21,12 +22,15 @@
 #include "Morphology.h"// for dilateActiveValues, erodeActiveValues
 #include "Prune.h"// for pruneInactive
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <tbb/parallel_for.h>
@@ -76,6 +80,38 @@ public:
         mPhi->insertMeta("multi_level_set_role", StringMetadata("phi"));
         mLabels->insertMeta("multi_level_set_role", StringMetadata("labels"));
     }
+
+    /// @brief Build a multi-object level set from a grid of labels.
+    /// @details The label of a voxel is @a labels' value there (active or
+    /// not); label 0 is background. Interface voxels (a voxel with a face
+    /// neighbour of a different label) are searched among the active voxels
+    /// of @a labels and their face neighbours, seeded with phi = 0.5*dx (the
+    /// voxel face midpoint), and the band (interface voxels dilated by
+    /// @a halfWidth over 26-neighbours) is reinitialized (spec 5); voxels
+    /// left with phi >= halfWidth*dx are deactivated. Every inactive voxel
+    /// kept in the trees holds its label from @a labels (ruling R11).
+    /// @throw ValueError if @a halfWidth < 2, the voxel size is not uniform
+    /// or the label background is not 0.
+    static Ptr fromLabelGrid(const LabelGridT& labels, int halfWidth = 3);
+
+    /// @brief Build a multi-object level set from signed distance grids, one
+    /// per non-zero label.
+    /// @details psi_l is the input grid of label l (inactive values read
+    /// with their sign, so deep interiors are negative); the background
+    /// label 0 has the implicit psi_0 = -min_l psi_l (ruling R2). At each
+    /// voxel the label is argmin psi (ties to the smaller label) and
+    /// phi = (v_b - v_a)/2 for the two smallest values v_a <= v_b, so
+    /// phi = |psi_l| near an isolated object. Candidates are the union of the
+    /// input active topologies and their face neighbours; the band is the
+    /// interface voxels dilated by @a halfWidth (26-neighbours), then
+    /// reinitialized (spec 5) and trimmed to phi < halfWidth*dx. Inactive
+    /// tiles and voxels kept in the label tree hold the deep-interior label
+    /// (ruling R11).
+    /// @throw ValueError if the map is empty, a grid is null or not a
+    /// GRID_LEVEL_SET, a key is 0, the transforms differ or are not a uniform
+    /// scale, or @a halfWidth < 2.
+    static Ptr fromSignedGrids(
+        const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth = 3);
 
     typename FloatGridT::Ptr phi() { return mPhi; }
     typename FloatGridT::ConstPtr phi() const { return mPhi; }
@@ -201,6 +237,13 @@ public:
     }
 
 private:
+    using BoolTreeT = typename FloatTreeT::template ValueConverter<bool>::Type;
+
+    /// Shared factory back end; see the definition.
+    template<typename SamplerT>
+    static Ptr build(const math::Transform& xform, typename LabelTreeT::Ptr labels,
+        const BoolTreeT& candidates, const SamplerT& sampler, int halfWidth);
+
     typename FloatGridT::Ptr mPhi;
     typename LabelGridT::Ptr mLabels;
     int mHalfWidth;
@@ -545,6 +588,293 @@ private:
     float mTolerance;
     int mGrainSize = 1;
 };
+
+
+////////////////////////////////////////
+
+
+namespace lsmo_internal {
+
+/// @brief Factory sampler for MultiLevelSet::fromLabelGrid: the label is the
+/// input value; phi is 0.5*dx at voxels with a face neighbour of a different
+/// label and @a bg elsewhere. Copied once per task.
+template<typename LabelTreeT>
+struct LabelGridSampler
+{
+    LabelGridSampler(const LabelTreeT& t, double dx, float bg)
+        : acc(t), half(float(0.5 * dx)), background(bg) {}
+    LabelGridSampler(const LabelGridSampler& o)
+        : acc(o.acc.tree()), half(o.half), background(o.background) {}
+
+    int32_t label(const Coord& p) { return static_cast<int32_t>(acc.getValue(p)); }
+    float phi(const Coord& p)
+    {
+        const auto l = acc.getValue(p);
+        const Coord* offs = faceOffsets();
+        for (int f = 0; f < 6; ++f) {
+            if (acc.getValue(p + offs[f]) != l) return half;
+        }
+        return background;
+    }
+
+    tree::ValueAccessor<const LabelTreeT> acc;
+    float half, background;
+};
+
+/// @brief Factory sampler for MultiLevelSet::fromSignedGrids. Candidates are
+/// (psi_l, l) for every input and (psi_0 = -min_l psi_l, 0) for the
+/// background (ruling R2); the label is the smallest candidate (ties to the
+/// smaller label) and phi = (v_b - v_a)/2 for the two smallest v_a <= v_b.
+/// Copied once per task.
+template<typename FloatTreeT>
+struct SignedGridsSampler
+{
+    using Input = std::pair<int32_t, const FloatTreeT*>;
+
+    explicit SignedGridsSampler(const std::vector<Input>& in): inputs(in) { this->init(); }
+    SignedGridsSampler(const SignedGridsSampler& o): inputs(o.inputs) { this->init(); }
+
+    void eval(const Coord& p, int32_t& label, double& phi)
+    {
+        const double inf = std::numeric_limits<double>::infinity();
+        double va = inf, vb = inf, minPsi = inf;
+        int32_t la = 0, lb = 0;
+        auto push = [&](double v, int32_t l) {
+            if (v < va || (v == va && l < la)) {
+                vb = va; lb = la; va = v; la = l;
+            } else if (v < vb || (v == vb && l < lb)) {
+                vb = v; lb = l;
+            }
+        };
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            const double psi = accs[i].getValue(p);
+            minPsi = std::min(minPsi, psi);
+            push(psi, inputs[i].first);
+        }
+        push(-minPsi, 0);
+        label = la;
+        phi = 0.5 * (vb - va);
+    }
+    int32_t label(const Coord& p) { int32_t l; double d; this->eval(p, l, d); return l; }
+    float phi(const Coord& p) { int32_t l; double d; this->eval(p, l, d); return float(d); }
+
+    std::vector<Input> inputs;
+    std::vector<tree::ValueAccessor<const FloatTreeT>> accs;
+
+private:
+    void init()
+    {
+        accs.reserve(inputs.size());
+        for (const Input& in : inputs) accs.emplace_back(*in.second);
+    }
+};
+
+} // namespace lsmo_internal
+
+
+/// @details Factory back end. @a labels holds the inactive structure (tiles
+/// and leaves) whose values must carry the deep-interior labels; @a sampler
+/// provides label(p) and the initial phi(p) anywhere.
+/// -# Interface voxels: voxels of @a candidates with a face neighbour of a
+///    different sampled label.
+/// -# Band: interface voxels dilated by @a halfWidth (26-neighbours); every
+///    label leaf touched by the band or its face shell gets the sampled
+///    label at all its voxels, active exactly on the band.
+/// -# phi mirrors the label tree's structure; band voxels get the sampled
+///    phi; reinitialize() (spec 5.1 reseed + 5.2 solve).
+/// -# Voxels with phi >= halfWidth*dx are deactivated (labels kept), then
+///    pruneInactive().
+template<typename FloatTreeT, typename LabelTreeT>
+template<typename SamplerT>
+typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
+MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
+    typename LabelTreeT::Ptr labels, const BoolTreeT& candidates,
+    const SamplerT& sampler, int halfWidth)
+{
+    const double dx = xform.voxelSize()[0];
+    const float bg = float(halfWidth * dx);
+    const Coord* offs = lsmo_internal::faceOffsets();
+
+    // 1. interface voxels
+    BoolTreeT band(candidates);
+    band.voxelizeActiveTiles();
+    {
+        tree::LeafManager<BoolTreeT> leafs(band);
+        tbb::parallel_for(leafs.leafRange(1),
+            [&](const typename tree::LeafManager<BoolTreeT>::LeafRange& range) {
+                SamplerT s(sampler);
+                for (auto leaf = range.begin(); leaf; ++leaf) {
+                    for (auto it = leaf->beginValueOn(); it; ++it) {
+                        const Coord p = it.getCoord();
+                        const int32_t l = s.label(p);
+                        bool iface = false;
+                        for (int f = 0; f < 6 && !iface; ++f) iface = s.label(p + offs[f]) != l;
+                        if (!iface) leaf->setValueOff(it.pos());
+                    }
+                }
+            });
+    }
+
+    // 2. band and label tree
+    tools::dilateActiveValues(band, halfWidth, NN_FACE_EDGE_VERTEX, IGNORE_TILES);
+    {
+        BoolTreeT shell(band);
+        tools::dilateActiveValues(shell, 1, NN_FACE, IGNORE_TILES);
+        tree::ValueAccessor<LabelTreeT> acc(*labels);
+        for (auto leaf = shell.cbeginLeaf(); leaf; ++leaf) acc.touchLeaf(leaf->origin());
+    }
+    {
+        tree::LeafManager<LabelTreeT> leafs(*labels);
+        tbb::parallel_for(leafs.leafRange(1),
+            [&](const typename tree::LeafManager<LabelTreeT>::LeafRange& range) {
+                SamplerT s(sampler);
+                for (auto leaf = range.begin(); leaf; ++leaf) {
+                    const auto* bandLeaf = band.probeConstLeaf(leaf->origin());
+                    for (Index i = 0; i < LabelTreeT::LeafNodeType::NUM_VALUES; ++i) {
+                        leaf->setValueOnly(i, LabelT(s.label(leaf->offsetToGlobalCoord(i))));
+                        leaf->setActiveState(i, bandLeaf && bandLeaf->isValueOn(i));
+                    }
+                }
+            });
+    }
+
+    // 3. phi with the same structure, then reinitialize
+    typename FloatTreeT::Ptr phiTree(new FloatTreeT(*labels, bg, TopologyCopy()));
+    {
+        tree::LeafManager<FloatTreeT> leafs(*phiTree);
+        tbb::parallel_for(leafs.leafRange(1),
+            [&](const typename tree::LeafManager<FloatTreeT>::LeafRange& range) {
+                SamplerT s(sampler);
+                for (auto leaf = range.begin(); leaf; ++leaf) {
+                    for (auto it = leaf->beginValueOn(); it; ++it) it.setValue(s.phi(it.getCoord()));
+                }
+            });
+    }
+    typename FloatGridT::Ptr phiGrid = FloatGridT::create(phiTree);
+    phiGrid->setTransform(xform.copy());
+    typename LabelGridT::Ptr labGrid = LabelGridT::create(labels);
+    labGrid->setTransform(xform.copy());
+    Ptr mls(new MultiLevelSet(phiGrid, labGrid, halfWidth));
+    MultiLevelSetRedistance<MultiLevelSet>(*mls).reinitialize();
+
+    // 4. trim to the band phi < halfWidth*dx
+    {
+        tree::LeafManager<FloatTreeT> leafs(*phiTree);
+        tbb::parallel_for(leafs.leafRange(1),
+            [&](const typename tree::LeafManager<FloatTreeT>::LeafRange& range) {
+                for (auto leaf = range.begin(); leaf; ++leaf) {
+                    auto* labLeaf = labels->probeLeaf(leaf->origin());
+                    for (auto it = leaf->beginValueOn(); it; ++it) {
+                        if (*it < bg) continue;
+                        leaf->setValueOff(it.pos(), bg);
+                        labLeaf->setActiveState(it.pos(), false);
+                    }
+                }
+            });
+    }
+    mls->pruneInactive();
+    return mls;
+}
+
+
+template<typename FloatTreeT, typename LabelTreeT>
+typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
+MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, int halfWidth)
+{
+    if (halfWidth < 2) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: halfWidth must be at least 2");
+    }
+    if (!labels.transform().hasUniformScale()) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: transform must have uniform voxel size");
+    }
+    if (labels.background() != LabelT(0)) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: label background must be 0");
+    }
+    const double dx = labels.transform().voxelSize()[0];
+
+    // Keep the input's structure and values (deep-interior labels), inactive.
+    typename LabelTreeT::Ptr lab(new LabelTreeT(labels.tree()));
+    for (auto it = lab->beginValueOn(); it; ++it) it.setValueOff();
+
+    BoolTreeT candidates(labels.tree(), false, TopologyCopy());
+    candidates.voxelizeActiveTiles();
+    tools::dilateActiveValues(candidates, 1, NN_FACE, IGNORE_TILES);
+
+    return build(labels.transform(), lab, candidates,
+        lsmo_internal::LabelGridSampler<LabelTreeT>(labels.tree(), dx, float(halfWidth * dx)),
+        halfWidth);
+}
+
+
+template<typename FloatTreeT, typename LabelTreeT>
+typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
+MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
+    const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth)
+{
+    if (halfWidth < 2) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: halfWidth must be at least 2");
+    }
+    if (grids.empty()) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: no input grids");
+    }
+    using SamplerT = lsmo_internal::SignedGridsSampler<FloatTreeT>;
+    const math::Transform* xform = nullptr;
+    std::vector<typename SamplerT::Input> inputs;
+    for (const auto& kv : grids) {
+        if (!kv.second) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: null input grid");
+        }
+        if (kv.first == 0) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: label 0 is reserved for the background");
+        }
+        if (kv.second->getGridClass() != GRID_LEVEL_SET) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: input grids must be level sets");
+        }
+        if (!xform) {
+            xform = &kv.second->transform();
+        } else if (*xform != kv.second->transform()) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: input grids must share a transform");
+        }
+        inputs.emplace_back(kv.first, &kv.second->tree());
+    }
+    if (!xform->hasUniformScale()) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: transform must have uniform voxel size");
+    }
+    SamplerT sampler(inputs);
+
+    // Deep interiors: every negative inactive tile of an input becomes a
+    // tile of its argmin label (largest tiles first, so smaller ones refine
+    // them); every input leaf is touched so its voxels get sampled labels.
+    typename LabelTreeT::Ptr lab(new LabelTreeT(LabelT(0)));
+    std::vector<std::pair<Index, Coord>> tiles;
+    for (const auto& in : inputs) {
+        for (auto it = in.second->cbeginValueOff(); it; ++it) {
+            if (it.getLevel() == 0 || !(*it < 0)) continue;
+            tiles.emplace_back(it.getLevel(), it.getCoord());
+        }
+    }
+    std::stable_sort(tiles.begin(), tiles.end(),
+        [](const std::pair<Index, Coord>& a, const std::pair<Index, Coord>& b) {
+            return a.first > b.first;
+        });
+    for (const auto& t : tiles) {
+        const int32_t l = sampler.label(t.second);
+        if (l != 0) lab->addTile(t.first, t.second, LabelT(l), false);
+    }
+    {
+        tree::ValueAccessor<LabelTreeT> acc(*lab);
+        for (const auto& in : inputs) {
+            for (auto leaf = in.second->cbeginLeaf(); leaf; ++leaf) acc.touchLeaf(leaf->origin());
+        }
+    }
+
+    BoolTreeT candidates(false);
+    for (const auto& in : inputs) candidates.topologyUnion(*in.second);
+    candidates.voxelizeActiveTiles();
+    tools::dilateActiveValues(candidates, 1, NN_FACE, IGNORE_TILES);
+
+    return build(*xform, lab, candidates, sampler, halfWidth);
+}
 
 } // namespace tools
 } // namespace OPENVDB_VERSION_NAME

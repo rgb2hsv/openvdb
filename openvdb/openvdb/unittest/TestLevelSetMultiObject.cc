@@ -3,6 +3,7 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetMultiObject.h>
+#include <openvdb/tools/LevelSetSphere.h>
 
 #include <gtest/gtest.h>
 
@@ -10,6 +11,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -456,4 +461,243 @@ TEST_F(TestLevelSetMultiObject, RedistanceSeedInterface)
     }
     // non-seed voxels are left alone
     EXPECT_EQ(out.getValue(Coord(5, 3, 3)), snapshot.getValue(Coord(5, 3, 3)));
+}
+
+namespace {
+
+// Interface layer: active voxels with an active face neighbour of opposite
+// sign. Errors are |sdf - analytic| in units of dx; analytic takes world
+// coordinates.
+double
+maxInterfaceError(const FloatGrid& sdf, std::function<double(Vec3d)> analytic)
+{
+    const double dx = sdf.voxelSize()[0];
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    tree::ValueAccessor<const FloatTree> acc(sdf.tree());
+    double maxErr = 0.0;
+    Index64 n = 0;
+    for (auto it = sdf.tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        bool iface = false;
+        for (int f = 0; f < 6 && !iface; ++f) {
+            float v;
+            if (acc.probeValue(p + offs[f], v)) iface = (v < 0.0f) != (*it < 0.0f);
+        }
+        if (!iface) continue;
+        ++n;
+        maxErr = std::max(maxErr, std::abs(*it - analytic(sdf.indexToWorld(p))) / dx);
+    }
+    EXPECT_GT(n, Index64(0));
+    return maxErr;
+}
+
+// RMS of |sdf - analytic| / dx over all active voxels.
+double
+rmsBandError(const FloatGrid& sdf, std::function<double(Vec3d)> analytic)
+{
+    const double dx = sdf.voxelSize()[0];
+    double sum = 0.0;
+    Index64 n = 0;
+    for (auto it = sdf.tree().cbeginValueOn(); it; ++it, ++n) {
+        const double e = (*it - analytic(sdf.indexToWorld(it.getCoord()))) / dx;
+        sum += e * e;
+    }
+    EXPECT_GT(n, Index64(0));
+    return n ? std::sqrt(sum / double(n)) : 0.0;
+}
+
+// Raw signedDistance(ijk, label) over the active voxels of @a m whose world
+// position satisfies @a keep.
+FloatGrid::Ptr
+rawSignedGrid(const MLS& m, int32_t label, std::function<bool(Vec3d)> keep)
+{
+    FloatGrid::Ptr g = FloatGrid::create(float(m.halfWidth() * m.voxelSize()));
+    g->setTransform(m.phi()->transform().copy());
+    auto acc = g->getAccessor();
+    for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        if (keep(m.phi()->indexToWorld(p))) acc.setValue(p, m.signedDistance(p, label));
+    }
+    return g;
+}
+
+// Ruling R11: every seed (an active voxel with a face neighbour, active or
+// not, of a different label, as the redistancer sees it) lies within one
+// voxel of the true interface; distToInterface takes world coordinates.
+void
+expectNoSpuriousSeeds(const MLS& m, std::function<double(Vec3d)> distToInterface)
+{
+    const double dx = m.voxelSize();
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    Index64 nSeeds = 0, nBad = 0;
+    for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        bool seed = false;
+        for (int f = 0; f < 6; ++f) seed |= lab.getValue(p + offs[f]) != lab.getValue(p);
+        if (!seed) continue;
+        ++nSeeds;
+        const double d = distToInterface(m.phi()->indexToWorld(p));
+        if (d > dx * (1.0 + 1e-6)) {
+            if (++nBad <= 5) ADD_FAILURE() << "spurious seed at " << p << ", interface " << d / dx << " dx away";
+        }
+    }
+    EXPECT_GT(nSeeds, Index64(0));
+    EXPECT_EQ(nBad, Index64(0));
+}
+
+struct TwoSphereErrors { double maxIface[2], rms[2]; };
+
+// Spheres of radius 10*dx at (-+15*dx, 0, 0), labels 1 and 2, via
+// fromSignedGrids; raw signedDistance errors near each sphere, in dx.
+TwoSphereErrors
+twoSphereRoundTrip(double dx)
+{
+    const double r = 10.0 * dx, cx = 15.0 * dx;
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(-cx), 0, 0), float(dx));
+    in[2] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(cx), 0, 0), float(dx));
+    auto m = MLS::fromSignedGrids(in);
+    EXPECT_TRUE(m);
+    if (!m) return TwoSphereErrors{};
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2}));
+    EXPECT_EQ(m->halfWidth(), 3);
+    EXPECT_DOUBLE_EQ(m->voxelSize(), dx);
+    const auto sphere = [r](double c) {
+        return [r, c](Vec3d w) { return (w - Vec3d(c, 0, 0)).length() - r; };
+    };
+    expectNoSpuriousSeeds(*m, [&](Vec3d w) {
+        return std::min(std::abs(sphere(-cx)(w)), std::abs(sphere(cx)(w)));
+    });
+    TwoSphereErrors e;
+    for (int s = 0; s < 2; ++s) {
+        const double c = s ? cx : -cx;
+        auto g = rawSignedGrid(*m, s + 1, [s](Vec3d w) { return s ? w[0] > 0.0 : w[0] < 0.0; });
+        e.maxIface[s] = maxInterfaceError(*g, sphere(c));
+        e.rms[s] = rmsBandError(*g, sphere(c));
+    }
+    return e;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, RoundTripTwoSpheres)
+{
+    const TwoSphereErrors e = twoSphereRoundTrip(1.0);
+    for (int s = 0; s < 2; ++s) {
+        std::cout << "RoundTripTwoSpheres label " << s + 1 << ": max interface error "
+            << e.maxIface[s] << " dx, RMS band error " << e.rms[s] << " dx" << std::endl;
+        EXPECT_LT(e.maxIface[s], 0.05);
+        EXPECT_LT(e.rms[s], 0.1);
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, RoundTripNonUnitVoxel)
+{
+    const TwoSphereErrors e1 = twoSphereRoundTrip(1.0);
+    const TwoSphereErrors e = twoSphereRoundTrip(0.25);
+    for (int s = 0; s < 2; ++s) {
+        std::cout << "RoundTripNonUnitVoxel label " << s + 1 << ": max interface error "
+            << e.maxIface[s] << " dx, RMS band error " << e.rms[s] << " dx" << std::endl;
+        EXPECT_LT(e.maxIface[s], 0.05);
+        EXPECT_LT(e.rms[s], 0.1);
+        EXPECT_NEAR(e.maxIface[s], e1.maxIface[s], 1e-3);
+        EXPECT_NEAR(e.rms[s], e1.rms[s], 1e-3);
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, ConvergenceOrder)
+{
+    const double r = 0.5;
+    const double dxs[3] = {1.0 / 20.0, 1.0 / 40.0, 1.0 / 80.0};
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (double dx : dxs) {
+        std::map<int32_t, FloatGrid::ConstPtr> in;
+        in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(0, 0, 0), float(dx));
+        auto m = MLS::fromSignedGrids(in);
+        ASSERT_TRUE(m);
+        ASSERT_TRUE(m->validate());
+        auto g = rawSignedGrid(*m, 1, [](Vec3d) { return true; });
+        const double errWorld = dx * maxInterfaceError(*g, [r](Vec3d w) { return w.length() - r; });
+        std::cout << "ConvergenceOrder dx = 1/" << int(std::lround(1.0 / dx))
+            << ": max interface error " << errWorld << " (" << errWorld / dx << " dx)" << std::endl;
+        ASSERT_GT(errWorld, 0.0);
+        const double x = std::log(dx), y = std::log(errWorld);
+        sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    const double n = 3.0;
+    const double slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    std::cout << "ConvergenceOrder slope " << slope << std::endl;
+    EXPECT_GE(slope, 1.8);
+}
+
+TEST_F(TestLevelSetMultiObject, FromLabelGrid)
+{
+    // Label 1 on [5, 24]^3 inside label 2 on [0, 29]^3; label 0 elsewhere.
+    const double dx = 0.5;
+    Int32Grid::Ptr in = Int32Grid::create(0);
+    in->setTransform(math::Transform::createLinearTransform(dx));
+    in->tree().fill(CoordBBox(Coord(0), Coord(29)), 2, /*active=*/true);
+    in->tree().fill(CoordBBox(Coord(5), Coord(24)), 1, /*active=*/true);
+    in->tree().voxelizeActiveTiles();
+
+    auto m = MLS::fromLabelGrid(*in);
+    ASSERT_TRUE(m);
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2}));
+    EXPECT_EQ(m->halfWidth(), 3);
+    EXPECT_DOUBLE_EQ(m->voxelSize(), dx);
+
+    // Index-space distance from a voxel centre to the face planes of a box
+    // whose voxels span [lo, hi] (faces at lo - 0.5 and hi + 0.5).
+    const auto boxDist = [](const Vec3d& p, double lo, double hi) {
+        const double l = lo - 0.5, h = hi + 0.5;
+        double inner = std::numeric_limits<double>::max();
+        bool inside = true;
+        Vec3d q(0.0);
+        for (int a = 0; a < 3; ++a) {
+            q[a] = std::max(0.0, std::max(l - p[a], p[a] - h));
+            if (p[a] < l || p[a] > h) inside = false;
+            inner = std::min(inner, std::min(p[a] - l, h - p[a]));
+        }
+        return inside ? inner : q.length();
+    };
+    expectNoSpuriousSeeds(*m, [&](Vec3d w) {
+        const Vec3d p = w / dx;
+        return dx * std::min(boxDist(p, 5, 24), boxDist(p, 0, 29));
+    });
+
+    // Interface voxels whose only crossings lie along one axis (face
+    // interiors) hold 0.5*dx: the distance to the cube face.
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    const auto& lab = m->labels()->tree();
+    Index64 nFace = 0;
+    for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        EXPECT_EQ(lab.getValue(p), in->tree().getValue(p)) << p;
+        int axes = 0;
+        for (int a = 0; a < 3; ++a) {
+            const bool cross = lab.getValue(p + offs[2 * a]) != lab.getValue(p)
+                || lab.getValue(p + offs[2 * a + 1]) != lab.getValue(p);
+            axes += cross ? 1 : 0;
+        }
+        if (axes != 1) continue;
+        ++nFace;
+        EXPECT_NEAR(*it, 0.5 * dx, 1e-3 * dx) << p;
+    }
+    EXPECT_GT(nFace, Index64(6 * 18 * 18));
+    // band: every active voxel within halfWidth*dx (plus solver tolerance)
+    for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) EXPECT_LE(*it, float(3.0 * dx));
+}
+
+TEST_F(TestLevelSetMultiObject, FromSignedGridsThrows)
+{
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    FloatGrid::Ptr fog = tools::createLevelSetSphere<FloatGrid>(5.0f, Vec3f(0), 1.0f);
+    fog->setGridClass(GRID_FOG_VOLUME);
+    in[1] = fog;
+    EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
 }
