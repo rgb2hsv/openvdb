@@ -230,6 +230,10 @@ Added at the user's request (2026-11-09).
 - A rejected change keeps the voxel's label; its φ is set to 1e-3·dx (a
   barrier just inside its own region) and the voxel is frozen for this step's
   redistancing.
+- Every label write in a step respects protection: projection (above),
+  orphan cleanup (§4.5: a relabel involving a protected label is applied only
+  if simple) and band activation (§4.6b: a newly activated voxel whose stored
+  inactive label or proposed label is protected keeps its stored label).
 - Labels that are not protected behave exactly as before.
 
 ## 5. Second-order label-aware redistancing
