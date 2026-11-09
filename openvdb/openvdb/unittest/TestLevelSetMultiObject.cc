@@ -233,51 +233,154 @@ makePlanar(double dx, bool exact)
 TEST_F(TestLevelSetMultiObject, RedistancePlanar)
 {
     const double dx = 0.5;
-    auto m = makePlanar(dx, /*exact=*/false);
-    std::string msg;
-    ASSERT_TRUE(m->validate(&msg)) << msg;
-    const Index64 nActive = m->phi()->activeVoxelCount();
-    const Index64 nLeaves = m->phi()->tree().leafCount();
+    for (int reseed = 0; reseed < 2; ++reseed) {
+        SCOPED_TRACE(reseed ? "reinitialize" : "redistance");
+        auto m = makePlanar(dx, /*exact=*/false);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const Index64 nActive = m->phi()->activeVoxelCount();
+        const Index64 nLeaves = m->phi()->tree().leafCount();
 
-    tools::MultiLevelSetRedistance<MLS> redist(*m);
-    const int iterations = redist.redistance();
-    EXPECT_GE(iterations, 1);
-    EXPECT_LE(iterations, int(std::ceil(3.0 * std::sqrt(3.0))) + 2);
+        tools::MultiLevelSetRedistance<MLS> redist(*m);
+        const int iterations = reseed ? redist.reinitialize() : redist.redistance();
+        EXPECT_GE(iterations, 1);
+        EXPECT_LE(iterations, int(std::ceil(3.0 * std::sqrt(3.0))) + 2);
 
-    EXPECT_EQ(m->phi()->activeVoxelCount(), nActive);
-    EXPECT_EQ(m->phi()->tree().leafCount(), nLeaves);
-    EXPECT_TRUE(m->validate(&msg)) << msg;
-    for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
-        const Coord c = it.getCoord();
-        EXPECT_NEAR(*it, std::abs(c[0] - 7.3) * dx, 1e-3 * dx) << c;
-        EXPECT_EQ(m->labels()->tree().getValue(c), c[0] <= 7 ? 1 : 2);
-    }
-    // inactive phi stays at the background
-    for (auto leaf = m->phi()->tree().cbeginLeaf(); leaf; ++leaf) {
-        for (auto v = leaf->cbeginValueOff(); v; ++v) EXPECT_FLOAT_EQ(*v, float(3.0 * dx));
+        EXPECT_EQ(m->phi()->activeVoxelCount(), nActive);
+        EXPECT_EQ(m->phi()->tree().leafCount(), nLeaves);
+        EXPECT_TRUE(m->validate(&msg)) << msg;
+        for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+            const Coord c = it.getCoord();
+            EXPECT_NEAR(*it, std::abs(c[0] - 7.3) * dx, 1e-3 * dx) << c;
+            EXPECT_EQ(m->labels()->tree().getValue(c), c[0] <= 7 ? 1 : 2);
+        }
+        // inactive phi stays at the background
+        for (auto leaf = m->phi()->tree().cbeginLeaf(); leaf; ++leaf) {
+            for (auto v = leaf->cbeginValueOff(); v; ++v) EXPECT_FLOAT_EQ(*v, float(3.0 * dx));
+        }
     }
 }
 
 TEST_F(TestLevelSetMultiObject, RedistanceKeepsCrossing)
 {
     const double dx = 0.5;
-    auto m = makePlanar(dx, /*exact=*/true);
+    for (int reseed = 0; reseed < 2; ++reseed) {
+        SCOPED_TRACE(reseed ? "reinitialize" : "redistance");
+        auto m = makePlanar(dx, /*exact=*/true);
+        tools::MultiLevelSetRedistance<MLS> redist(*m);
+        if (reseed) redist.reinitialize(); else redist.redistance();
+        const auto& t = m->phi()->tree();
+        for (int j = 0; j < 16; ++j)
+            for (int k = 0; k < 16; ++k) {
+                const double a = t.getValue(Coord(7, j, k));
+                const double b = t.getValue(Coord(8, j, k));
+                ASSERT_GT(a + b, 0.0);
+                EXPECT_NEAR(7.0 + a / (a + b), 7.3, 1e-5);
+            }
+    }
+}
+
+namespace {
+
+// Ball of radius R (index units) at @a ctr: label 1 inside, 2 outside; band
+// |r - R| <= 3 voxels with phi = |r - R|*dx, and every other voxel of the
+// box [lo, hi]^3 inactive with its deep-interior label (ruling R7b).
+MLS::Ptr
+makeBall(double dx, const Vec3d& ctr, double R, int lo, int hi)
+{
+    auto xform = math::Transform::createLinearTransform(dx);
+    FloatGrid::Ptr phi = FloatGrid::create(float(3 * dx));
+    Int32Grid::Ptr lab = Int32Grid::create(0);
+    phi->setTransform(xform);
+    lab->setTransform(xform->copy());
+    auto pa = phi->getAccessor();
+    auto la = lab->getAccessor();
+    for (int i = lo; i <= hi; ++i)
+        for (int j = lo; j <= hi; ++j)
+            for (int k = lo; k <= hi; ++k) {
+                const Coord c(i, j, k);
+                const double r = (Vec3d(i, j, k) - ctr).length();
+                const int label = r < R ? 1 : 2;
+                if (std::abs(r - R) <= 3.0) {
+                    pa.setValue(c, float(std::abs(r - R) * dx));
+                    la.setValue(c, label);
+                } else {
+                    pa.touchLeaf(c);
+                    la.setValueOff(c, label);
+                }
+            }
+    return MLS::Ptr(new MLS(phi, lab, 3));
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, RedistanceCurvedNoDrift)
+{
+    const Vec3d ctr(0.3, -0.2, 0.1);
+    const double R = 9.7;
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+
+    // redistance() freezes the interface: repeated calls never move it.
+    auto m = makeBall(1.0, ctr, R, -15, 15);
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const FloatTree initial(m->phi()->tree());
     tools::MultiLevelSetRedistance<MLS> redist(*m);
-    redist.redistance();
-    const auto& t = m->phi()->tree();
-    for (int j = 0; j < 16; ++j)
-        for (int k = 0; k < 16; ++k) {
-            const double a = t.getValue(Coord(7, j, k));
-            const double b = t.getValue(Coord(8, j, k));
-            ASSERT_GT(a + b, 0.0);
-            EXPECT_NEAR(7.0 + a / (a + b), 7.3, 1e-5);
+    for (int n = 0; n < 10; ++n) redist.redistance();
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+    const auto& labels = m->labels()->tree();
+    Index64 nInterface = 0;
+    for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        bool iface = false;
+        for (int f = 0; f < 6; ++f) iface |= labels.getValue(p + offs[f]) != labels.getValue(p);
+        if (!iface) continue;
+        ++nInterface;
+        const float a = *it, b = initial.getValue(p);
+        uint32_t ua, ub;
+        std::memcpy(&ua, &a, 4);
+        std::memcpy(&ub, &b, 4);
+        EXPECT_EQ(ua, ub) << p;
+    }
+    EXPECT_GT(nInterface, Index64(100));
+
+    // reinitialize() places crossings accurately on a fresh copy.
+    auto m2 = makeBall(1.0, ctr, R, -15, 15);
+    tools::MultiLevelSetRedistance<MLS>(*m2).reinitialize();
+    EXPECT_TRUE(m2->validate(&msg)) << msg;
+    const auto& phi2 = m2->phi()->tree();
+    const auto& lab2 = m2->labels()->tree();
+    double sumErr = 0.0;
+    Index64 nPairs = 0;
+    for (auto it = phi2.cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        if (lab2.getValue(p) != 1) continue;
+        for (int f = 0; f < 6; ++f) {
+            const Coord q = p + offs[f];
+            if (lab2.getValue(q) != 2 || !phi2.isValueOn(q)) continue;
+            const double a = *it, b = phi2.getValue(q);
+            const double t = a / (a + b);
+            // exact crossing |c + s*e - ctr| = R, s in [0, 1]
+            const Vec3d c = Vec3d(p[0], p[1], p[2]) - ctr;
+            const Vec3d e(offs[f][0], offs[f][1], offs[f][2]);
+            const double ce = c.dot(e);
+            const double s = -ce + std::sqrt(ce * ce - (c.lengthSqr() - R * R));
+            sumErr += std::abs(t - s);
+            ++nPairs;
         }
+    }
+    ASSERT_GT(nPairs, Index64(100));
+    // Regression guard only (ruling R13): the spec 5.1 formula's curvature
+    // bias measures 0.0262*dx here, and the exact field scores 0.0109*dx on
+    // this metric. The spec accuracy gates are tested in Task 3.
+    EXPECT_LT(sumErr / double(nPairs), 0.03);
 }
 
 TEST_F(TestLevelSetMultiObject, RedistanceOrderIndependent)
 {
     // Three labels over several leaves: a ball split into labels 1 | 2 by the
-    // plane x = 11.5, label 3 outside; phi starts as a rough guess.
+    // plane x = 11.5, label 3 outside; phi starts as a rough guess. Inactive
+    // voxels of [-1, 24]^3 hold their deep-interior label (ruling R7b).
     auto build = []() {
         const double dx = 0.25;
         auto xform = math::Transform::createLinearTransform(dx);
@@ -289,41 +392,51 @@ TEST_F(TestLevelSetMultiObject, RedistanceOrderIndependent)
         auto la = lab->getAccessor();
         const Vec3d ctr(11.5, 12.2, 11.7);
         const double R = 7.4;
-        for (int i = 0; i < 24; ++i)
-            for (int j = 0; j < 24; ++j)
-                for (int k = 0; k < 24; ++k) {
+        for (int i = -1; i <= 24; ++i)
+            for (int j = -1; j <= 24; ++j)
+                for (int k = -1; k <= 24; ++k) {
                     const double r = (Vec3d(i, j, k) - ctr).length();
-                    if (std::abs(r - R) > 4.0) continue;
                     const Coord c(i, j, k);
-                    pa.setValue(c, float(std::abs(r - R) * dx * (1.0 + 0.1 * ((i * 7 + j * 3 + k) % 5))));
-                    la.setValue(c, r < R ? (i < 12 ? 1 : 2) : 3);
+                    const int label = r < R ? (i < 12 ? 1 : 2) : 3;
+                    const bool inside = i >= 0 && i < 24 && j >= 0 && j < 24 && k >= 0 && k < 24;
+                    if (inside && std::abs(r - R) <= 4.0) {
+                        pa.setValue(c, float(std::abs(r - R) * dx * (1.0 + 0.1 * ((i * 7 + j * 3 + k) % 5))));
+                        la.setValue(c, label);
+                    } else {
+                        pa.touchLeaf(c);
+                        la.setValueOff(c, label);
+                    }
                 }
         return MLS::Ptr(new MLS(phi, lab, 3));
     };
-    auto serial = build();
-    auto parallel = build();
-    ASSERT_GT(serial->phi()->tree().leafCount(), Index32(8));
+    for (int reseed = 0; reseed < 2; ++reseed) {
+        SCOPED_TRACE(reseed ? "reinitialize" : "redistance");
+        auto serial = build();
+        auto parallel = build();
+        ASSERT_TRUE(serial->validate());
+        ASSERT_GT(serial->phi()->tree().leafCount(), Index32(8));
 
-    tools::MultiLevelSetRedistance<MLS> r0(*serial);
-    r0.setGrainSize(0);
-    const int n0 = r0.redistance();
-    tools::MultiLevelSetRedistance<MLS> r1(*parallel);
-    r1.setGrainSize(1);
-    const int n1 = r1.redistance();
-    EXPECT_EQ(n0, n1);
-    EXPECT_TRUE(serial->validate());
+        tools::MultiLevelSetRedistance<MLS> r0(*serial);
+        r0.setGrainSize(0);
+        const int n0 = reseed ? r0.reinitialize() : r0.redistance();
+        tools::MultiLevelSetRedistance<MLS> r1(*parallel);
+        r1.setGrainSize(1);
+        const int n1 = reseed ? r1.reinitialize() : r1.redistance();
+        EXPECT_EQ(n0, n1);
+        EXPECT_TRUE(serial->validate());
 
-    ASSERT_TRUE(serial->phi()->tree().hasSameTopology(parallel->phi()->tree()));
-    tree::ValueAccessor<const FloatTree> acc(parallel->phi()->tree());
-    Index64 n = 0;
-    for (auto it = serial->phi()->tree().cbeginValueOn(); it; ++it, ++n) {
-        const float a = *it, b = acc.getValue(it.getCoord());
-        uint32_t ua, ub;
-        std::memcpy(&ua, &a, 4);
-        std::memcpy(&ub, &b, 4);
-        EXPECT_EQ(ua, ub) << it.getCoord();
+        ASSERT_TRUE(serial->phi()->tree().hasSameTopology(parallel->phi()->tree()));
+        tree::ValueAccessor<const FloatTree> acc(parallel->phi()->tree());
+        Index64 n = 0;
+        for (auto it = serial->phi()->tree().cbeginValueOn(); it; ++it, ++n) {
+            const float a = *it, b = acc.getValue(it.getCoord());
+            uint32_t ua, ub;
+            std::memcpy(&ua, &a, 4);
+            std::memcpy(&ub, &b, 4);
+            EXPECT_EQ(ua, ub) << it.getCoord();
+        }
+        EXPECT_GT(n, Index64(0));
     }
-    EXPECT_GT(n, Index64(0));
 }
 
 TEST_F(TestLevelSetMultiObject, RedistanceSeedInterface)
@@ -334,7 +447,7 @@ TEST_F(TestLevelSetMultiObject, RedistanceSeedInterface)
     FloatTree out(m->phi()->tree());
     BoolTree seeds(false);
     tools::MultiLevelSetRedistance<MLS>::seedInterface(snapshot,
-        [](const Coord& c) { return c[0] <= 7; }, out, seeds, dx);
+        [](const Coord& c) { return c[0] <= 7; }, out, seeds, dx, /*grainSize=*/0);
     EXPECT_EQ(seeds.activeVoxelCount(), Index64(2 * 16 * 16));
     for (auto it = seeds.cbeginValueOn(); it; ++it) {
         const Coord c = it.getCoord();

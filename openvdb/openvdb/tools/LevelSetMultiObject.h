@@ -228,9 +228,11 @@ inline const Coord* faceOffsets()
 /// written to @a out and flagged as active voxels of @a seedMask; nothing
 /// else in @a out changes. Active tiles of @a out are ignored.
 /// @param differs  copied once per task; called as differs(p, q).
+/// @param writeValues if false, only @a seedMask is built and @a out is
+/// left untouched (used to freeze the current interface values).
 template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp>
 void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
-    FloatTreeT& out, BoolTreeT& seedMask, double dx, int grainSize)
+    FloatTreeT& out, BoolTreeT& seedMask, double dx, int grainSize, bool writeValues = true)
 {
     using LeafT = typename FloatTreeT::LeafNodeType;
     seedMask.clear();
@@ -259,19 +261,21 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
                     for (int side = 0; side < 2; ++side) {
                         const Coord q = p + offs[2 * axis + side];
                         if (!op(p, q)) continue;
+                        seed = true;
+                        if (!writeValues) break;
                         float phiQf;
                         if (!acc.probeValue(q, phiQf)) phiQf = bg;
                         const double sum = phiP + double(phiQf);
                         const double theta = (sum < eps) ? 0.5 : phiP / sum;
                         d = std::min(d, theta * dx);
-                        seed = true;
                     }
+                    if (seed && !writeValues) break;
                     if (d == std::numeric_limits<double>::max()) continue;
                     if (d <= 0.0) { onInterface = true; continue; }
                     invSum += 1.0 / (d * d);
                 }
                 if (!seed) continue;
-                it.setValue(onInterface ? 0.0f : float(1.0 / std::sqrt(invSum)));
+                if (writeValues) it.setValue(onInterface ? 0.0f : float(1.0 / std::sqrt(invSum)));
                 if (maskLeaf) maskLeaf->setValueOn(it.pos(), true);
             }
         }
@@ -307,17 +311,29 @@ struct InsideDiffers
 /// @details Restores phi = distance to the voxel's own label boundary over
 /// the active band while keeping the interface fixed:
 /// -# Interface voxels (an active voxel with a face neighbour, active or
-///    not, of a different label) are seeded with a subcell distance computed
-///    from a snapshot of phi, and frozen.
+///    not, of a different label) are frozen. redistance() keeps their
+///    current values, so repeated calls never move a crossing (use it every
+///    evolution step). reinitialize() first reseeds them with the subcell
+///    distance of spec 5.1, computed from a snapshot of phi; that formula is
+///    not a fixed point of itself on curved interfaces, so reinitialize() is
+///    meant for one-shot use (factories, per-label reconstruction).
 /// -# All other active voxels solve |grad phi| = 1 by parallel Jacobi
 ///    iteration, using second-order one-sided upwind differences (Chopp 2001)
 ///    where two same-side upwind values are available (the outer one with
-///    p's label and no larger than the inner one) and first order otherwise. Inactive neighbours are not used. Iteration stops when
+///    p's label and strictly smaller than the inner one) and first order
+///    otherwise. Inactive neighbours are not used. Iteration stops when
 ///    max|delta phi| falls below the tolerance or after
 ///    ceil(halfWidth*sqrt(3)) + 2 iterations.
 ///
 /// Only active phi voxels are written; topology, labels and inactive values
 /// are untouched. Voxels with no path to a seed get the phi background.
+/// Outer values are not clamped and may exceed the background
+/// (halfWidth*dx); deactivating such voxels is left to band maintenance.
+///
+/// @pre The label tree holds the correct (deep-interior) label at the
+/// inactive face neighbours of the band (ruling R7b). A band-edge voxel
+/// whose inactive neighbour reads the label background instead becomes a
+/// spurious interface voxel.
 ///
 /// @note FastSweeping.h was evaluated for reuse (spec 5.2) and rejected: its
 /// update is first-order Godunov only, it sweeps in place (Gauss-Seidel), and
@@ -345,9 +361,36 @@ public:
     /// @brief TBB grain size in leaves; zero or negative runs serially.
     void setGrainSize(int grainSize) { mGrainSize = grainSize; }
 
-    /// @brief Redistance phi in place.
+    /// @brief Redistance phi in place, keeping the interface-voxel values
+    /// frozen (idempotent: crossings never move).
     /// @return the number of Jacobi iterations performed.
-    int redistance()
+    int redistance() { return this->run(/*reseed=*/false); }
+
+    /// @brief Reseed the interface voxels with the spec 5.1 subcell distance,
+    /// then redistance phi in place.
+    /// @return the number of Jacobi iterations performed.
+    int reinitialize() { return this->run(/*reseed=*/true); }
+
+    /// @brief Interface seeding only (spec 5.1), for per-label reconstruction.
+    /// @details For each active voxel p of @a out, every face neighbour q with
+    /// isInside(p) != isInside(q) defines a crossing; phi values come from
+    /// @a phiSnapshot. Seeds are written to @a out and marked active in
+    /// @a seedMask (which is overwritten); other voxels of @a out are unchanged.
+    /// @param voxelSize world-space voxel size dx (trees carry no transform,
+    /// and the subcell crossing offset theta*dx needs it).
+    /// @param grainSize TBB grain size in leaves; zero or negative runs serially.
+    /// @a isInside is copied once per task, so it may own value accessors.
+    template<typename IsInsideOp>
+    static void seedInterface(const FloatTreeT& phiSnapshot, IsInsideOp isInside,
+        FloatTreeT& out, BoolTreeT& seedMask, double voxelSize, int grainSize = 1)
+    {
+        lsmo_internal::seedInterface(phiSnapshot,
+            lsmo_internal::InsideDiffers<IsInsideOp>(isInside), out, seedMask,
+            voxelSize, grainSize);
+    }
+
+private:
+    int run(bool reseed)
     {
         FloatTreeT& phi = mMls.phi()->tree();
         const double dx = mMls.voxelSize();
@@ -357,13 +400,16 @@ public:
 
         if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
 
-        // 5.1: seeds from a read-only snapshot.
+        // Interface voxels: frozen as they are, or reseeded (5.1) from a
+        // read-only snapshot.
         BoolTreeT seeds(false);
-        {
+        const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
+        if (reseed) {
             const FloatTreeT snapshot(phi);
-            lsmo_internal::seedInterface(snapshot,
-                lsmo_internal::LabelDiffers<LabelTreeT>(mMls.labels()->tree()),
-                phi, seeds, dx, mGrainSize);
+            lsmo_internal::seedInterface(snapshot, differs, phi, seeds, dx, mGrainSize);
+        } else {
+            lsmo_internal::seedInterface(phi, differs, phi, seeds, dx, mGrainSize,
+                /*writeValues=*/false);
         }
 
         // 5.2: reset non-seed voxels, then Jacobi with one aux buffer.
@@ -396,22 +442,6 @@ public:
         return iter;
     }
 
-    /// @brief Interface seeding only (spec 5.1), for per-label reconstruction.
-    /// @details For each active voxel p of @a out, every face neighbour q with
-    /// isInside(p) != isInside(q) defines a crossing; phi values come from
-    /// @a phiSnapshot. Seeds are written to @a out and marked active in
-    /// @a seedMask (which is overwritten); other voxels of @a out are unchanged.
-    /// @param voxelSize world-space voxel size dx (trees carry no transform,
-    /// and the subcell crossing offset theta*dx needs it).
-    template<typename IsInsideOp>
-    static void seedInterface(const FloatTreeT& phiSnapshot, IsInsideOp isInside,
-        FloatTreeT& out, BoolTreeT& seedMask, double voxelSize)
-    {
-        lsmo_internal::seedInterface(phiSnapshot,
-            lsmo_internal::InsideDiffers<IsInsideOp>(isInside), out, seedMask, voxelSize, 1);
-    }
-
-private:
     static constexpr float kUnknown = std::numeric_limits<float>::max();
 
     template<typename OpT>
@@ -459,7 +489,7 @@ private:
                             }
                         }
                         if (a == kUnknown) continue;
-                        if (a2 <= a) { // second order (Chopp 2001)
+                        if (a2 < a) { // second order (Chopp 2001)
                             abar[n] = (4.0 * a - a2) / 3.0;
                             coef[n] = 9.0 / 4.0;
                         } else {
