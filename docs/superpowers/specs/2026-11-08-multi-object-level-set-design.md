@@ -338,6 +338,7 @@ struct MultiObjectMeshSettings {
     Connectivity connectivity = Connectivity::FG26_BG6;
     bool junctionCorrection = true;   // section 6.4
     bool computeNormals = false;
+    int grainSize = 1;                // TBB grain size in blocks; <= 0 serial (R36)
 };
 
 struct LabelMesh {
@@ -358,11 +359,14 @@ multiObjectToMesh(const MultiLevelSetT&,
 
 Cells are the 2×2×2 voxel-centre cubes of the index grid.
 
-1. **Interface cells, one pass.** Leaf-parallel over band voxels that have a
-   face neighbour of a different label (the same set as redistancing seeds).
-   Each such voxel contributes the up-to-8 cells it is a corner of. Cells are
-   deduplicated per leaf by owning-corner rule (the cell belongs to the leaf
-   containing its min corner). For each cell, read the 8 corner labels once.
+1. **Interface cells, one pass (ruling R36).** Cells are enumerated in
+   blocks of leaf-DIM^3 minimum corners: every leaf of the label tree plus its
+   seven lower neighbour blocks (a cell whose minimum corner lies one voxel
+   below a leaf has corners in it), block-parallel. Each block reads its
+   labels plus a one-voxel upper halo once and skips cells whose 8 corner
+   labels agree, so every mixed cell is processed exactly once, including
+   cells whose minimum corner lies in a tile. Interfaces inside tiles (absent
+   in valid pairs) are not seen.
 2. **Per-label classification.** For each distinct non-zero label l among a
    cell's corners with a mixed in/out pattern, the 8-bit case index is
    `bit_i = (L(corner_i) == l)`. Classification uses **labels, not the sign of
@@ -401,10 +405,18 @@ is built.
 
 At a voxel q of label b next to a third label c, φ_q is the distance to b's
 nearest boundary, which may be the b|c interface rather than l. That biases θ
-in cells containing three or more labels. With `junctionCorrection`, for such
-cells only, recompute local ψ_l at the 8 corners using the 5.1 seeding
-restricted to l | not-l crossings (a 4×4×4 stencil) before placing vertices.
-This affects geometry only; topology is fixed by step 2–3.
+in cells containing three or more labels. With `junctionCorrection` (default
+true), on every edge of which at least one incident cell has three or more
+distinct labels (label 0 included), the outside endpoint q gets
+ψ_l(q) = one local Godunov step on ψ_l (per axis the smaller of the two
+face-neighbour values, −φ in l, +φ elsewhere), clamped to the proven bounds of
+rulings R17/R19: [φ_q, max(φ_q, U)] with U = min over label-l voxels p in the
+5×5×5 neighbourhood of |q − p|·dx − φ_p. The l-side φ_p is kept. The value
+depends only on (q, l), so all cells sharing the edge agree. This affects
+geometry only; topology is fixed by steps 2–3 (ruling R35; the original "5.1
+seeding" rule was measured to change nothing). It lowers the worst-case vertex
+error over the junction set (0.653 → 0.272·dx) but may worsen individual
+junctions slightly where φ_q was already exact.
 
 ## 7. Error handling
 
@@ -513,8 +525,10 @@ Contouring tests (`TestLevelSetMultiObjectMesh.cc`):
     (joined under 26/18 vs 26 only, separated under 6); hollow sphere (cavity);
     random noise labels.
 13. **Geometry.** Sphere: vertices within 0.1·dx of the analytic surface.
-    Triple junction (test 3 fixture): with `junctionCorrection` the max vertex
-    error drops below that of the uncorrected run.
+    Triple junction (ruling R35): with `junctionCorrection` the worst-case max
+    vertex error over the 12-junction set of test 3 and the max vertex error
+    of the original test 3 fixture both drop below those of the uncorrected
+    run; per-junction numbers are printed.
 15. **Topology: cube through three spheres** (`TopologyCubeThroughSpheres`).
     A cube (label 1, side 40·dx) translates along +x by advection (velocity
     (1,0,0), weight 1) a distance of side + sphere diameter + 8·dx, so every
