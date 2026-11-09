@@ -79,6 +79,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1404,6 +1405,11 @@ stencilIndex(int i, int j, int k)
 /// math::CurvatureStencil::meanCurvatureNormGrad. Voxels outside the active
 /// band read the phi background with the sign given by their label.
 /// All derivatives are in world units. Not thread-safe; use one per thread.
+///
+/// The stencil also samples auxiliary grids (velocity, pressure, ...) at its
+/// centre voxel through sampleAtCentre(), which caches the result per centre
+/// voxel so that speed functors evaluating several labels at one voxel sample
+/// each field once.
 template<typename MultiLevelSetT>
 class LabelAwareStencil
 {
@@ -1424,6 +1430,10 @@ public:
     /// @brief Fill the stencil around @a ijk with psi of @a label.
     void moveTo(const Coord& ijk, int32_t label)
     {
+        if (ijk != mCenter) {
+            mScalarCache.valid = false;
+            mVectorCache.valid = false;
+        }
         mCenter = ijk;
         mLabel = label;
         static const Coord offs[19] = {
@@ -1443,6 +1453,20 @@ public:
     int32_t label() const { return mLabel; }
     float voxelSize() const { return mDx; }
     const math::Transform& transform() const { return mTransform; }
+
+    /// @brief BoxSampler value of @a grid at the world position of the
+    /// centre voxel. The value is cached until the stencil moves to another
+    /// voxel (or another grid is sampled), and the grid is read through a
+    /// value accessor kept by the stencil. @a grid must outlive the stencil.
+    float sampleAtCentre(const FloatGrid& grid) const
+    {
+        return this->sample(grid, mScalarCache);
+    }
+    /// @brief Vector-valued version of sampleAtCentre().
+    Vec3f sampleAtCentre(const Vec3SGrid& grid) const
+    {
+        return this->sample(grid, mVectorCache);
+    }
 
     /// @brief psi at offset (i,j,k) from the centre; the 19 points have at
     /// most two non-zero offsets.
@@ -1504,6 +1528,34 @@ public:
     }
 
 private:
+    /// One-entry cache of a sampled grid: the grid, a value accessor to its
+    /// tree, and the value at the current centre voxel.
+    template<typename GridT>
+    struct FieldCache
+    {
+        const GridT* grid = nullptr;
+        std::unique_ptr<tree::ValueAccessor<const typename GridT::TreeType>> acc;
+        bool valid = false;
+        typename GridT::ValueType value{};
+    };
+
+    template<typename GridT>
+    typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& cache) const
+    {
+        if (cache.grid != &grid) {
+            cache.grid = &grid;
+            cache.acc.reset(new tree::ValueAccessor<const typename GridT::TreeType>(grid.tree()));
+            cache.valid = false;
+        }
+        if (!cache.valid) {
+            const Vec3d w = mTransform.indexToWorld(mCenter);
+            const Vec3R idx = grid.transform().worldToIndex(w);
+            cache.value = tools::BoxSampler::sample(*cache.acc, idx);
+            cache.valid = true;
+        }
+        return cache.value;
+    }
+
     const math::Transform& mTransform;
     tree::ValueAccessor<const FloatTreeT> mPhiAcc;
     tree::ValueAccessor<const LabelTreeT> mLabelAcc;
@@ -1511,6 +1563,8 @@ private:
     Coord mCenter;
     int32_t mLabel = 0;
     float mValues[19];
+    mutable FieldCache<FloatGrid> mScalarCache;
+    mutable FieldCache<Vec3SGrid> mVectorCache;
 };
 
 
@@ -1592,6 +1646,8 @@ public:
     float operator()(const Coord& ijk, int32_t label,
         const LabelAwareStencil<MultiLevelSetT>& s) const
     {
+        OPENVDB_ASSERT(ijk == s.center());
+        (void)ijk; // fields are sampled at s.center()
         if (!isActive(label)) return 0.999f;
         if (mFixed.count(label)) return 0.0f;
 
@@ -1615,11 +1671,10 @@ public:
             kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
         }
 
+        // fields are sampled at the stencil centre (== ijk), once per voxel
         float advection = 0.0f;
         if (mAdvection) {
-            const Vec3d w = s.transform().indexToWorld(ijk);
-            const Vec3R idx = mAdvection->transform().worldToIndex(w);
-            const Vec3f vel = tools::BoxSampler::sample(mAdvection->tree(), idx);
+            const Vec3f vel = s.sampleAtCentre(*mAdvection);
             for (int a = 0; a < 3; ++a) {
                 const float f = mAdvectionWeight * vel[a];
                 if (f > 0.0f) advection += f * dneg[a];
@@ -1629,9 +1684,7 @@ public:
 
         float pressure = 0.0f;
         if (mPressure) {
-            const Vec3d w = s.transform().indexToWorld(ijk);
-            const Vec3R idx = mPressure->transform().worldToIndex(w);
-            const float force = mPressureWeight * tools::BoxSampler::sample(mPressure->tree(), idx);
+            const float force = mPressureWeight * s.sampleAtCentre(*mPressure);
             float gsPos = 0.0f, gsNeg = 0.0f;
             for (int a = 0; a < 3; ++a) {
                 const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
@@ -2280,38 +2333,59 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
 
     // b. activate the inactive face neighbours of voxels with
     // phi < (halfWidth-1)*dx; label of the smallest-phi active face neighbour
+    // (ties to the smaller label). Candidates are collected per leaf in
+    // parallel on the unmodified trees, then applied serially in leaf order;
+    // the result is the (phi, label) minimum per voxel, so it does not
+    // depend on the order or the thread count.
     {
-        std::map<Coord, std::pair<float, LabelT>> added;
-        tree::ValueAccessor<const FloatTreeT> phiAcc(phi);
-        tree::ValueAccessor<const LabelTreeT> labAcc(labels);
-        for (auto it = phi.cbeginValueOn(); it; ++it) {
-            if (!(*it < grow)) continue;
-            const Coord p = it.getCoord();
-            for (int f = 0; f < 6; ++f) {
-                const Coord q = p + offs[f];
-                if (phiAcc.isValueOn(q)) continue;
-                const LabelT l = labAcc.getValue(p);
-                auto ins = added.insert(std::make_pair(q, std::make_pair(*it, l)));
-                if (!ins.second) {
-                    auto& cur = ins.first->second;
-                    if (*it < cur.first || (*it == cur.first && l < cur.second)) {
-                        cur = std::make_pair(*it, l);
+        struct Activation { Coord ijk; float phi; LabelT label; };
+        tree::LeafManager<const FloatTreeT> leafs(phi);
+        std::vector<std::vector<Activation>> found(leafs.leafCount());
+        forEachIndex(leafs.leafCount(), [&](size_t i) {
+            const auto& leaf = leafs.leaf(i);
+            const auto* labLeaf = labels.probeConstLeaf(leaf.origin());
+            tree::ValueAccessor<const FloatTreeT> phiAcc(phi);
+            for (auto it = leaf.cbeginValueOn(); it; ++it) {
+                if (!(*it < grow)) continue;
+                const Coord p = it.getCoord();
+                const LabelT l = labLeaf ? labLeaf->getValue(it.pos()) : labels.getValue(p);
+                for (int f = 0; f < 6; ++f) {
+                    const Coord q = p + offs[f];
+                    if (!phiAcc.isValueOn(q)) found[i].push_back(Activation{q, *it, l});
+                }
+            }
+        });
+        // Serial merge. Every candidate voxel was inactive before the merge,
+        // so an active one here was activated by an earlier candidate; its
+        // phi temporarily holds the best candidate value.
+        tree::ValueAccessor<FloatTreeT> phiW(phi);
+        tree::ValueAccessor<LabelTreeT> labW(labels);
+        std::vector<std::pair<Coord, LabelT>> added; // voxel, label before activation
+        for (const auto& list : found) {
+            for (const Activation& a : list) {
+                float cur;
+                if (phiW.probeValue(a.ijk, cur)) {
+                    const LabelT curLabel = labW.getValue(a.ijk);
+                    if (a.phi < cur || (a.phi == cur && a.label < curLabel)) {
+                        phiW.setValueOnly(a.ijk, a.phi);
+                        labW.setValueOnly(a.ijk, a.label);
                     }
+                } else {
+                    added.emplace_back(a.ijk, labW.getValue(a.ijk));
+                    phiW.setValueOn(a.ijk, a.phi);
+                    labW.setValueOn(a.ijk, a.label);
                 }
             }
         }
-        tree::ValueAccessor<FloatTreeT> phiW(phi);
-        tree::ValueAccessor<LabelTreeT> labW(labels);
         for (const auto& kv : added) {
-            phiW.setValueOn(kv.first, bg);
-            LabelT l = kv.second.second;
+            phiW.setValueOnly(kv.first, bg);
             // an activated voxel keeps its inactive label when the change
-            // involves a protected label (spec 4.7)
-            const LabelT cur = labW.getValue(kv.first);
-            if (this->involvesProtected(static_cast<int32_t>(cur), static_cast<int32_t>(l))) {
-                l = cur;
+            // involves a protected label (topology preservation)
+            const LabelT l = labW.getValue(kv.first);
+            if (this->involvesProtected(static_cast<int32_t>(kv.second),
+                    static_cast<int32_t>(l))) {
+                labW.setValueOnly(kv.first, kv.second);
             }
-            labW.setValueOn(kv.first, l);
         }
     }
 
