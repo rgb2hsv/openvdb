@@ -3,7 +3,13 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetMultiObject.h>
+#include <openvdb/tools/Interpolation.h>
+#include <openvdb/tools/LevelSetAdvect.h>
+#include <openvdb/tools/LevelSetFilter.h>
+#include <openvdb/tools/LevelSetMeasure.h>
 #include <openvdb/tools/LevelSetSphere.h>
+#include <openvdb/tools/VelocityFields.h>
+#include <openvdb/tools/VolumeToMesh.h>
 
 #include <gtest/gtest.h>
 
@@ -1730,4 +1736,184 @@ TEST_F(TestLevelSetMultiObject, WallRetreat)
     EXPECT_EQ(m->labels()->tree().getValue(retreat), 0);
     EXPECT_EQ(m->labels()->tree().getValue(wallSide), 2);
     EXPECT_EQ(m->phi()->tree().getValue(wallSide), wallPhi);
+}
+
+
+////////////////////////////////////////
+// Spec section 8, test 8: single-object equivalence with OpenVDB's single
+// level set path (LevelSetAdvection / LevelSetFilter, FIRST_BIAS + TVD_RK1).
+
+namespace {
+
+// Dense Vec3SGrid over the index box @a box (voxel size @a dx), each voxel
+// set to f(its world position); background zero.
+Vec3SGrid::Ptr
+makeVelocity(const CoordBBox& box, double dx, const std::function<Vec3s(const Vec3d&)>& f)
+{
+    Vec3SGrid::Ptr vel = Vec3SGrid::create(Vec3s(0.0f));
+    vel->setTransform(math::Transform::createLinearTransform(dx));
+    vel->denseFill(box, Vec3s(0.0f), /*active=*/true);
+    tree::LeafManager<Vec3STree> leaves(vel->tree());
+    leaves.foreach([&](Vec3STree::LeafNodeType& leaf, size_t) {
+        for (auto it = leaf.beginValueOn(); it; ++it) {
+            it.setValue(f(vel->indexToWorld(it.getCoord())));
+        }
+    });
+    return vel;
+}
+
+struct ZeroSetDiff
+{
+    double symDiff = 0.0;     // sub-voxel symmetric difference volume (world)
+    double symDiffSign = 0.0; // voxel count with differing signs, times dx^3
+    double hausdorff = 0.0;   // Hausdorff distance of the zero sets (world)
+};
+
+// One-directional zero-set distance: max |psi_b| at the volumeToMesh
+// points (isovalue 0) of @a a, sampled with BoxSampler.
+double
+zeroSetDistance(const FloatGrid& a, const FloatGrid& b)
+{
+    std::vector<Vec3s> pts;
+    std::vector<Vec4I> quads;
+    tools::volumeToMesh(a, pts, quads, 0.0);
+    double d = 0.0;
+    for (const Vec3s& p : pts) {
+        const Vec3d idx = b.transform().worldToIndex(Vec3d(p));
+        d = std::max(d, double(std::abs(tools::BoxSampler::sample(b.tree(), idx))));
+    }
+    return d;
+}
+
+// Compares the zero sets of two signed distance grids on the same transform.
+// Symmetric difference: over the union of both active bands, each voxel
+// contributes |H(a) - H(b)|*dx^3 with the sub-voxel inside fraction
+// H(psi) = clamp(0.5 - psi/dx, 0, 1) (asserted); symDiffSign is the plain
+// count of voxels whose signs differ (reported only). Hausdorff: max of the
+// two one-directional zero-set distances.
+ZeroSetDiff
+compareZeroSets(const FloatGrid& a, const FloatGrid& b)
+{
+    const double dx = a.voxelSize()[0], dx3 = dx * dx * dx;
+    auto H = [dx](float v) { return std::min(1.0, std::max(0.0, 0.5 - double(v) / dx)); };
+    tree::ValueAccessor<const FloatTree> aa(a.tree()), ba(b.tree());
+    ZeroSetDiff r;
+    auto visit = [&](const Coord& c) {
+        const float va = aa.getValue(c), vb = ba.getValue(c);
+        r.symDiff += std::abs(H(va) - H(vb)) * dx3;
+        if ((va < 0.0f) != (vb < 0.0f)) r.symDiffSign += dx3;
+    };
+    for (auto it = a.tree().cbeginValueOn(); it; ++it) visit(it.getCoord());
+    for (auto it = b.tree().cbeginValueOn(); it; ++it) {
+        if (!aa.isValueOn(it.getCoord())) visit(it.getCoord());
+    }
+    r.hausdorff = std::max(zeroSetDistance(a, b), zeroSetDistance(b, a));
+    return r;
+}
+
+// Fixture: sphere r = 12 dx, centred off the rotation axis so the rotational
+// field moves it.
+const double kEqRadius = 12.0;
+const Vec3d kEqCenter(16.0, 0.0, 0.0);
+
+// v = 0.05*(-y, x, 0) over a box covering the swept annulus (plus band).
+Vec3SGrid::Ptr
+makeRotation()
+{
+    return makeVelocity(CoordBBox(Coord(-36, -36, -18), Coord(36, 36, 18)), 1.0,
+        [](const Vec3d& p) { return Vec3s(float(-0.05 * p[1]), float(0.05 * p[0]), 0.0f); });
+}
+
+void
+referenceAdvect(FloatGrid& ref, const Vec3SGrid& vel, double t0, double t1)
+{
+    using Field = tools::DiscreteField<Vec3SGrid>;
+    Field field(vel);
+    tools::LevelSetAdvection<FloatGrid, Field> adv(ref, field);
+    adv.setSpatialScheme(math::FIRST_BIAS);
+    adv.setTemporalScheme(math::TVD_RK1);
+    adv.advect(t0, t1);
+}
+
+void
+referenceCurvature(FloatGrid& ref)
+{
+    tools::LevelSetFilter<FloatGrid> filter(ref);
+    filter.meanCurvature(); // dt = dx^2/3
+}
+
+void
+checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t steps,
+    double angle)
+{
+    std::string msg;
+    ASSERT_TRUE(m.validate(&msg)) << msg;
+    const double dx = m.voxelSize();
+    FloatGrid::Ptr sdf = m.extractSignedDistance(1);
+    // the centre, rotated by @a angle about z, is inside
+    const Vec3d c(kEqCenter[0] * std::cos(angle), kEqCenter[0] * std::sin(angle), 0.0);
+    ASSERT_LT(sdf->tree().getValue(sdf->transform().worldToIndexCellCentered(c)), 0.0f);
+    const double vol = tools::levelSetVolume(ref);
+    const ZeroSetDiff d = compareZeroSets(*sdf, ref);
+    std::cout << name << ": MOGAC steps " << steps << ", reference volume " << vol
+              << ", MOGAC volume " << tools::levelSetVolume(*sdf)
+              << ", symmetric difference " << d.symDiff << " (" << 100.0 * d.symDiff / vol
+              << "%), sign-count " << d.symDiffSign << " (" << 100.0 * d.symDiffSign / vol
+              << "%), Hausdorff " << d.hausdorff / dx << " dx" << std::endl;
+    EXPECT_LT(d.symDiff, 0.01 * vol);
+    EXPECT_LT(d.hausdorff, 1.0 * dx);
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, SingleObjectAdvection)
+{
+    Vec3SGrid::Ptr vel = makeRotation();
+    FloatGrid::Ptr ref = tools::createLevelSetSphere<FloatGrid>(
+        float(kEqRadius), Vec3f(kEqCenter), 1.0f);
+    referenceAdvect(*ref, *vel, 0.0, 20.0);
+
+    auto m = makeSphere(kEqRadius, kEqCenter);
+    Forces forces;
+    forces.setAdvection(vel, 1.0f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    const size_t steps = lsmo.advect(0.0, 20.0);
+    checkEquivalence("SingleObjectAdvection", *m, *ref, steps, 0.05 * 20.0);
+}
+
+TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
+{
+    // 60 iterations of dt = dx^2/3: total t = 20
+    FloatGrid::Ptr ref = tools::createLevelSetSphere<FloatGrid>(
+        float(kEqRadius), Vec3f(kEqCenter), 1.0f);
+    for (int n = 0; n < 60; ++n) referenceCurvature(*ref);
+
+    auto m = makeSphere(kEqRadius, kEqCenter);
+    Forces forces;
+    forces.setCurvatureWeight(1.0f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    const size_t steps = lsmo.advect(0.0, 20.0);
+    checkEquivalence("SingleObjectCurvature", *m, *ref, steps, 0.0);
+}
+
+TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
+{
+    // Reference: 30 x (advection over dx^2/3, one meanCurvature iteration),
+    // total t = 10.
+    Vec3SGrid::Ptr vel = makeRotation();
+    FloatGrid::Ptr ref = tools::createLevelSetSphere<FloatGrid>(
+        float(kEqRadius), Vec3f(kEqCenter), 1.0f);
+    const double h = 1.0 / 3.0;
+    for (int n = 0; n < 30; ++n) {
+        referenceAdvect(*ref, *vel, n * h, (n + 1) * h);
+        referenceCurvature(*ref);
+    }
+
+    auto m = makeSphere(kEqRadius, kEqCenter);
+    Forces forces;
+    forces.setAdvection(vel, 1.0f);
+    forces.setCurvatureWeight(1.0f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    const size_t steps = lsmo.advect(0.0, 10.0);
+    checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 10.0);
 }
