@@ -13,6 +13,8 @@
 #include <openvdb/tools/VelocityFields.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
+#include "LevelSetMultiObjectTopology.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -2193,4 +2195,371 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
         EXPECT_LE(loss, 1.1 * std::max(refLoss, 0.0) + 0.02) << "label " << l;
         EXPECT_GE(loss, 1.1 * std::min(refLoss, 0.0) - 0.02) << "label " << l;
     }
+}
+
+
+////////////////////////////////////////
+// Topology-preserving evolution (spec section 4.7, test 15)
+
+namespace {
+
+using Conn = tools::MultiObjectConnectivity;
+const Conn kAllConn[4] = {Conn::FG26_BG6, Conn::FG6_BG26, Conn::FG18_BG6, Conn::FG6_BG18};
+
+uint32_t
+nbBit(int a, int b, int c)
+{
+    return uint32_t(1) << ((a + 1) + 3 * (b + 1) + 9 * (c + 1));
+}
+
+// Reference topological numbers, written straight from the Bertrand-Malandain
+// definitions on coordinates (independent of the bitmask implementation):
+// N^1_n(x,X) = N*_n(x) & X, N^k_n = union over y in N^{k-1} of
+// N_n(y) & N*_26(x) & X; G_6 = N^2_6, G_6+ = N^3_6, G_18 = N^2_18,
+// G_26 = N^1_26; T_n = number of n-components of G_n.
+int
+refTopoNumber(uint32_t inSet, int n, int k)
+{
+    auto d2 = [](const Coord& a, const Coord& b) { return (a - b).asVec3i().lengthSqr(); };
+    const int bound = n == 6 ? 1 : (n == 18 ? 2 : 3);
+    std::vector<Coord> X;
+    for (int c = -1; c <= 1; ++c)
+        for (int b = -1; b <= 1; ++b)
+            for (int a = -1; a <= 1; ++a)
+                if ((a || b || c) && (inSet & nbBit(a, b, c))) X.push_back(Coord(a, b, c));
+    std::set<Coord> g;
+    for (const Coord& p : X) if (d2(p, Coord(0)) <= bound) g.insert(p);
+    for (int level = 2; level <= k; ++level) {
+        std::set<Coord> next = g;
+        for (const Coord& y : g)
+            for (const Coord& p : X) if (d2(p, y) <= bound) next.insert(p);
+        g = next;
+    }
+    // n-components of g
+    std::vector<Coord> pts(g.begin(), g.end());
+    std::vector<int> comp(pts.size(), -1);
+    int count = 0;
+    for (size_t s = 0; s < pts.size(); ++s) {
+        if (comp[s] >= 0) continue;
+        std::vector<size_t> stack{s};
+        comp[s] = count;
+        while (!stack.empty()) {
+            const size_t c = stack.back();
+            stack.pop_back();
+            for (size_t q = 0; q < pts.size(); ++q) {
+                if (comp[q] < 0 && d2(pts[q], pts[c]) <= bound) { comp[q] = count; stack.push_back(q); }
+            }
+        }
+        ++count;
+    }
+    return count;
+}
+
+bool
+refSimple(uint32_t mask, Conn conn)
+{
+    const uint32_t all = (uint32_t(1) << 27) - 1, centre = nbBit(0, 0, 0);
+    const uint32_t fg = mask & all & ~centre, bg = ~mask & all & ~centre;
+    switch (conn) {
+    case Conn::FG26_BG6: return refTopoNumber(fg, 26, 1) == 1 && refTopoNumber(bg, 6, 2) == 1;
+    case Conn::FG6_BG26: return refTopoNumber(fg, 6, 2) == 1 && refTopoNumber(bg, 26, 1) == 1;
+    case Conn::FG18_BG6: return refTopoNumber(fg, 18, 2) == 1 && refTopoNumber(bg, 6, 3) == 1;
+    case Conn::FG6_BG18: return refTopoNumber(fg, 6, 3) == 1 && refTopoNumber(bg, 18, 2) == 1;
+    }
+    return false;
+}
+
+Int32Grid::Ptr
+boxLabels(const std::vector<std::pair<CoordBBox, int32_t>>& boxes)
+{
+    Int32Grid::Ptr g = Int32Grid::create(0);
+    auto acc = g->getAccessor();
+    for (const auto& bl : boxes) {
+        for (auto p = bl.first.begin(); p; ++p) acc.setValue(*p, bl.second);
+    }
+    return g;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, SimplePointTable)
+{
+    using tools::lsmo_internal::isSimplePoint;
+    const uint32_t c = nbBit(0, 0, 0);
+    uint32_t ring = c, plug = 0, face = 0, full = 0;
+    for (int k = -1; k <= 1; ++k)
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
+                full |= nbBit(i, j, k);
+                if (k == 0) ring |= nbBit(i, j, k);
+                if (k <= 0) face |= nbBit(i, j, k);
+                if (!(i == 0 && j == 0 && k != 0)) plug |= nbBit(i, j, k);
+            }
+    for (Conn conn : kAllConn) {
+        SCOPED_TRACE(int(conn));
+        EXPECT_FALSE(isSimplePoint(c, conn));                                     // isolated voxel
+        EXPECT_TRUE(isSimplePoint(c | nbBit(1, 0, 0), conn));                     // end of a line
+        EXPECT_FALSE(isSimplePoint(c | nbBit(-1, 0, 0) | nbBit(1, 0, 0), conn));  // middle of a line
+        EXPECT_FALSE(isSimplePoint(ring, conn));  // completes a ring around a tunnel
+        EXPECT_FALSE(isSimplePoint(plug, conn));  // plugs the last hole of a cavity
+        EXPECT_FALSE(isSimplePoint(full, conn));  // interior voxel (removal makes a cavity)
+        EXPECT_TRUE(isSimplePoint(face, conn));   // face of a solid block
+        // the centre bit is ignored
+        EXPECT_EQ(isSimplePoint(face, conn), isSimplePoint(face & ~c, conn));
+    }
+    // x joins two opposite corner voxels that are not adjacent to each other
+    const uint32_t corner = c | nbBit(-1, -1, -1) | nbBit(1, 1, 1);
+    EXPECT_FALSE(isSimplePoint(corner, Conn::FG26_BG6)); // two 26-components in N*
+    // 10^5 random neighbourhoods against the reference definitions, at
+    // several densities
+    std::mt19937 gen(20261109u);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    Index64 mismatches = 0, simple = 0;
+    for (int n = 0; n < 100000; ++n) {
+        const double density = 0.1 + 0.8 * uni(gen);
+        uint32_t mask = 0;
+        for (int b = 0; b < 27; ++b) if (uni(gen) < density) mask |= uint32_t(1) << b;
+        const Conn conn = kAllConn[n % 4];
+        const bool got = isSimplePoint(mask, conn);
+        simple += got;
+        if (got != refSimple(mask, conn)) ++mismatches;
+    }
+    std::cout << "SimplePointTable: " << simple << " of 100000 random masks simple" << std::endl;
+    EXPECT_EQ(mismatches, Index64(0));
+    EXPECT_GT(simple, Index64(1000)); // the random set exercises both outcomes
+}
+
+TEST_F(TestLevelSetMultiObject, DigitalTopologyHelper)
+{
+    using lsmo_test::digitalTopology;
+    const CoordBBox dom(Coord(-2), Coord(13));
+    auto expectTopo = [&](const Int32Grid& g, Conn conn, int comps, int cav, int euler) {
+        const auto t = digitalTopology(g, 1, dom, conn);
+        EXPECT_EQ(t.components, comps) << "conn " << int(conn);
+        EXPECT_EQ(t.cavities, cav) << "conn " << int(conn);
+        EXPECT_EQ(t.euler, euler) << "conn " << int(conn);
+    };
+    auto solid = boxLabels({{CoordBBox(Coord(0), Coord(7)), 1}});
+    auto hollow = boxLabels({{CoordBBox(Coord(0), Coord(7)), 1}, {CoordBBox(Coord(2), Coord(5)), 0}});
+    auto torus = boxLabels({{CoordBBox(Coord(0, 0, 0), Coord(9, 9, 3)), 1},
+        {CoordBBox(Coord(3, 3, 0), Coord(6, 6, 3)), 0}});
+    auto corner = boxLabels({{CoordBBox(Coord(0), Coord(2)), 1}, {CoordBBox(Coord(3), Coord(5)), 1}});
+    auto edge = boxLabels({{CoordBBox(Coord(0), Coord(2)), 1},
+        {CoordBBox(Coord(3, 3, 0), Coord(5, 5, 2)), 1}});
+    for (Conn conn : kAllConn) {
+        expectTopo(*solid, conn, 1, 0, 1);
+        expectTopo(*hollow, conn, 1, 1, 2);
+        expectTopo(*torus, conn, 1, 0, 0);
+    }
+    // corner contact: joined only under 26
+    expectTopo(*corner, Conn::FG26_BG6, 1, 0, 1);
+    expectTopo(*corner, Conn::FG18_BG6, 2, 0, 2);
+    expectTopo(*corner, Conn::FG6_BG26, 2, 0, 2);
+    expectTopo(*corner, Conn::FG6_BG18, 2, 0, 2);
+    // edge contact: joined under 26 and 18, separated under 6
+    expectTopo(*edge, Conn::FG26_BG6, 1, 0, 1);
+    expectTopo(*edge, Conn::FG18_BG6, 1, 0, 1);
+    expectTopo(*edge, Conn::FG6_BG26, 2, 0, 2);
+    expectTopo(*edge, Conn::FG6_BG18, 2, 0, 2);
+}
+
+TEST_F(TestLevelSetMultiObject, SimplePointPreservesTopology)
+{
+    // Independent check of isSimplePoint against digitalTopology: toggling a
+    // simple voxel of a random blob never changes components, cavities or
+    // the Euler characteristic.
+    using tools::lsmo_internal::isSimplePoint;
+    using lsmo_test::digitalTopology;
+    const CoordBBox dom(Coord(-1), Coord(9));
+    std::mt19937 gen(42u);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    std::uniform_int_distribution<int> pos(1, 7);
+    Index64 toggles = 0, broken = 0, nonSimpleChanged = 0, nonSimple = 0;
+    for (int trial = 0; trial < 40; ++trial) {
+        const Conn conn = kAllConn[trial % 4];
+        Int32Grid::Ptr g = Int32Grid::create(0);
+        auto acc = g->getAccessor();
+        const double density = 0.3 + 0.4 * uni(gen);
+        for (int k = 0; k <= 8; ++k)
+            for (int j = 0; j <= 8; ++j)
+                for (int i = 0; i <= 8; ++i) if (uni(gen) < density) acc.setValue(Coord(i, j, k), 1);
+        auto topo = digitalTopology(*g, 1, dom, conn);
+        for (int n = 0; n < 60; ++n) {
+            const Coord p(pos(gen), pos(gen), pos(gen));
+            uint32_t mask = 0;
+            for (int c = -1; c <= 1; ++c)
+                for (int b = -1; b <= 1; ++b)
+                    for (int a = -1; a <= 1; ++a)
+                        if (acc.getValue(p.offsetBy(a, b, c)) == 1) mask |= nbBit(a, b, c);
+            const bool simple = isSimplePoint(mask, conn);
+            acc.setValue(p, acc.getValue(p) == 1 ? 0 : 1);
+            const auto after = digitalTopology(*g, 1, dom, conn);
+            if (simple) {
+                ++toggles;
+                if (!(after == topo)) ++broken;
+            } else {
+                ++nonSimple;
+                if (!(after == topo)) ++nonSimpleChanged;
+            }
+            topo = after;
+        }
+    }
+    std::cout << "SimplePointPreservesTopology: " << toggles << " simple toggles, " << broken
+              << " changed topology; " << nonSimple << " non-simple toggles, "
+              << nonSimpleChanged << " changed topology" << std::endl;
+    EXPECT_GT(toggles, Index64(200));
+    EXPECT_EQ(broken, Index64(0));
+    EXPECT_GT(nonSimpleChanged, Index64(0));
+}
+
+namespace {
+
+struct CubeRunResult
+{
+    std::vector<lsmo_test::DigitalTopology> topo; // per chunk
+    double shift = 0.0;     // centroid x shift of label 1
+    bool changed = false;   // topology differed from (1, 0, 1) at some chunk
+    MLS::Ptr state;         // final state
+};
+
+// Spec section 8 test 15: cube (label 1, side 40 voxels, [0,39]^3) advected
+// along +x by side + sphere diameter + 8 = 56 voxels through three fixed
+// voxelised balls of radius 4 (labels 2-4) centred at x = 48 at distinct
+// (y, z). With @a protect, label 1 is topology-preserving (FG26_BG6) and the
+// per-chunk gates are asserted. @a tEnd < 0 runs the whole distance.
+CubeRunResult
+runCubeThroughSpheres(bool protect, int grainSize = 1, double tEnd = -1.0)
+{
+    const int side = 40;
+    const double distance = tEnd > 0.0 ? tEnd : side + 8.0 + 8.0;
+    const Coord centres[3] = {Coord(48, 10, 12), Coord(48, 20, 28), Coord(48, 29, 15)};
+    const CoordBBox domain(Coord(-8, -8, -8), Coord(side - 1 + int(distance) + 8, side + 7, side + 7));
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (auto p = CoordBBox(Coord(0), Coord(side - 1)).begin(); p; ++p) acc.setValue(*p, 1);
+        for (int s = 0; s < 3; ++s) {
+            for (auto p = CoordBBox(centres[s] - Coord(4), centres[s] + Coord(4)).begin(); p; ++p) {
+                if ((*p - centres[s]).asVec3i().lengthSqr() <= 16) acc.setValue(*p, 2 + s);
+            }
+        }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4}));
+    // snapshot of the fixed spheres: label, active state and phi bits around them
+    const CoordBBox sphereBox(Coord(48 - 10, 10 - 10, 12 - 10), Coord(48 + 10, 29 + 10, 28 + 10));
+    struct Snap { int32_t label; bool on; float phi; };
+    auto snapshot = [&]() {
+        std::map<Coord, Snap> s;
+        for (auto p = sphereBox.begin(); p; ++p) {
+            const int32_t l = m->labels()->tree().getValue(*p);
+            if (l < 2) continue;
+            s[*p] = Snap{l, m->labels()->tree().isValueOn(*p), m->phi()->tree().getValue(*p)};
+        }
+        return s;
+    };
+    const auto spheres0 = snapshot();
+    auto labelCentroidX = [&]() {
+        double sum = 0.0, n = 0.0;
+        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        for (auto p = domain.begin(); p; ++p) {
+            if (acc.getValue(*p) == 1) { sum += (*p)[0]; n += 1.0; }
+        }
+        return n > 0.0 ? sum / n : 0.0;
+    };
+    const double x0 = labelCentroidX();
+
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+    forces.setCurvatureWeight(0.0f);
+    forces.setFixedLabels({2, 3, 4});
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo.setGrainSize(grainSize);
+    if (protect) {
+        lsmo.setTopologyPreservingLabels({1});
+        lsmo.setConnectivity(Conn::FG26_BG6);
+    }
+    CubeRunResult res;
+    const lsmo_test::DigitalTopology ball{1, 0, 1};
+    const auto t0 = lsmo_test::digitalTopology(*m->labels(), 1, domain, Conn::FG26_BG6);
+    EXPECT_TRUE(t0 == ball);
+    const char* tag = protect ? "TopologyCube(protected)" : "TopologyCube(control)";
+    const double chunk = 2.0;
+    double t = 0.0;
+    size_t steps = 0;
+    const auto start = std::chrono::steady_clock::now();
+    while (t < distance - 1e-9) {
+        const double t1 = std::min(distance, t + chunk);
+        steps += lsmo.advect(t, t1);
+        t = t1;
+        const auto topo = lsmo_test::digitalTopology(*m->labels(), 1, domain, Conn::FG26_BG6);
+        res.topo.push_back(topo);
+        if (!(topo == ball)) res.changed = true;
+        std::cout << tag << ": t " << t << " steps " << steps << " components "
+                  << topo.components << " cavities " << topo.cavities << " euler " << topo.euler
+                  << std::endl;
+        if (!protect) continue;
+        EXPECT_EQ(topo.components, 1) << "t " << t;
+        EXPECT_EQ(topo.cavities, 0) << "t " << t;
+        EXPECT_EQ(topo.euler, 1) << "t " << t;
+        const auto spheres = snapshot();
+        bool same = spheres.size() == spheres0.size();
+        for (const auto& kv : spheres0) {
+            auto it = spheres.find(kv.first);
+            same = same && it != spheres.end() && it->second.label == kv.second.label
+                && it->second.on == kv.second.on
+                && std::memcmp(&it->second.phi, &kv.second.phi, sizeof(float)) == 0;
+        }
+        EXPECT_TRUE(same) << "t " << t;
+        std::string msg;
+        EXPECT_TRUE(m->validate(&msg)) << "t " << t << ": " << msg;
+        Index64 overlaps = 0, badCover = 0;
+        partitionErrors(*m, overlaps, badCover);
+        EXPECT_EQ(overlaps, Index64(0)) << "t " << t;
+        EXPECT_EQ(badCover, Index64(0)) << "t " << t;
+        if (::testing::Test::HasFailure()) break;
+    }
+    res.shift = labelCentroidX() - x0;
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << tag << ": " << steps << " steps, " << secs << " s, centroid shift " << res.shift
+              << " (commanded " << distance << ")" << std::endl;
+    res.state = m;
+    return res;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
+{
+    const double distance = 56.0;
+    const CubeRunResult prot = runCubeThroughSpheres(true);
+    EXPECT_FALSE(prot.changed);
+    EXPECT_NEAR(prot.shift, distance, 2.0);
+    // control: without protection the spheres change the cube's topology
+    const CubeRunResult ctrl = runCubeThroughSpheres(false);
+    EXPECT_TRUE(ctrl.changed);
+}
+
+TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
+{
+    // The coloured passes make the protected result independent of the
+    // thread count: serial and parallel runs past first contact (t = 48)
+    // are bit-identical.
+    const CubeRunResult a = runCubeThroughSpheres(true, 0, 48.0);
+    const CubeRunResult b = runCubeThroughSpheres(true, 1, 48.0);
+    ASSERT_TRUE(a.state && b.state);
+    const Int32Tree& la = a.state->labels()->tree();
+    const Int32Tree& lb = b.state->labels()->tree();
+    const FloatTree& pa = a.state->phi()->tree();
+    const FloatTree& pb = b.state->phi()->tree();
+    ASSERT_TRUE(la.hasSameTopology(lb));
+    Index64 diff = 0;
+    for (auto it = pa.cbeginValueOn(); it; ++it) {
+        const float v = pb.getValue(it.getCoord());
+        if (std::memcmp(&v, &*it, sizeof(float)) != 0) ++diff;
+    }
+    for (auto it = la.cbeginValueAll(); it; ++it) {
+        if (lb.getValue(it.getCoord()) != *it) ++diff;
+    }
+    EXPECT_EQ(diff, Index64(0));
 }

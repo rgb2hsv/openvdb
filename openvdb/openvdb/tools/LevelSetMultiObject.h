@@ -9,7 +9,8 @@
 /// fromLabelGrid and fromSignedGrids and the exact per-label signed distance
 /// extractSignedDistance), the second-order label-aware redistancer
 /// MultiLevelSetRedistance, the LabelAwareStencil, the built-in speed functor
-/// MultiObjectForces and the evolver LevelSetMultiObject.
+/// MultiObjectForces and the evolver LevelSetMultiObject (with opt-in
+/// topology-preserving evolution, MultiObjectConnectivity).
 
 #ifndef OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
 #define OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
@@ -22,6 +23,7 @@
 #include <openvdb/tree/ValueAccessor.h>
 #include <openvdb/math/Math.h>
 #include "Interpolation.h"// for BoxSampler
+#include <openvdb/util/NodeMasks.h>// for FindLowestOn
 #include <openvdb/util/NullInterrupter.h>
 #include "Morphology.h"// for dilateActiveValues, erodeActiveValues
 #include "Prune.h"// for pruneLevelSet
@@ -1512,6 +1514,116 @@ private:
 ////////////////////////////////////////
 
 
+/// @brief Digital adjacency pair (foreground, background) used by
+/// topology-preserving evolution (spec 4.7) and the multi-label mesher.
+enum class MultiObjectConnectivity { FG26_BG6, FG6_BG26, FG18_BG6, FG6_BG18 };
+
+
+namespace lsmo_internal {
+
+/// Adjacency tables of the 3x3x3 neighbourhood, bit i <-> (dx,dy,dz) with
+/// i = (dx+1) + 3(dy+1) + 9(dz+1): adj[a][i] holds the positions other than
+/// the centre that are a-adjacent to i (a = 0: 6, 1: 18, 2: 26), and
+/// star[a] the a-neighbours of the centre (N*_6, N*_18, N*_26).
+struct SimplePointTables
+{
+    uint32_t adj[3][27];
+    uint32_t star[3];
+    SimplePointTables()
+    {
+        auto coord = [](int i) { return Coord(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1); };
+        const uint32_t centre = uint32_t(1) << 13;
+        for (int a = 0; a < 3; ++a) {
+            star[a] = 0;
+            for (int i = 0; i < 27; ++i) {
+                adj[a][i] = 0;
+                for (int j = 0; j < 27; ++j) {
+                    const Coord d = coord(i) - coord(j);
+                    const int d2 = d.x() * d.x() + d.y() * d.y() + d.z() * d.z();
+                    if (d2 >= 1 && d2 <= a + 1) adj[a][i] |= uint32_t(1) << j;
+                }
+                adj[a][i] &= ~centre;
+            }
+            star[a] = adj[a][13];
+        }
+    }
+};
+
+inline const SimplePointTables& simplePointTables()
+{
+    static const SimplePointTables tables;
+    return tables;
+}
+
+/// Number of components under adjacency @a a of the positions in @a set.
+inline int countComponents(uint32_t set, int a)
+{
+    const SimplePointTables& t = simplePointTables();
+    int count = 0;
+    while (set) {
+        uint32_t comp = set & (~set + 1); // lowest bit
+        uint32_t frontier = comp;
+        while (frontier) {
+            const int i = int(util::FindLowestOn(Index32(frontier)));
+            frontier &= frontier - 1;
+            const uint32_t add = t.adj[a][i] & set & ~comp;
+            comp |= add;
+            frontier |= add;
+        }
+        set &= ~comp;
+        ++count;
+    }
+    return count;
+}
+
+/// Bertrand-Malandain topological number T_n(x, X) of the centre x for the
+/// positions @a X of the 26-neighbourhood (centre excluded): the number of
+/// n-components of the geodesic neighbourhood G_n(x, X) = N^k_n(x, X), with
+/// N^1_n = N*_n(x) & X and N^k_n = union of N_n(y) & N*_26(x) & X over y in
+/// N^{k-1}_n; k = 2 for 6 (paired with 26) and 18, k = 3 for 6+ (6 paired
+/// with 18), k = 1 for 26. @a a is 0, 1, 2 for n = 6, 18, 26.
+inline int topologicalNumber(uint32_t X, int a, int k)
+{
+    const SimplePointTables& t = simplePointTables();
+    X &= t.star[2];
+    uint32_t g = X & t.star[a];
+    for (int level = 2; level <= k; ++level) {
+        uint32_t next = g;
+        for (uint32_t b = g; b; b &= b - 1) {
+            next |= t.adj[a][int(util::FindLowestOn(Index32(b)))] & X;
+        }
+        g = next;
+    }
+    return countComponents(g, a);
+}
+
+/// @brief Whether the centre of a 3x3x3 neighbourhood is a simple point of
+/// the foreground region @a inMask (27 bits, bit i <-> (dx,dy,dz) with
+/// i = (dx+1) + 3(dy+1) + 9(dz+1); the centre bit is ignored) under the
+/// adjacency pair @a conn: adding or removing it changes neither the
+/// region's nor its complement's topology (no new or lost components,
+/// tunnels or cavities). Decided by T_fg = 1 and T_bg = 1 (Bertrand and
+/// Malandain 1994).
+inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
+{
+    const uint32_t all = (uint32_t(1) << 27) - 1, centre = uint32_t(1) << 13;
+    const uint32_t fg = inMask & all & ~centre, bg = ~inMask & all & ~centre;
+    switch (conn) {
+        case MultiObjectConnectivity::FG26_BG6:
+            return topologicalNumber(fg, 2, 1) == 1 && topologicalNumber(bg, 0, 2) == 1;
+        case MultiObjectConnectivity::FG6_BG26:
+            return topologicalNumber(fg, 0, 2) == 1 && topologicalNumber(bg, 2, 1) == 1;
+        case MultiObjectConnectivity::FG18_BG6:
+            return topologicalNumber(fg, 1, 2) == 1 && topologicalNumber(bg, 0, 3) == 1;
+        case MultiObjectConnectivity::FG6_BG18:
+            return topologicalNumber(fg, 0, 3) == 1 && topologicalNumber(bg, 1, 2) == 1;
+    }
+    return false;
+}
+
+} // namespace lsmo_internal
+
+
 /// @brief Multi-object level set evolver (MOGAC / MCLS, spec section 4).
 ///
 /// @details One forward Euler step of step() does:
@@ -1536,6 +1648,16 @@ private:
 ///    smaller label) and phi = |v_1 - v_2|/2 over the two smallest values, or
 ///    |v_1| with one candidate. Results are written to copies of both trees
 ///    (time-n data stays readable until both are swapped in together).
+/// -# <b>Topology preservation</b> (4.7, opt-in): with
+///    setTopologyPreservingLabels(), a projected change a -> b that involves
+///    a protected label is deferred and applied in 27 coloured passes
+///    (coordinates mod 3) only if the voxel is a simple point
+///    (lsmo_internal::isSimplePoint, under setConnectivity()) of every
+///    protected label in {a, b} on the labels as updated by earlier passes;
+///    a rejected voxel keeps label a with phi = 1e-3*dx and stays frozen.
+///    Orphan cleanup and band activation never change a protected label's
+///    region except by simple changes, so its components, cavities and
+///    tunnels are preserved. With no protected label nothing changes.
 /// -# <b>Orphan cleanup</b> (4.5): a voxel whose label occurs nowhere in its
 ///    26-neighbourhood takes the label and phi of its smallest-phi active
 ///    neighbour (fixed labels excluded) and is redistanced (not frozen).
@@ -1601,11 +1723,19 @@ public:
     void setGrainSize(int grainSize) { mGrainSize = grainSize; }
     /// @brief Redistance tolerance in world units (default 1e-4*dx).
     void setRedistanceTolerance(float tolWorld) { mTolerance = tolWorld; }
+    /// @brief Labels whose digital topology is preserved (spec 4.7; default
+    /// none): a label change a -> b at a voxel is applied only if the voxel is
+    /// a simple point of every protected label in {a, b}.
+    void setTopologyPreservingLabels(std::set<int32_t> labels) { mProtected = std::move(labels); }
+    /// @brief Adjacency pair of topology preservation (default FG26_BG6).
+    void setConnectivity(MultiObjectConnectivity conn) { mConnectivity = conn; }
 
     float cfl() const { return mCfl; }
     bool clampSpeed() const { return mClampSpeed; }
     int grainSize() const { return mGrainSize; }
     float redistanceTolerance() const { return mTolerance; }
+    const std::set<int32_t>& topologyPreservingLabels() const { return mProtected; }
+    MultiObjectConnectivity connectivity() const { return mConnectivity; }
 
     /// @brief One forward Euler step of at most @a maxDt (world time).
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
@@ -1671,6 +1801,35 @@ private:
 
     bool isFixed(int32_t l) const { return l != 0 && mSpeed.isFixed(l); }
 
+    bool isProtected(int32_t l) const { return !mProtected.empty() && mProtected.count(l) != 0; }
+    /// Whether a change @a from -> @a to involves a protected label.
+    bool involvesProtected(int32_t from, int32_t to) const
+    {
+        return from != to && (this->isProtected(from) || this->isProtected(to));
+    }
+
+    /// Whether changing the label of @a p from @a from to @a to keeps every
+    /// protected label among them topologically unchanged, on @a labels.
+    template<typename AccT>
+    bool topologyAllows(AccT& labels, const Coord& p, int32_t from, int32_t to) const
+    {
+        for (const int32_t l : {from, to}) {
+            if (!this->isProtected(l)) continue;
+            uint32_t mask = 0;
+            for (int i = 0; i < 27; ++i) {
+                const Coord q = p.offsetBy(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1);
+                if (static_cast<int32_t>(labels.getValue(q)) == l) mask |= uint32_t(1) << i;
+            }
+            if (!lsmo_internal::isSimplePoint(mask, mConnectivity)) return false;
+        }
+        return true;
+    }
+
+    /// A projected label change involving a protected label (spec 4.7).
+    struct Deferred { Coord ijk; int32_t from, to; float phi; };
+    void applyDeferred(const std::vector<std::vector<Deferred>>& deferred,
+        FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze);
+
     /// Add @a l to @a e's candidates (R21): label 0 and fixed labels only
     /// make passive label 0 participate.
     void addCandidate(VoxelEntry& e, int32_t l) const
@@ -1735,6 +1894,8 @@ private:
     MultiLevelSetT& mMls;
     const SpeedT& mSpeed;
     InterruptT* mInterrupter;
+    std::set<int32_t> mProtected;
+    MultiObjectConnectivity mConnectivity = MultiObjectConnectivity::FG26_BG6;
     float mCfl = 0.999f;
     bool mClampSpeed = false;
     int mGrainSize = 1;
@@ -1818,6 +1979,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     // 4. two-smallest projection, written to copies of both trees
     typename FloatTreeT::Ptr newPhi(new FloatTreeT(phi));
     typename LabelTreeT::Ptr newLabels(new LabelTreeT(labels));
+    // changes involving a protected label are deferred (spec 4.7)
+    std::vector<std::vector<Deferred>> deferred(mProtected.empty() ? 0 : leafCount);
     forEachIndex(leafCount, [&](size_t i) {
         const LeafData& d = data[i];
         if (d.entries.empty()) return;
@@ -1827,10 +1990,15 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         for (const VoxelEntry& e : d.entries) {
             int32_t l; float v;
             if (!project(e, dt, l, v)) continue;
+            if (this->involvesProtected(e.own, l)) {
+                deferred[i].push_back(Deferred{leaf.offsetToGlobalCoord(e.offset), e.own, l, v});
+                continue;
+            }
             phiLeaf->setValueOnly(e.offset, v);
             labLeaf->setValueOnly(e.offset, LabelT(l));
         }
     });
+    if (!deferred.empty()) this->applyDeferred(deferred, *newPhi, *newLabels, freeze);
 
     // 5. orphan cleanup
     this->cleanOrphans(*newPhi, *newLabels, freeze);
@@ -1883,9 +2051,59 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
     for (const auto& list : fixes) {
         for (const Fix& fx : list) {
+            // protected labels (spec 4.7): only simple changes, tested on the
+            // labels as updated by the fixes applied so far (serial order)
+            const int32_t own = static_cast<int32_t>(labAcc.getValue(fx.ijk));
+            const int32_t to = static_cast<int32_t>(fx.label);
+            if (this->involvesProtected(own, to)
+                && !this->topologyAllows(labAcc, fx.ijk, own, to)) continue;
             phiAcc.setValueOnly(fx.ijk, fx.phi);
             labAcc.setValueOnly(fx.ijk, fx.label);
             maskAcc.setValueOff(fx.ijk); // flagged for redistancing
+        }
+    }
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
+    const std::vector<std::vector<Deferred>>& deferred,
+    FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze)
+{
+    // 27 coloured passes (coordinates mod 3): changes of one colour have
+    // disjoint 26-neighbourhoods, so they are decided independently (in
+    // parallel) on the labels as updated by the earlier passes, then
+    // applied. The result does not depend on the thread count.
+    std::vector<Deferred> byColour[27];
+    for (const auto& list : deferred) {
+        for (const Deferred& c : list) {
+            auto mod3 = [](int v) { return ((v % 3) + 3) % 3; };
+            byColour[mod3(c.ijk.x()) + 3 * mod3(c.ijk.y()) + 9 * mod3(c.ijk.z())].push_back(c);
+        }
+    }
+    const float barrier = float(1e-3 * mMls.voxelSize());
+    tree::ValueAccessor<FloatTreeT> phiAcc(newPhi);
+    tree::ValueAccessor<LabelTreeT> labAcc(newLabels);
+    tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
+    for (const std::vector<Deferred>& pass : byColour) {
+        if (pass.empty()) continue;
+        std::vector<char> accept(pass.size(), 0);
+        forEachIndex(pass.size(), [&](size_t i) {
+            tree::ValueAccessor<const LabelTreeT> lab(newLabels);
+            const Deferred& c = pass[i];
+            accept[i] = this->topologyAllows(lab, c.ijk, c.from, c.to);
+        });
+        for (size_t i = 0; i < pass.size(); ++i) {
+            const Deferred& c = pass[i];
+            if (accept[i]) {
+                phiAcc.setValueOnly(c.ijk, c.phi);
+                labAcc.setValueOnly(c.ijk, LabelT(c.to));
+            } else {
+                // rejected: keep the label, barrier just inside its region
+                phiAcc.setValueOnly(c.ijk, barrier);
+                maskAcc.setValueOn(c.ijk);
+            }
         }
     }
 }
@@ -1928,7 +2146,14 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
         tree::ValueAccessor<LabelTreeT> labW(labels);
         for (const auto& kv : added) {
             phiW.setValueOn(kv.first, bg);
-            labW.setValueOn(kv.first, kv.second.second);
+            LabelT l = kv.second.second;
+            // an activated voxel keeps its inactive label when the change
+            // involves a protected label (spec 4.7)
+            const LabelT cur = labW.getValue(kv.first);
+            if (this->involvesProtected(static_cast<int32_t>(cur), static_cast<int32_t>(l))) {
+                l = cur;
+            }
+            labW.setValueOn(kv.first, l);
         }
     }
 
