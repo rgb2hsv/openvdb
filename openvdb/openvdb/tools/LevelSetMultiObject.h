@@ -140,9 +140,10 @@ public:
     /// also near junctions where the raw signedDistance() underestimates.
     /// @details A voxel is inside if its label (active or not, ruling R7b)
     /// equals @a label. Seeds are the active phi voxels with a face neighbour
-    /// on the other side of that region; they get the spec 5.1 subcell
-    /// distance computed from phi with only label | not-label crossings, the
-    /// outer layers solve spec 5.2 on |psi|, and the sign is applied last.
+    /// on the other side of that region. They keep phi (no 5.1 reseed),
+    /// except outside seeds next to a third label, which are rebuilt from
+    /// label-side values (lsmo_internal::rebuildJunctionSeeds, ruling R17);
+    /// the outer layers solve spec 5.2 on |psi|, and the sign is applied last.
     /// The result is active exactly at the voxels with |psi| < halfWidth*dx
     /// (the seeds dilated by @a halfWidth; for @a halfWidth up to this
     /// object's halfWidth() the search is limited to the active band, which
@@ -679,6 +680,82 @@ struct LabelRegionDiffers
     bool requireActive;
 };
 
+/// @brief Per-label reconstruction near junctions (spec 5.3, ruling R17).
+/// @details A seed q of @a out (active in @a seeds) outside the region
+/// {L == @a label} with a face neighbour (active or not) of a third label
+/// (neither @a label nor L(q)) holds the distance to its own label's
+/// boundary, which may not be the region's. Such seeds are rebuilt by a local
+/// Godunov extension of psi = -phi inside / +phi outside: per axis the
+/// smallest known psi among the two face neighbours (label-side seeds, other
+/// outside seeds, rebuilt seeds once solved), then
+/// sum_i (psi - a_i)^2 = dx^2. Jacobi sweeps over just these seeds until no
+/// value changes by more than 1e-4*dx (at most 8). A seed with no known
+/// neighbour keeps its value. Results are clamped to [0, background].
+/// Runs serially (junction seeds are few).
+template<typename FloatTreeT, typename BoolTreeT, typename LabelTreeT>
+void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTreeT& labels,
+    typename LabelTreeT::ValueType label, double dx)
+{
+    const Coord* offs = faceOffsets();
+    tree::ValueAccessor<const LabelTreeT> lab(labels);
+    tree::ValueAccessor<FloatTreeT> acc(out);
+    tree::ValueAccessor<const BoolTreeT> seedAcc(seeds);
+
+    std::vector<Coord> todo;
+    std::vector<float> keep;
+    for (auto it = seeds.cbeginValueOn(); it; ++it) {
+        const Coord q = it.getCoord();
+        const auto lq = lab.getValue(q);
+        if (lq == label) continue;
+        bool third = false;
+        for (int f = 0; f < 6 && !third; ++f) {
+            const auto ln = lab.getValue(q + offs[f]);
+            third = ln != label && ln != lq;
+        }
+        if (!third) continue;
+        todo.push_back(q);
+        keep.push_back(acc.getValue(q));
+    }
+    if (todo.empty()) return;
+    for (const Coord& q : todo) acc.setValue(q, kUnknownDistance);
+
+    const float bg = out.background();
+    const float tol = float(1e-4 * dx);
+    std::vector<float> next(todo.size());
+    for (int sweep = 0; sweep < 8; ++sweep) {
+        float maxDelta = 0.0f;
+        for (size_t n = 0; n < todo.size(); ++n) {
+            const Coord& q = todo[n];
+            double abar[3], coef[3] = {1.0, 1.0, 1.0};
+            int m = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                double a = std::numeric_limits<double>::max();
+                for (int side = 0; side < 2; ++side) {
+                    const Coord nb = q + offs[2 * axis + side];
+                    if (!seedAcc.isValueOn(nb)) continue;
+                    const float v = acc.getValue(nb);
+                    if (v == kUnknownDistance) continue;
+                    a = std::min(a, lab.getValue(nb) == label ? -double(v) : double(v));
+                }
+                if (a != std::numeric_limits<double>::max()) abar[m++] = a;
+            }
+            const float old = acc.getValue(q);
+            next[n] = m == 0 ? old
+                : float(std::min(std::max(solveGodunov(abar, coef, m, dx), 0.0), double(bg)));
+            if (old == kUnknownDistance) {
+                if (next[n] != kUnknownDistance) maxDelta = std::numeric_limits<float>::max();
+            } else {
+                maxDelta = std::max(maxDelta, std::abs(next[n] - old));
+            }
+        }
+        for (size_t n = 0; n < todo.size(); ++n) acc.setValue(todo[n], next[n]);
+        if (maxDelta <= tol) break;
+    }
+    for (size_t n = 0; n < todo.size(); ++n) {
+        if (acc.getValue(todo[n]) == kUnknownDistance) acc.setValue(todo[n], keep[n]);
+    }
+}
+
 /// @brief Factory sampler for MultiLevelSet::fromLabelGrid: the label is the
 /// input value; phi is 0.5*dx at voxels with a face neighbour of a different
 /// label and @a bg elsewhere. Copied once per task.
@@ -918,9 +995,14 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
         });
     }
 
-    // 3. seed with label | not-label crossings (5.1), solve |psi| (5.2)
+    // 3. seeds: label | not-label crossings, keeping the pair's phi (ruling
+    // R17: no subcell reseed, which is not a fixed point of reinitialized
+    // phi). Not-label seeds next to a third label store the distance to the
+    // wrong boundary and are rebuilt from label-side data.
     BoolTreeT seeds(false);
-    lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize);
+    lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize,
+        /*writeValues=*/false);
+    lsmo_internal::rebuildJunctionSeeds(*out, seeds, labels, inLabel, dx);
     const int maxIter = int(std::ceil(halfWidth * std::sqrt(3.0))) + 2;
     lsmo_internal::solveOuterLayers(*out, seeds, sideOp, dx, float(1e-4 * dx), maxIter,
         grainSize, static_cast<util::NullInterrupter*>(nullptr));

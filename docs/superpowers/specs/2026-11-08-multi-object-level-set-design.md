@@ -254,8 +254,18 @@ therefore underestimates ψ_l outside l there.
 `extractSignedDistance(l, halfWidth)`:
 
 1. Build a boolean "is l" mask over the band (dilated by halfWidth if needed).
-2. Seed with 5.1 using only l | not-l crossings.
-3. Solve 5.2 on |ψ_l|, apply sign from the mask.
+2. Seeds are the band voxels with a face neighbour across the l | not-l
+   boundary. They keep the pair's φ and are not reseeded with 5.1, because the
+   subcell fix is not a fixed point of already reinitialized φ. An l-side seed's φ
+   is the distance to l's boundary and is exact. A not-l seed's φ is the
+   distance to its own label's boundary. That is wrong only next to a third
+   label, so a not-l seed with a face neighbour (active or not) of a third
+   label (neither l nor its own label) is rebuilt from l-side data. The rebuild
+   is a local Godunov extension of ψ_l: per axis, take the smallest known
+   neighbour value a_i (−φ for l-side seeds, +φ for other not-l seeds and
+   rebuilt seeds once solved), then solve Σ(ψ − a_i)² = dx². Jacobi sweeps
+   over these seeds only continue until the values are stable (ruling R17).
+3. Solve 5.2 on |ψ_l| with those seeds frozen, apply sign from the mask.
 4. Return as `GRID_LEVEL_SET` with background halfWidth·dx.
 
 The evolver's speed stencils use raw ±φ, which is accurate at the face-neighbour
