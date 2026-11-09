@@ -196,12 +196,12 @@ namespace {
 
 // Planar interface at x = 7.3 (label 1 for x <= 7, label 2 for x >= 8),
 // active band x in [4, 11] (four voxels on each side), y, z in [0, 15].
-// The two interface layers and their outer neighbours (x in [6, 9], the
-// stencil of the spec 5.1 reseed) hold the exact distances; if @a exact is
-// false the remaining band voxels hold garbage (alternating 0.5*dx and
-// halfWidth*dx).
+// Layers x in [7 - halo, 8 + halo] hold the exact distances (halo 0: the two
+// interface layers, enough for redistance(); halo 1: also the outer
+// neighbours read by the spec 5.1 reseed); if @a exact is false the remaining
+// band voxels hold garbage (alternating 0.5*dx and halfWidth*dx).
 MLS::Ptr
-makePlanar(double dx, bool exact)
+makePlanar(double dx, bool exact, int halo = 1)
 {
     const int halfWidth = 3;
     auto xform = math::Transform::createLinearTransform(dx);
@@ -216,7 +216,7 @@ makePlanar(double dx, bool exact)
             for (int k = 0; k < 16; ++k) {
                 const Coord c(i, j, k);
                 float d = float(std::abs(i - 7.3) * dx);
-                if (!exact && (i < 6 || i > 9)) {
+                if (!exact && (i < 7 - halo || i > 8 + halo)) {
                     d = ((i + j + k) % 2) ? float(0.5 * dx) : float(halfWidth * dx);
                 }
                 pa.setValue(c, d);
@@ -242,7 +242,7 @@ TEST_F(TestLevelSetMultiObject, RedistancePlanar)
     const double dx = 0.5;
     for (int reseed = 0; reseed < 2; ++reseed) {
         SCOPED_TRACE(reseed ? "reinitialize" : "redistance");
-        auto m = makePlanar(dx, /*exact=*/false);
+        auto m = makePlanar(dx, /*exact=*/false, /*halo=*/reseed);
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << msg;
         const Index64 nActive = m->phi()->activeVoxelCount();
@@ -463,6 +463,21 @@ TEST_F(TestLevelSetMultiObject, RedistanceSeedInterface)
     }
     // non-seed voxels are left alone
     EXPECT_EQ(out.getValue(Coord(5, 3, 3)), snapshot.getValue(Coord(5, 3, 3)));
+
+    // A seed whose only other-side neighbour is inactive has no usable
+    // gradient term (Delta would collapse to epsilon): it keeps its value.
+    FloatTree lone(float(3 * dx));
+    lone.setValueOn(Coord(6, 0, 0), 0.4f);
+    lone.setValueOn(Coord(7, 0, 0), 0.15f);
+    lone.setValueOff(Coord(8, 0, 0), 0.35f);
+    const FloatTree loneSnapshot(lone);
+    BoolTree loneSeeds(false);
+    tools::MultiLevelSetRedistance<MLS>::seedInterface(loneSnapshot,
+        [](const Coord& c) { return c[0] <= 7; }, lone, loneSeeds, dx, /*grainSize=*/0);
+    EXPECT_EQ(loneSeeds.activeVoxelCount(), Index64(1));
+    EXPECT_TRUE(loneSeeds.isValueOn(Coord(7, 0, 0)));
+    EXPECT_EQ(lone.getValue(Coord(7, 0, 0)), 0.15f);
+    EXPECT_EQ(lone.getValue(Coord(6, 0, 0)), 0.4f);
 }
 
 namespace {
@@ -672,21 +687,17 @@ TEST_F(TestLevelSetMultiObject, FromLabelGrid)
         return dx * std::min(boxDist(p, 5, 24), boxDist(p, 0, 29));
     });
 
-    // Interface voxels whose only crossings lie along one axis (face
-    // interiors) hold 0.5*dx: the distance to the cube face.
+    // Every interface voxel keeps its frozen face-midpoint seed, 0.5*dx
+    // (fromLabelGrid redistances without reseeding, ruling R16).
     const Coord* offs = tools::lsmo_internal::faceOffsets();
     const auto& lab = m->labels()->tree();
     Index64 nFace = 0;
     for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
         const Coord p = it.getCoord();
         EXPECT_EQ(lab.getValue(p), in->tree().getValue(p)) << p;
-        int axes = 0;
-        for (int a = 0; a < 3; ++a) {
-            const bool cross = lab.getValue(p + offs[2 * a]) != lab.getValue(p)
-                || lab.getValue(p + offs[2 * a + 1]) != lab.getValue(p);
-            axes += cross ? 1 : 0;
-        }
-        if (axes != 1) continue;
+        bool iface = false;
+        for (int f = 0; f < 6; ++f) iface |= lab.getValue(p + offs[f]) != lab.getValue(p);
+        if (!iface) continue;
         ++nFace;
         EXPECT_NEAR(*it, 0.5 * dx, 1e-3 * dx) << p;
     }
@@ -702,4 +713,20 @@ TEST_F(TestLevelSetMultiObject, FromSignedGridsThrows)
     fog->setGridClass(GRID_FOG_VOLUME);
     in[1] = fog;
     EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
+
+    FloatGrid::Ptr a = tools::createLevelSetSphere<FloatGrid>(5.0f, Vec3f(-8, 0, 0), 1.0f);
+    FloatGrid::Ptr b = tools::createLevelSetSphere<FloatGrid>(5.0f, Vec3f(8, 0, 0), 1.0f);
+    FloatGrid::Ptr c = tools::createLevelSetSphere<FloatGrid>(2.5f, Vec3f(4, 0, 0), 0.5f);
+
+    in.clear(); // empty map
+    EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
+    in[1] = a; in[2] = FloatGrid::ConstPtr(); // null grid
+    EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
+    in.clear(); in[0] = a; in[2] = b; // key 0 is the background
+    EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
+    in.clear(); in[1] = a; in[2] = c; // mismatched transforms
+    EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
+    in.clear(); in[1] = a; in[2] = b;
+    EXPECT_THROW(MLS::fromSignedGrids(in, 1), ValueError); // halfWidth < 2
+    EXPECT_NO_THROW(MLS::fromSignedGrids(in, 2));
 }

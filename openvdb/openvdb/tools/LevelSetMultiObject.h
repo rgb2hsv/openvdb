@@ -108,7 +108,10 @@ public:
     /// interface voxels dilated by @a halfWidth (26-neighbours), then
     /// reinitialized (spec 5) and trimmed to phi < halfWidth*dx. Inactive
     /// tiles and voxels kept in the label tree hold the deep-interior label
-    /// (ruling R11).
+    /// (ruling R11). Inactive tiles are labelled by the argmin at the tile
+    /// origin, which is exact for disjoint inputs; where inputs overlap
+    /// inside a tile, only voxels in leaves (of the band, its face shell or
+    /// an input) are labelled per voxel.
     /// @throw ValueError if the map is empty, a grid is null or not a
     /// GRID_LEVEL_SET, a key is 0, the transforms differ or are not a uniform
     /// scale, or @a halfWidth < 2.
@@ -272,7 +275,9 @@ inline const Coord* faceOffsets()
 /// Delta_i = max(|psi(+1) - psi(-1)|/2, |psi(+1) - psi(0)|, |psi(0) - psi(-1)|,
 /// 1e-6*dx) / dx and the seed is |psi_p| / sqrt(sum_i Delta_i^2); terms that
 /// involve an inactive neighbour are left out (only band edges of finite
-/// domains have them; a seed with no active face neighbour keeps its value).
+/// domains have them). A seed with no active face neighbour q with
+/// differs(p, q) keeps its value (Delta could collapse to epsilon), and seed
+/// values are clamped to the snapshot background.
 /// All phi values are read from @a snapshot, so the result does not depend
 /// on evaluation order. Seed
 /// values are written to @a out and flagged as active voxels of @a seedMask;
@@ -306,7 +311,7 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
                 // psi at the six face neighbours, signed relative to p's side;
                 // inactive neighbours are left out of the gradient.
                 double psi[6];
-                bool on[6], seed = false, anyOn = false;
+                bool on[6], seed = false, otherOn = false;
                 for (int f = 0; f < 6; ++f) {
                     const Coord q = p + offs[f];
                     const bool other = op(p, q);
@@ -314,11 +319,11 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
                     if (!writeValues) { if (seed) break; continue; }
                     float phiQ = bg;
                     on[f] = acc.probeValue(q, phiQ);
-                    anyOn |= on[f];
+                    otherOn |= on[f] && other;
                     psi[f] = other ? double(phiQ) : -double(phiQ);
                 }
                 if (!seed) continue;
-                if (writeValues && anyOn) {
+                if (writeValues && otherOn) {
                     const double psiP = -double(acc.getValue(p));
                     double sum2 = 0.0;
                     for (int axis = 0; axis < 3; ++axis) {
@@ -330,7 +335,7 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
                         d /= dx;
                         sum2 += d * d;
                     }
-                    it.setValue(float(std::abs(psiP) / std::sqrt(sum2)));
+                    it.setValue(float(std::min(std::abs(psiP) / std::sqrt(sum2), double(bg))));
                 }
                 if (maskLeaf) maskLeaf->setValueOn(it.pos(), true);
             }

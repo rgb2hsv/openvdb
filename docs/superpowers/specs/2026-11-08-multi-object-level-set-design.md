@@ -214,8 +214,10 @@ Voxel p (label a) is an interface voxel if some face neighbour q has label
 b ≠ a. Its value is the Russo–Smereka subcell fix (Russo & Smereka 2000,
 second order as analysed by du Chéné, Min & Gibou 2008), applied to
 ψ_a over p and its face neighbours: ψ_a = −φ at voxels of label a, +φ
-elsewhere (inactive neighbours read the φ background, signed by their label).
-Per axis i, with ψ(−1), ψ(0) = ψ_p, ψ(+1) the values along that axis,
+elsewhere. Terms that involve an inactive neighbour are omitted from Δ_i
+(only band edges of finite domains have them). A seed with no active face
+neighbour of the other label keeps its value, and seed values are clamped to
+the φ background. Per axis i, with ψ(−1), ψ(0) = ψ_p, ψ(+1) the values along that axis,
 
     Δ_i = max(|ψ(+1) − ψ(−1)|/2, |ψ(+1) − ψ(0)|, |ψ(0) − ψ(−1)|, ε) / dx
     φ_p = |ψ_p| / sqrt(Σ_i Δ_i²)
