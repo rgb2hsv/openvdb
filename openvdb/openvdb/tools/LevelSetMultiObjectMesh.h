@@ -125,6 +125,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -812,6 +813,8 @@ template<typename FloatTreeT, typename LabelTreeT>
 void
 contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, MeshBlock& out)
 {
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
     using LabelT = typename LabelTreeT::ValueType;
     const int P = dim + 1;
     std::vector<LabelT> L(size_t(P) * P * P);

@@ -68,13 +68,13 @@
 #include <openvdb/math/Math.h>
 #include "Interpolation.h"// for BoxSampler
 #include <openvdb/util/NodeMasks.h>// for FindLowestOn
+#include <openvdb/util/Assert.h>
 #include <openvdb/util/NullInterrupter.h>
 #include "Morphology.h"// for dilateActiveValues, erodeActiveValues
 #include "Prune.h"// for pruneLevelSet
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -82,6 +82,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -102,9 +103,19 @@ namespace tools {
 /// @details Invariant: both trees have identical active topology and phi is
 /// finite and non-negative at every active voxel. phi has background value
 /// <tt>halfWidth * voxelSize</tt> and the label background is 0.
+///
+/// @note The distance tree must hold @c float values (FloatTree or another
+/// tree configuration with a float ValueType); this is checked at compile
+/// time. The label tree may hold any integer type (Int32Tree by default;
+/// Int64Tree and UInt32Tree also work).
 template<typename FloatTreeT = FloatTree, typename LabelTreeT = Int32Tree>
 class MultiLevelSet
 {
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "MultiLevelSet: the distance tree must have float values");
+    static_assert(std::is_integral<typename LabelTreeT::ValueType>::value,
+        "MultiLevelSet: the label tree must have integer values");
+
 public:
     using Ptr = SharedPtr<MultiLevelSet>;
     using FloatGridT = Grid<FloatTreeT>;
@@ -112,8 +123,11 @@ public:
     using LabelT = typename LabelTreeT::ValueType;
 
     /// @brief Pair up @a phi and @a labels.
-    /// @throw ValueError if the transforms differ, the transform is not a
-    /// uniform scale, or @a halfWidth is less than 2.
+    /// @throw ValueError if a grid is null, the transforms differ, the
+    /// transform is not a uniform scale, @a halfWidth is less than 2, the
+    /// phi background differs from <tt>halfWidth * voxelSize</tt> (relative
+    /// tolerance 1e-6), the label background is not 0, or phi is negative or
+    /// not finite at an active voxel.
     MultiLevelSet(typename FloatGridT::Ptr phi, typename LabelGridT::Ptr labels, int halfWidth)
         : mPhi(phi), mLabels(labels), mHalfWidth(halfWidth)
     {
@@ -124,10 +138,15 @@ public:
             OPENVDB_THROW(ValueError, "MultiLevelSet: halfWidth must be at least 2");
         }
         if (mPhi->transform() != mLabels->transform()) {
-            OPENVDB_THROW(ValueError, "MultiLevelSet: phi and label grids must share a transform");
+            OPENVDB_THROW(ValueError,
+                "MultiLevelSet: phi and label grids must share a transform");
         }
         if (!mPhi->transform().hasUniformScale()) {
             OPENVDB_THROW(ValueError, "MultiLevelSet: transform must have uniform voxel size");
+        }
+        std::string message;
+        if (!this->validateBackgrounds(&message) || !this->validatePhi(&message)) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet: " << message);
         }
         mPhi->setGridClass(GRID_UNKNOWN);
         mPhi->insertMeta("multi_level_set_role", StringMetadata("phi"));
@@ -139,37 +158,46 @@ public:
     /// not); label 0 is background. Interface voxels (a voxel with a face
     /// neighbour of a different label) are searched among the active voxels
     /// of @a labels and their face neighbours and get phi = 0.5*dx (the voxel
-    /// face midpoint), kept frozen while the rest of the band (interface
-    /// voxels dilated by @a halfWidth over 26-neighbours) is redistanced
-    /// (spec 5.2; no 5.1 reseed, whose gradient estimate needs a distance
-    /// field rather than this staircase); voxels
-    /// left with phi >= halfWidth*dx are deactivated. Every inactive voxel
-    /// kept in the trees holds its label from @a labels (ruling R11).
+    /// face midpoint). They are kept frozen while the rest of the band
+    /// (interface voxels dilated by @a halfWidth over 26-neighbours) is
+    /// redistanced; the interface values are not re-estimated with a subcell
+    /// fix, because that gradient estimate needs a distance field, not this
+    /// voxel staircase. Voxels left with phi >= halfWidth*dx are deactivated.
+    /// Every inactive voxel kept in the trees holds its label from @a labels,
+    /// so the label of a region's interior is known just outside the band.
+    /// @param grainSize TBB grain size in leaves; zero or negative runs
+    /// serially. The result does not depend on it.
     /// @throw ValueError if @a halfWidth < 2, the voxel size is not uniform
     /// or the label background is not 0.
-    static Ptr fromLabelGrid(const LabelGridT& labels, int halfWidth = 3);
+    static Ptr fromLabelGrid(const LabelGridT& labels, int halfWidth = 3, int grainSize = 1);
 
     /// @brief Build a multi-object level set from signed distance grids, one
     /// per non-zero label.
     /// @details psi_l is the input grid of label l (inactive values read
     /// with their sign, so deep interiors are negative); the background
-    /// label 0 has the implicit psi_0 = -min_l psi_l (ruling R2). At each
-    /// voxel the label is argmin psi (ties to the smaller label) and
-    /// phi = (v_b - v_a)/2 for the two smallest values v_a <= v_b, so
-    /// phi = |psi_l| near an isolated object. Candidates are the union of the
-    /// input active topologies and their face neighbours; the band is the
-    /// interface voxels dilated by @a halfWidth (26-neighbours), then
-    /// reinitialized (spec 5) and trimmed to phi < halfWidth*dx. Inactive
-    /// tiles and voxels kept in the label tree hold the deep-interior label
-    /// (ruling R11). Inactive tiles are labelled by the argmin at the tile
-    /// origin, which is exact for disjoint inputs; where inputs overlap
-    /// inside a tile, only voxels in leaves (of the band, its face shell or
-    /// an input) are labelled per voxel.
+    /// label 0 has the implicit psi_0 = -min_l psi_l, i.e. it is the region
+    /// outside every object. At each voxel the label is argmin psi (ties to
+    /// the smaller label) and phi = (v_b - v_a)/2 for the two smallest values
+    /// v_a <= v_b, so phi = |psi_l| near an isolated object. Candidates are
+    /// the union of the input active topologies and their face neighbours;
+    /// the band is the interface voxels dilated by @a halfWidth
+    /// (26-neighbours), then reinitialized (interface voxels re-estimated
+    /// with the Russo-Smereka subcell fix, the rest of the band solved from
+    /// them; see MultiLevelSetRedistance::reinitialize) and trimmed to
+    /// phi < halfWidth*dx. Inactive tiles and voxels kept in the label tree
+    /// hold the label of the region they lie in, so the label of a region's
+    /// interior is known just outside the band. Inactive tiles are labelled
+    /// by the argmin at the tile origin, which is exact for disjoint inputs;
+    /// where inputs overlap inside a tile, only voxels in leaves (of the
+    /// band, its face shell or an input) are labelled per voxel.
+    /// @param grainSize TBB grain size in leaves; zero or negative runs
+    /// serially. The result does not depend on it.
     /// @throw ValueError if the map is empty, a grid is null or not a
     /// GRID_LEVEL_SET, a key is 0, the transforms differ or are not a uniform
     /// scale, or @a halfWidth < 2.
     static Ptr fromSignedGrids(
-        const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth = 3);
+        const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth = 3,
+        int grainSize = 1);
 
     typename FloatGridT::Ptr phi() { return mPhi; }
     typename FloatGridT::ConstPtr phi() const { return mPhi; }
@@ -188,27 +216,47 @@ public:
         return (mLabels->tree().getValue(ijk) == label) ? -d : d;
     }
 
-    /// @brief Signed distance to the boundary of @a label (spec 5.3):
-    /// second-order away from junction lines, first-order within about two
-    /// voxels of a triple-junction line (ruling R19).
-    /// @details A voxel is inside if its label (active or not, ruling R7b)
-    /// equals @a label. Seeds are the active phi voxels with a face neighbour
-    /// on the other side of that region. They keep phi (no 5.1 reseed),
-    /// except outside seeds next to a third label, which are rebuilt from
-    /// label-side values within proven bounds (lsmo_internal::
-    /// rebuildJunctionSeeds, rulings R17, R19; first order at junction lines);
-    /// the outer layers solve spec 5.2 on |psi|, and the sign is applied last.
-    /// The result is active exactly at the voxels with |psi| < halfWidth*dx
-    /// (the seeds dilated by @a halfWidth; for @a halfWidth up to this
-    /// object's halfWidth() the search is limited to the active band, which
-    /// already contains every such voxel). Inactive values are -/+
-    /// halfWidth*dx by region.
-    /// @param halfWidth band half-width in voxels; -1 uses halfWidth().
+    /// @brief Signed distance psi to the boundary of the region of
+    /// @a label: second-order accurate away from junction lines (where three
+    /// or more labels meet), first-order within about two voxels of one,
+    /// where the distance field itself is not smooth.
+    /// @details A voxel is inside if its label (active or not; inactive
+    /// voxels keep the label of the region they lie in) equals @a label.
+    /// Seeds are the active phi voxels with a face neighbour on the other
+    /// side of that region; they keep their phi, which is already the
+    /// distance to the region's boundary (re-estimating it with a subcell
+    /// fix would move the interface, since that fix is not a fixed point of
+    /// a redistanced field). The exception is an outside seed next to a third
+    /// label: its phi may be the distance to the boundary with that third
+    /// label, so it is rebuilt from inside values within proven bounds (see
+    /// lsmo_internal::rebuildJunctionSeeds). The other band voxels solve
+    /// |grad psi| = 1 from the seeds as in MultiLevelSetRedistance, on |psi|,
+    /// and the sign is applied last. The result is active exactly at the
+    /// voxels with |psi| < halfWidth*dx (the seeds dilated by @a halfWidth;
+    /// for @a halfWidth up to this object's halfWidth() the search is limited
+    /// to the active band, which already contains every such voxel).
+    /// Inactive values are -/+ halfWidth*dx by region.
+    ///
+    /// Accuracy: the layers next to the boundary are accurate to the order
+    /// stated above in the maximum norm; the outer layers of the band are
+    /// accurate in RMS but may have larger isolated errors, where the
+    /// upwind solve meets characteristics coming from far-apart seeds.
+    /// @param halfWidth band half-width in voxels of the result; -1 (the
+    /// default) uses this object's halfWidth(); otherwise it must be at
+    /// least 2. Values above halfWidth() are allowed, but voxels beyond this
+    /// object's band have no phi data and are solved from the band only.
+    /// @param grainSize TBB grain size in leaves; zero or negative runs
+    /// serially. The result does not depend on it.
+    /// @param interrupt optional interrupter, polled between Jacobi
+    /// iterations; if it fires, the result is a valid level set grid but
+    /// voxels not yet reached hold the background value.
     /// @return a GRID_LEVEL_SET grid with background halfWidth*dx and this
     /// object's transform; it has no active voxels if @a label has no
     /// boundary in the band (e.g. it does not occur).
     /// @throw ValueError if @a halfWidth is not -1 and less than 2.
-    typename FloatGridT::Ptr extractSignedDistance(int32_t label, int halfWidth = -1) const;
+    template<typename InterruptT = util::NullInterrupter>
+    typename FloatGridT::Ptr extractSignedDistance(int32_t label, int halfWidth = -1,
+        int grainSize = 1, InterruptT* interrupt = nullptr) const;
 
     /// @brief Sorted distinct non-zero labels over all active voxels.
     std::vector<int32_t> labelSet() const
@@ -221,26 +269,18 @@ public:
         return std::vector<int32_t>(s.begin(), s.end());
     }
 
-    /// @brief Check the class invariant.
+    /// @brief Check the class invariant (identical active topology, phi
+    /// finite and non-negative at active voxels, phi background
+    /// halfWidth*dx and label background 0).
     /// @param message if non-null, receives a description of the first failure.
     bool validate(std::string* message = nullptr) const
     {
+        if (!this->validateBackgrounds(message)) return false;
         if (!mPhi->tree().hasSameTopology(mLabels->tree())) {
             if (message) *message = "phi and label trees have different active topology";
             return false;
         }
-        for (auto it = mPhi->tree().cbeginValueOn(); it; ++it) {
-            const float v = *it;
-            if (!std::isfinite(v) || v < 0.0f) {
-                if (message) {
-                    std::ostringstream ss;
-                    ss << "phi is negative or non-finite at " << it.getCoord();
-                    *message = ss.str();
-                }
-                return false;
-            }
-        }
-        return true;
+        return this->validatePhi(message);
     }
 
     /// @brief Dilate the active topology of both trees by @a iterations
@@ -322,7 +362,46 @@ private:
     /// Shared factory back end; see the definition.
     template<typename SamplerT>
     static Ptr build(const math::Transform& xform, typename LabelTreeT::Ptr labels,
-        const BoolTreeT& candidates, const SamplerT& sampler, int halfWidth, bool reseed);
+        const BoolTreeT& candidates, const SamplerT& sampler, int halfWidth, bool reseed,
+        int grainSize);
+
+    /// phi background == halfWidth*dx (relative tolerance 1e-6), label background 0.
+    bool validateBackgrounds(std::string* message) const
+    {
+        const double expected = double(mHalfWidth) * this->voxelSize();
+        const double bg = double(mPhi->tree().background());
+        if (!(std::abs(bg - expected) <= 1e-6 * expected)) {
+            if (message) {
+                std::ostringstream ss;
+                ss << "phi background " << bg << " differs from halfWidth*voxelSize = "
+                   << expected;
+                *message = ss.str();
+            }
+            return false;
+        }
+        if (mLabels->tree().background() != LabelT(0)) {
+            if (message) *message = "label background is not 0";
+            return false;
+        }
+        return true;
+    }
+
+    /// phi finite and non-negative at every active voxel.
+    bool validatePhi(std::string* message) const
+    {
+        for (auto it = mPhi->tree().cbeginValueOn(); it; ++it) {
+            const float v = *it;
+            if (!std::isfinite(v) || v < 0.0f) {
+                if (message) {
+                    std::ostringstream ss;
+                    ss << "phi is negative or non-finite at " << it.getCoord();
+                    *message = ss.str();
+                }
+                return false;
+            }
+        }
+        return true;
+    }
 
     typename FloatGridT::Ptr mPhi;
     typename LabelGridT::Ptr mLabels;
@@ -341,7 +420,16 @@ inline const Coord* faceOffsets()
     return offs;
 }
 
-/// @brief Interface seeding (spec 5.1) over the active voxels of @a out.
+/// Run @a body on the leaf range of @a leafs: in parallel with grain size
+/// @a grainSize, or serially if @a grainSize is zero or negative.
+template<typename LeafManagerT, typename BodyT>
+void forEachLeafRange(LeafManagerT& leafs, int grainSize, const BodyT& body)
+{
+    if (grainSize > 0) tbb::parallel_for(leafs.leafRange(size_t(grainSize)), body);
+    else body(leafs.leafRange());
+}
+
+/// @brief Interface seeding over the active voxels of @a out.
 /// @details A voxel p is a seed if differs(p, q) holds for some face neighbour
 /// q (active or not). Its value is the Russo-Smereka subcell fix (Russo &
 /// Smereka 2000; analysed by du Chene, Min & Gibou 2008) applied to the
@@ -364,6 +452,8 @@ template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp>
 void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
     FloatTreeT& out, BoolTreeT& seedMask, double dx, int grainSize, bool writeValues = true)
 {
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
     using LeafT = typename FloatTreeT::LeafNodeType;
     seedMask.clear();
     seedMask.topologyUnion(out);
@@ -491,6 +581,8 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
     double dx, float tolerance, int maxIter, int grainSize, InterruptT* interrupt,
     bool signedReflection = false)
 {
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
     using LeafManagerT = tree::LeafManager<FloatTreeT>;
     using LeafRangeT = typename LeafManagerT::LeafRange;
     const float bg = phi.background();
@@ -802,6 +894,8 @@ template<typename FloatTreeT, typename BoolTreeT, typename LabelTreeT>
 void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTreeT& labels,
     typename LabelTreeT::ValueType label, double dx)
 {
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
     const Coord* offs = faceOffsets();
     tree::ValueAccessor<const LabelTreeT> lab(labels);
     tree::ValueAccessor<FloatTreeT> acc(out);
@@ -972,7 +1066,7 @@ template<typename SamplerT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
 MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     typename LabelTreeT::Ptr labels, const BoolTreeT& candidates,
-    const SamplerT& sampler, int halfWidth, bool reseed)
+    const SamplerT& sampler, int halfWidth, bool reseed, int grainSize)
 {
     const double dx = xform.voxelSize()[0];
     const float bg = float(halfWidth * dx);
@@ -983,7 +1077,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     band.voxelizeActiveTiles();
     {
         tree::LeafManager<BoolTreeT> leafs(band);
-        tbb::parallel_for(leafs.leafRange(1),
+        lsmo_internal::forEachLeafRange(leafs, grainSize,
             [&](const typename tree::LeafManager<BoolTreeT>::LeafRange& range) {
                 SamplerT s(sampler);
                 for (auto leaf = range.begin(); leaf; ++leaf) {
@@ -991,7 +1085,9 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
                         const Coord p = it.getCoord();
                         const int32_t l = s.label(p);
                         bool iface = false;
-                        for (int f = 0; f < 6 && !iface; ++f) iface = s.label(p + offs[f]) != l;
+                        for (int f = 0; f < 6 && !iface; ++f) {
+                            iface = s.label(p + offs[f]) != l;
+                        }
                         if (!iface) leaf->setValueOff(it.pos());
                     }
                 }
@@ -1008,7 +1104,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     }
     {
         tree::LeafManager<LabelTreeT> leafs(*labels);
-        tbb::parallel_for(leafs.leafRange(1),
+        lsmo_internal::forEachLeafRange(leafs, grainSize,
             [&](const typename tree::LeafManager<LabelTreeT>::LeafRange& range) {
                 SamplerT s(sampler);
                 for (auto leaf = range.begin(); leaf; ++leaf) {
@@ -1025,11 +1121,13 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     typename FloatTreeT::Ptr phiTree(new FloatTreeT(*labels, bg, TopologyCopy()));
     {
         tree::LeafManager<FloatTreeT> leafs(*phiTree);
-        tbb::parallel_for(leafs.leafRange(1),
+        lsmo_internal::forEachLeafRange(leafs, grainSize,
             [&](const typename tree::LeafManager<FloatTreeT>::LeafRange& range) {
                 SamplerT s(sampler);
                 for (auto leaf = range.begin(); leaf; ++leaf) {
-                    for (auto it = leaf->beginValueOn(); it; ++it) it.setValue(s.phi(it.getCoord()));
+                    for (auto it = leaf->beginValueOn(); it; ++it) {
+                        it.setValue(s.phi(it.getCoord()));
+                    }
                 }
             });
     }
@@ -1039,12 +1137,13 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     labGrid->setTransform(xform.copy());
     Ptr mls(new MultiLevelSet(phiGrid, labGrid, halfWidth));
     MultiLevelSetRedistance<MultiLevelSet> redist(*mls);
+    redist.setGrainSize(grainSize);
     if (reseed) redist.reinitialize(); else redist.redistance();
 
     // 4. trim to the band phi < halfWidth*dx
     {
         tree::LeafManager<FloatTreeT> leafs(*phiTree);
-        tbb::parallel_for(leafs.leafRange(1),
+        lsmo_internal::forEachLeafRange(leafs, grainSize,
             [&](const typename tree::LeafManager<FloatTreeT>::LeafRange& range) {
                 for (auto leaf = range.begin(); leaf; ++leaf) {
                     auto* labLeaf = labels->probeLeaf(leaf->origin());
@@ -1062,12 +1161,15 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
 
 
 template<typename FloatTreeT, typename LabelTreeT>
+template<typename InterruptT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::FloatGridT::Ptr
-MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int halfWidth) const
+MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int halfWidth,
+    int grainSize, InterruptT* interrupt) const
 {
     if (halfWidth == -1) halfWidth = mHalfWidth;
     if (halfWidth < 2) {
-        OPENVDB_THROW(ValueError, "MultiLevelSet::extractSignedDistance: halfWidth must be at least 2");
+        OPENVDB_THROW(ValueError,
+            "MultiLevelSet::extractSignedDistance: halfWidth must be at least 2");
     }
     using RegionDiffers = lsmo_internal::LabelRegionDiffers<FloatTreeT, LabelTreeT>;
     using BoolLeafRangeT = typename tree::LeafManager<BoolTreeT>::LeafRange;
@@ -1076,7 +1178,6 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     const LabelTreeT& labels = mLabels->tree();
     const double dx = this->voxelSize();
     const float bg = float(halfWidth * dx);
-    const int grainSize = 1;
     const LabelT inLabel = LabelT(label);
     const Coord* offs = lsmo_internal::faceOffsets();
     // Seeds must be active in phi (the pair holds distances only there);
@@ -1089,7 +1190,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     band.voxelizeActiveTiles();
     {
         tree::LeafManager<BoolTreeT> leafs(band);
-        tbb::parallel_for(leafs.leafRange(grainSize), [&](const BoolLeafRangeT& range) {
+        lsmo_internal::forEachLeafRange(leafs, grainSize, [&](const BoolLeafRangeT& range) {
             RegionDiffers op(seedOp);
             for (auto leaf = range.begin(); leaf; ++leaf) {
                 for (auto it = leaf->beginValueOn(); it; ++it) {
@@ -1108,30 +1209,35 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     typename FloatTreeT::Ptr out(new FloatTreeT(band, bg, TopologyCopy()));
     {
         tree::LeafManager<FloatTreeT> leafs(*out);
-        tbb::parallel_for(leafs.leafRange(grainSize), [&](const LeafRangeT& range) {
+        lsmo_internal::forEachLeafRange(leafs, grainSize, [&](const LeafRangeT& range) {
             tree::ValueAccessor<const FloatTreeT> acc(phi);
             for (auto leaf = range.begin(); leaf; ++leaf) {
-                for (auto it = leaf->beginValueOn(); it; ++it) it.setValue(acc.getValue(it.getCoord()));
+                for (auto it = leaf->beginValueOn(); it; ++it) {
+                    it.setValue(acc.getValue(it.getCoord()));
+                }
             }
         });
     }
 
-    // 3. seeds: label | not-label crossings, keeping the pair's phi (ruling
-    // R17: no subcell reseed, which is not a fixed point of reinitialized
-    // phi). Not-label seeds next to a third label may store the distance to
-    // the wrong boundary and are rebuilt from label-side data.
+    // 3. seeds: label | not-label crossings, keeping the pair's phi (no
+    // subcell reseed: it is not a fixed point of a redistanced phi, so it
+    // would move the interface). Not-label seeds next to a third label may
+    // store the distance to the wrong boundary and are rebuilt from
+    // label-side data.
+    if (interrupt) interrupt->start("Extracting signed distance");
     BoolTreeT seeds(false);
     lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize,
         /*writeValues=*/false);
     lsmo_internal::rebuildJunctionSeeds(*out, seeds, labels, inLabel, dx);
     const int maxIter = int(std::ceil(halfWidth * std::sqrt(3.0))) + 2;
     lsmo_internal::solveOuterLayers(*out, seeds, sideOp, dx, float(1e-4 * dx), maxIter,
-        grainSize, static_cast<util::NullInterrupter*>(nullptr));
+        grainSize, interrupt);
+    if (interrupt) interrupt->end();
 
     // 4. sign by region, trim to |psi| < halfWidth*dx, inactive values -/+bg
     {
         tree::LeafManager<FloatTreeT> leafs(*out);
-        tbb::parallel_for(leafs.leafRange(grainSize), [&](const LeafRangeT& range) {
+        lsmo_internal::forEachLeafRange(leafs, grainSize, [&](const LeafRangeT& range) {
             tree::ValueAccessor<const LabelTreeT> lab(labels);
             for (auto leaf = range.begin(); leaf; ++leaf) {
                 for (Index i = 0; i < FloatTreeT::LeafNodeType::NUM_VALUES; ++i) {
@@ -1152,7 +1258,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
         it.setMaxDepth(FloatTreeT::ValueOffIter::LEAF_DEPTH - 1); // tiles only
         for (; it; ++it) it.setValue(lab.getValue(it.getCoord()) == inLabel ? -bg : bg);
     }
-    tools::pruneLevelSet(*out, /*threaded=*/true, grainSize);
+    tools::pruneLevelSet(*out, /*threaded=*/grainSize > 0, size_t(std::max(grainSize, 1)));
 
     typename FloatGridT::Ptr grid = FloatGridT::create(out);
     grid->setTransform(mPhi->transform().copy());
@@ -1163,13 +1269,15 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
 
 template<typename FloatTreeT, typename LabelTreeT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
-MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, int halfWidth)
+MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, int halfWidth,
+    int grainSize)
 {
     if (halfWidth < 2) {
         OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: halfWidth must be at least 2");
     }
     if (!labels.transform().hasUniformScale()) {
-        OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: transform must have uniform voxel size");
+        OPENVDB_THROW(ValueError,
+            "MultiLevelSet::fromLabelGrid: transform must have uniform voxel size");
     }
     if (labels.background() != LabelT(0)) {
         OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: label background must be 0");
@@ -1186,14 +1294,14 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, i
 
     return build(labels.transform(), lab, candidates,
         lsmo_internal::LabelGridSampler<LabelTreeT>(labels.tree(), dx, float(halfWidth * dx)),
-        halfWidth, /*reseed=*/false);
+        halfWidth, /*reseed=*/false, grainSize);
 }
 
 
 template<typename FloatTreeT, typename LabelTreeT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
 MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
-    const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth)
+    const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth, int grainSize)
 {
     if (halfWidth < 2) {
         OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: halfWidth must be at least 2");
@@ -1209,20 +1317,24 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
             OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: null input grid");
         }
         if (kv.first == 0) {
-            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: label 0 is reserved for the background");
+            OPENVDB_THROW(ValueError,
+                "MultiLevelSet::fromSignedGrids: label 0 is reserved for the background");
         }
         if (kv.second->getGridClass() != GRID_LEVEL_SET) {
-            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: input grids must be level sets");
+            OPENVDB_THROW(ValueError,
+                "MultiLevelSet::fromSignedGrids: input grids must be level sets");
         }
         if (!xform) {
             xform = &kv.second->transform();
         } else if (*xform != kv.second->transform()) {
-            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: input grids must share a transform");
+            OPENVDB_THROW(ValueError,
+                "MultiLevelSet::fromSignedGrids: input grids must share a transform");
         }
         inputs.emplace_back(kv.first, &kv.second->tree());
     }
     if (!xform->hasUniformScale()) {
-        OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: transform must have uniform voxel size");
+        OPENVDB_THROW(ValueError,
+            "MultiLevelSet::fromSignedGrids: transform must have uniform voxel size");
     }
     SamplerT sampler(inputs);
 
@@ -1257,7 +1369,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
     candidates.voxelizeActiveTiles();
     tools::dilateActiveValues(candidates, 1, NN_FACE, IGNORE_TILES);
 
-    return build(*xform, lab, candidates, sampler, halfWidth, /*reseed=*/true);
+    return build(*xform, lab, candidates, sampler, halfWidth, /*reseed=*/true, grainSize);
 }
 
 
@@ -2052,7 +2164,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     // 6a. swap both trees together; b-e. band maintenance
     this->swapBuffers(newPhi, newLabels);
     this->bandMaintenance(freeze);
-    assert(mMls.validate());
+    OPENVDB_ASSERT(mMls.validate());
     return dt;
 }
 

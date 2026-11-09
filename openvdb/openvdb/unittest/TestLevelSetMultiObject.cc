@@ -106,7 +106,10 @@ TEST_F(TestLevelSetMultiObject, HolderThrows)
 
     lab->setTransform(math::Transform::createLinearTransform(1.0));
     EXPECT_THROW(MLS(phi, lab, 1), ValueError);
-    EXPECT_NO_THROW(MLS(phi, lab, 2));
+    // the phi background must be halfWidth*dx
+    FloatGrid::Ptr phiHw2 = FloatGrid::create(2.0f);
+    phiHw2->setTransform(math::Transform::createLinearTransform(1.0));
+    EXPECT_NO_THROW(MLS(phiHw2, lab, 2));
 
     auto nonUniform = math::Transform::Ptr(new math::Transform(math::MapBase::Ptr(new math::ScaleMap(Vec3d(1.0, 2.0, 1.0)))));
     FloatGrid::Ptr phi2 = FloatGrid::create(3.0f);
@@ -114,6 +117,220 @@ TEST_F(TestLevelSetMultiObject, HolderThrows)
     phi2->setTransform(nonUniform);
     lab2->setTransform(nonUniform->copy());
     EXPECT_THROW(MLS(phi2, lab2, 3), ValueError);
+}
+
+TEST_F(TestLevelSetMultiObject, HolderInvariantThrows)
+{
+    auto pair = [](float bg, int32_t labelBg, double dx = 0.5) {
+        auto xform = math::Transform::createLinearTransform(dx);
+        FloatGrid::Ptr phi = FloatGrid::create(bg);
+        Int32Grid::Ptr lab = Int32Grid::create(labelBg);
+        phi->setTransform(xform);
+        lab->setTransform(xform->copy());
+        phi->tree().setValueOn(Coord(0, 0, 0), 0.25f);
+        lab->tree().setValueOn(Coord(0, 0, 0), 1);
+        return std::make_pair(phi, lab);
+    };
+    // phi background must be halfWidth*dx = 1.5 (relative tolerance 1e-6)
+    {
+        auto g = pair(1.5f, 0);
+        EXPECT_NO_THROW(MLS(g.first, g.second, 3));
+        EXPECT_THROW(MLS(g.first, g.second, 4), ValueError);
+        g = pair(1.5f * (1.0f + 1e-7f), 0);
+        EXPECT_NO_THROW(MLS(g.first, g.second, 3));
+        g = pair(1.5f * (1.0f + 1e-5f), 0);
+        EXPECT_THROW(MLS(g.first, g.second, 3), ValueError);
+        g = pair(3.0f, 0); // halfWidth in voxels, not world units
+        EXPECT_THROW(MLS(g.first, g.second, 3), ValueError);
+    }
+    // label background must be 0
+    {
+        auto g = pair(1.5f, 1);
+        EXPECT_THROW(MLS(g.first, g.second, 3), ValueError);
+    }
+    // phi must be finite and non-negative at active voxels
+    for (const float bad : {-0.25f, std::numeric_limits<float>::quiet_NaN(),
+             std::numeric_limits<float>::infinity()}) {
+        auto g = pair(1.5f, 0);
+        g.first->tree().setValueOn(Coord(1, 0, 0), bad);
+        g.second->tree().setValueOn(Coord(1, 0, 0), 1);
+        EXPECT_THROW(MLS(g.first, g.second, 3), ValueError) << bad;
+    }
+    // inactive values are not checked
+    {
+        auto g = pair(1.5f, 0);
+        g.first->tree().setValueOff(Coord(2, 0, 0), -1.0f);
+        EXPECT_NO_THROW(MLS(g.first, g.second, 3));
+    }
+    // validate() also checks the backgrounds
+    {
+        auto g = pair(1.5f, 0);
+        MLS m(g.first, g.second, 3);
+        std::string msg;
+        EXPECT_TRUE(m.validate(&msg)) << msg;
+        m.phi()->tree().root().setBackground(2.0f, /*updateChildNodes=*/true);
+        EXPECT_FALSE(m.validate(&msg));
+        EXPECT_FALSE(msg.empty());
+        m.phi()->tree().root().setBackground(1.5f, /*updateChildNodes=*/true);
+        EXPECT_TRUE(m.validate(&msg)) << msg;
+        m.labels()->tree().root().setBackground(3, /*updateChildNodes=*/true);
+        msg.clear();
+        EXPECT_FALSE(m.validate(&msg));
+        EXPECT_FALSE(msg.empty());
+    }
+}
+
+namespace {
+
+// Bitwise equality of two trees: active topology, leaf layout and every
+// value (active or not).
+template<typename TreeT>
+Index64
+treeDifferences(const TreeT& a, const TreeT& b)
+{
+    if (!a.hasSameTopology(b) || a.leafCount() != b.leafCount()) return Index64(1) << 40;
+    Index64 diff = 0;
+    tree::ValueAccessor<const TreeT> acc(b);
+    for (auto it = a.cbeginValueAll(); it; ++it) {
+        const auto va = *it;
+        const auto vb = acc.getValue(it.getCoord());
+        if (std::memcmp(&va, &vb, sizeof(va)) != 0) ++diff;
+    }
+    return diff;
+}
+
+// Labels 1..3 in 8^3 blocks over [0, 23]^3, label 0 outside.
+template<typename GridT>
+typename GridT::Ptr
+makeBlockLabels()
+{
+    typename GridT::Ptr labels = GridT::create(0);
+    auto acc = labels->getAccessor();
+    for (int i = 0; i < 24; ++i)
+        for (int j = 0; j < 24; ++j)
+            for (int k = 0; k < 24; ++k) {
+                acc.setValue(Coord(i, j, k),
+                    typename GridT::ValueType(1 + ((i / 8 + j / 8 + k / 8) % 3)));
+            }
+    return labels;
+}
+
+// fromLabelGrid, a few evolver steps and extractSignedDistance with label
+// tree type LabelTreeT; returns the final phi tree and label-1 distance.
+template<typename LabelTreeT>
+std::pair<FloatTree::Ptr, FloatGrid::Ptr>
+runWithLabelTree()
+{
+    using MLST = tools::MultiLevelSet<FloatTree, LabelTreeT>;
+    using ForcesT = tools::MultiObjectForces<MLST>;
+    auto labels = makeBlockLabels<Grid<LabelTreeT>>();
+    auto m = MLST::fromLabelGrid(*labels);
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3}));
+    ForcesT forces;
+    forces.setPressure(FloatGrid::create(1.0f), 1.0f);
+    forces.setCurvatureWeight(0.1f);
+    forces.setFixedLabels({3});
+    tools::LevelSetMultiObject<MLST, ForcesT> lsmo(*m, forces);
+    for (int n = 0; n < 5; ++n) lsmo.step(1.0f);
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+    tools::MultiLevelSetRedistance<MLST>(*m).redistance();
+    return std::make_pair(FloatTree::Ptr(new FloatTree(m->phi()->tree())),
+        m->extractSignedDistance(1));
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, OtherLabelTreeTypes)
+{
+    // The distance tree must hold floats (a static_assert); the label tree
+    // may hold any integer type. Int64 and UInt32 labels give results
+    // identical to Int32 labels.
+    const auto ref = runWithLabelTree<Int32Tree>();
+    const auto i64 = runWithLabelTree<Int64Tree>();
+    const auto u32 = runWithLabelTree<UInt32Tree>();
+    ASSERT_GT(ref.second->activeVoxelCount(), Index64(0));
+    EXPECT_EQ(treeDifferences(*ref.first, *i64.first), Index64(0));
+    EXPECT_EQ(treeDifferences(*ref.first, *u32.first), Index64(0));
+    EXPECT_EQ(treeDifferences(ref.second->tree(), i64.second->tree()), Index64(0));
+    EXPECT_EQ(treeDifferences(ref.second->tree(), u32.second->tree()), Index64(0));
+}
+
+TEST_F(TestLevelSetMultiObject, FactoriesSerialMatchParallel)
+{
+    // fromLabelGrid, fromSignedGrids and extractSignedDistance give
+    // bit-identical results for every grain size (<= 0: serial).
+    Int32Grid::Ptr labels = makeBlockLabels<Int32Grid>();
+    auto serial = MLS::fromLabelGrid(*labels, 3, 0);
+    for (const int grain : {1, 4}) {
+        auto parallel = MLS::fromLabelGrid(*labels, 3, grain);
+        EXPECT_EQ(treeDifferences(serial->phi()->tree(), parallel->phi()->tree()), Index64(0));
+        EXPECT_EQ(treeDifferences(serial->labels()->tree(), parallel->labels()->tree()),
+            Index64(0));
+    }
+
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(9.0f, Vec3f(-6.0f, 0.3f, 0.1f), 0.5f);
+    in[2] = tools::createLevelSetSphere<FloatGrid>(8.0f, Vec3f(7.5f, 0.2f, -0.4f), 0.5f);
+    in[3] = tools::createLevelSetSphere<FloatGrid>(6.0f, Vec3f(0.5f, 11.0f, 0.3f), 0.5f);
+    auto s2 = MLS::fromSignedGrids(in, 3, -1);
+    for (const int grain : {1, 4}) {
+        auto p2 = MLS::fromSignedGrids(in, 3, grain);
+        EXPECT_EQ(treeDifferences(s2->phi()->tree(), p2->phi()->tree()), Index64(0));
+        EXPECT_EQ(treeDifferences(s2->labels()->tree(), p2->labels()->tree()), Index64(0));
+    }
+
+    for (const MLS::Ptr& m : {serial, s2}) {
+        for (const int32_t l : m->labelSet()) {
+            for (const int hw : {-1, 2, 5}) {
+                FloatGrid::Ptr a = m->extractSignedDistance(l, hw, 0);
+                FloatGrid::Ptr b = m->extractSignedDistance(l, hw, 1);
+                FloatGrid::Ptr c = m->extractSignedDistance(l, hw, 3);
+                ASSERT_GT(a->activeVoxelCount(), Index64(0));
+                EXPECT_EQ(treeDifferences(a->tree(), b->tree()), Index64(0)) << l << " " << hw;
+                EXPECT_EQ(treeDifferences(a->tree(), c->tree()), Index64(0)) << l << " " << hw;
+            }
+        }
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, ExtractInterrupt)
+{
+    struct Interrupter: public util::NullInterrupter
+    {
+        int calls = 0, starts = 0, ends = 0, fireAt = 3;
+        void start(const char* = nullptr) override { ++starts; }
+        void end() override { ++ends; }
+        bool wasInterrupted(int = -1) override { return ++calls >= fireAt; }
+    };
+    auto m = makeTwoSpheres(1.0);
+    FloatGrid::Ptr full = m->extractSignedDistance(1);
+
+    // never fires: identical result
+    Interrupter quiet;
+    quiet.fireAt = std::numeric_limits<int>::max();
+    FloatGrid::Ptr same = m->extractSignedDistance(1, -1, 1, &quiet);
+    EXPECT_GT(quiet.calls, 0);
+    EXPECT_EQ(quiet.starts, 1);
+    EXPECT_EQ(quiet.ends, 1);
+    EXPECT_EQ(treeDifferences(full->tree(), same->tree()), Index64(0));
+
+    // fires after two Jacobi iterations: still a valid level set grid
+    Interrupter early;
+    FloatGrid::Ptr part = m->extractSignedDistance(1, -1, 1, &early);
+    EXPECT_EQ(early.calls, early.fireAt);
+    EXPECT_EQ(early.ends, 1);
+    EXPECT_EQ(part->getGridClass(), GRID_LEVEL_SET);
+    EXPECT_FLOAT_EQ(part->background(), full->background());
+    const float bg = part->background();
+    for (auto it = part->tree().cbeginValueAll(); it; ++it) {
+        ASSERT_TRUE(std::isfinite(*it));
+        if (it.isValueOn()) ASSERT_LT(std::abs(*it), bg);
+        else ASSERT_EQ(std::abs(*it), bg);
+    }
+    EXPECT_GT(part->activeVoxelCount(), Index64(0));
+    EXPECT_LT(part->activeVoxelCount(), full->activeVoxelCount());
 }
 
 TEST_F(TestLevelSetMultiObject, HolderSignedDistance)
