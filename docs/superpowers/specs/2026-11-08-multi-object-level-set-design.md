@@ -514,11 +514,11 @@ Contouring tests (`TestLevelSetMultiObjectMesh.cc`):
     radius 4·dx, fixed labels) lie inside the cube's swept path at distinct
     (y, z) positions. Label 1 is topology-preserving (FG26_BG6).
     - Every chunk: the cube region has exactly 1 component (26-adjacency), 0
-      enclosed cavities (6-adjacency) and Euler characteristic 2; sphere
+      enclosed cavities (6-adjacency) and region Euler characteristic 1; sphere
       voxels are bit-identical; `validate()` and the partition invariant hold.
     - End: cube centroid moved by the commanded distance ± 2·dx.
     - Control: the same run without protection must change the cube's
-      topology at some chunk (cavities > 0 or χ ≠ 2), proving the test
+      topology at some chunk (cavities > 0 or χ ≠ 1), proving the test
       discriminates.
 
 14. **Efficiency (benchmark, non-gating).** Eight-label vortex state: time

@@ -379,7 +379,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
 
 - [ ] **Step 1: Write failing tests.**
   - `SimplePointTable`: exhaustively over all 2^26 neighbourhoods is too slow — instead check hand cases per connectivity: isolated voxel (not simple), end of a line (simple), middle of a line (not simple), voxel completing a ring/tunnel (not simple), voxel filling a cavity's last hole (not simple), face of a solid block (simple); plus 10^5 random masks checked against a brute-force reference (count fg components among 26-nbrs adjacent to centre and bg 6-components 6-adjacent to centre inside the 3x3x3, i.e. the definition of T_fg/T_bg).
-  - `DigitalTopologyHelper`: solid cube (1,0,2), hollow cube (1,1,4), solid torus (1,0,0), two cubes touching at a corner (1 under 26, 2 under 6).
+  - `DigitalTopologyHelper`: solid cube (1,0,1), hollow cube (1,1,2), solid torus (1,0,0) — euler = χ of the digital region (cubical complex), two cubes touching at a corner (1 under 26, 2 under 6).
   - `TopologyCubeThroughSpheres` exactly per spec §8 test 15 (gates verbatim), including the control run.
 - [ ] **Step 2: Run** `TestLevelSetMultiObject.SimplePoint*:*DigitalTopology*:*TopologyCube*` — FAIL.
 - [ ] **Step 3: Implement** per §4.7: collect proposed changes from projection (do not apply them there when any protected label is involved), apply in 27 passes with `isSimplePoint` evaluated on current labels per protected label; rejected → keep label, φ = 1e-3·dx, add to the freeze mask. Unprotected changes apply as before.
