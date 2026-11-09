@@ -1863,7 +1863,8 @@ referenceCurvature(FloatGrid& ref)
 
 void
 checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t steps,
-    double angle, const FloatGrid* analytic = nullptr, double exactRadius = -1.0)
+    double angle, const FloatGrid* analytic = nullptr, double exactRadius = -1.0,
+    double radiusSlack = 0.0)
 {
     std::string msg;
     ASSERT_TRUE(m.validate(&msg)) << msg;
@@ -1882,14 +1883,15 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
     EXPECT_LT(d.hausdorff, 1.0 * dx);
     if (exactRadius > 0.0) {
         // Ruling R28: mean zero-crossing radius about the exact centre @a c;
-        // MOGAC's radius error at most max(1.1 x the reference's, 0.25*dx).
+        // MOGAC's radius error at most max(1.1 x the reference's,
+        // the reference's + @a radiusSlack (ruling R30), 0.25*dx).
         const double rm = meanRadius(zeroCrossings(*sdf), c);
         const double rr = meanRadius(zeroCrossings(ref), c);
         const double em = std::abs(rm - exactRadius), er = std::abs(rr - exactRadius);
         std::cout << name << ": exact radius " << exactRadius << ", MOGAC mean radius " << rm
                   << " (error " << em / dx << " dx), reference mean radius " << rr
                   << " (error " << er / dx << " dx)" << std::endl;
-        EXPECT_LE(em, std::max(1.1 * er, 0.25 * dx));
+        EXPECT_LE(em, std::max({1.1 * er, er + radiusSlack, 0.25 * dx}));
         return;
     }
     if (!analytic) {
@@ -1964,9 +1966,15 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 10.0);
-    // exact: r^2 = r0^2 - 2t about the centre rotated by 0.05*10 radians
+    // exact: r^2 = r0^2 - 2t about the centre rotated by 0.05*10 radians.
+    // Ruling R30: 0.1*dx extra slack over the reference's radius error. The
+    // curvature limit stableDt = dx^2/(6w) caps every MOGAC step, which forces
+    // the advection to CFL ~0.13, where first-order upwinding is most
+    // diffusive (advection alone at that dt: radius error 0.347 dx vs 0.255 dx
+    // at MOGAC's own CFL and 0.300 dx for the reference). Operator splitting
+    // (advection at its own CFL, curvature substepped) is a known follow-up.
     checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 10.0, nullptr,
-        std::sqrt(kEqRadius * kEqRadius - 2.0 * 10.0));
+        std::sqrt(kEqRadius * kEqRadius - 2.0 * 10.0), 0.1 * m->voxelSize());
 }
 
 

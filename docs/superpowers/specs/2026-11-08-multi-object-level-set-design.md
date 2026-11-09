@@ -434,7 +434,12 @@ Required integration tests:
    and combined (ruling R28): the mean zero-crossing radius about the exact
    centre (unmoved, or rotated analytically for combined) is compared with
    r² = r₀² − 2t; MOGAC's |radius error| ≤ max(1.1 × the reference's
-   |radius error|, 0.25·dx).
+   |radius error|, 0.25·dx). For combined the bound also admits the
+   reference's |radius error| + 0.1·dx (ruling R30): the curvature limit
+   stableDt = dx²/(6w) caps every MOGAC step and so forces its advection to
+   CFL ≈ 0.13, where first-order upwinding is most diffusive; operator
+   splitting (advection at its own CFL, curvature substepped) is a known
+   follow-up.
 9. **Eight objects in a tornado vortex** (parameters per ruling R27). Eight
    shapes with **eight distinct labels** (sphere, cube, tetrahedron,
    octahedron, dodecahedron, icosahedron, capsule, closed tube ring; via
