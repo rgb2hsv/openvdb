@@ -6,8 +6,9 @@
 /// @brief Multi-object level sets: a single unsigned distance grid phi
 /// paired with an integer grid of object labels (MOGAC). This header
 /// currently provides the MultiLevelSet data holder (with its factories
-/// fromLabelGrid and fromSignedGrids) and the second-order label-aware
-/// redistancer MultiLevelSetRedistance.
+/// fromLabelGrid and fromSignedGrids and the exact per-label signed distance
+/// extractSignedDistance) and the second-order label-aware redistancer
+/// MultiLevelSetRedistance.
 
 #ifndef OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
 #define OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
@@ -20,7 +21,7 @@
 #include <openvdb/tree/ValueAccessor.h>
 #include <openvdb/util/NullInterrupter.h>
 #include "Morphology.h"// for dilateActiveValues, erodeActiveValues
-#include "Prune.h"// for pruneInactive
+#include "Prune.h"// for pruneLevelSet
 
 #include <algorithm>
 #include <cmath>
@@ -134,6 +135,25 @@ public:
         const float d = mPhi->tree().getValue(ijk);
         return (mLabels->tree().getValue(ijk) == label) ? -d : d;
     }
+
+    /// @brief Signed distance to the boundary of @a label (spec 5.3), exact
+    /// also near junctions where the raw signedDistance() underestimates.
+    /// @details A voxel is inside if its label (active or not, ruling R7b)
+    /// equals @a label. Seeds are the active phi voxels with a face neighbour
+    /// on the other side of that region; they get the spec 5.1 subcell
+    /// distance computed from phi with only label | not-label crossings, the
+    /// outer layers solve spec 5.2 on |psi|, and the sign is applied last.
+    /// The result is active exactly at the voxels with |psi| < halfWidth*dx
+    /// (the seeds dilated by @a halfWidth; for @a halfWidth up to this
+    /// object's halfWidth() the search is limited to the active band, which
+    /// already contains every such voxel). Inactive values are -/+
+    /// halfWidth*dx by region.
+    /// @param halfWidth band half-width in voxels; -1 uses halfWidth().
+    /// @return a GRID_LEVEL_SET grid with background halfWidth*dx and this
+    /// object's transform; it has no active voxels if @a label has no
+    /// boundary in the band (e.g. it does not occur).
+    /// @throw ValueError if @a halfWidth is not -1 and less than 2.
+    typename FloatGridT::Ptr extractSignedDistance(int32_t label, int halfWidth = -1) const;
 
     /// @brief Sorted distinct non-zero labels over all active voxels.
     std::vector<int32_t> labelSet() const
@@ -364,6 +384,146 @@ struct InsideDiffers
     IsInsideOp inside;
 };
 
+
+/// Marker for voxels not yet reached by the outer-layer solver.
+constexpr float kUnknownDistance = std::numeric_limits<float>::max();
+
+/// Solve sum_i c_i (phi - abar_i)^2 = dx^2 over the sorted upwind set,
+/// dropping terms with phi <= abar_i.
+inline double solveGodunov(double* abar, double* coef, int n, double dx)
+{
+    for (int i = 1; i < n; ++i) { // insertion sort by abar
+        for (int j = i; j > 0 && abar[j] < abar[j - 1]; --j) {
+            std::swap(abar[j], abar[j - 1]);
+            std::swap(coef[j], coef[j - 1]);
+        }
+    }
+    const double h2 = dx * dx;
+    double result = abar[0] + dx / std::sqrt(coef[0]);
+    double A = coef[0], B = coef[0] * abar[0], C = coef[0] * abar[0] * abar[0];
+    for (int k = 1; k < n; ++k) {
+        if (result <= abar[k]) break;
+        A += coef[k];
+        B += coef[k] * abar[k];
+        C += coef[k] * abar[k] * abar[k];
+        // A phi^2 - 2 B phi + (C - h^2) = 0
+        const double disc = B * B - A * (C - h2);
+        if (disc < 0.0) break;
+        result = (B + std::sqrt(disc)) / A;
+    }
+    return result;
+}
+
+/// @brief Outer-layer solver (spec 5.2) on the unsigned distance @a phi.
+/// @details Active voxels of @a phi that are not active in @a seeds are reset
+/// and solve |grad phi| = 1 by parallel Jacobi iteration with the seeds as
+/// Dirichlet data: second-order one-sided upwind differences (Chopp 2001)
+/// where two same-side upwind values are available (the outer one, q2, with
+/// !differs(p, q2) and strictly smaller than the inner one) and first order
+/// otherwise. Inactive neighbours are not used. Iteration stops when
+/// max|delta phi| < @a tolerance, after @a maxIter iterations, or on
+/// interrupt; voxels left unreached get the background of @a phi.
+/// @param differs copied once per task; called as differs(p, q).
+/// @param grainSize TBB grain size in leaves; zero or negative runs serially.
+/// @return the number of Jacobi iterations performed.
+template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp, typename InterruptT>
+int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& differs,
+    double dx, float tolerance, int maxIter, int grainSize, InterruptT* interrupt)
+{
+    using LeafManagerT = tree::LeafManager<FloatTreeT>;
+    using LeafRangeT = typename LeafManagerT::LeafRange;
+    const float bg = phi.background();
+    const bool serial = grainSize <= 0;
+    const Coord* offs = faceOffsets();
+
+    auto forEachLeaf = [&](LeafManagerT& leafs, const auto& op) {
+        auto body = [&](const LeafRangeT& range) {
+            for (auto leafIt = range.begin(); leafIt; ++leafIt) op(leafIt);
+        };
+        if (grainSize > 0) tbb::parallel_for(leafs.leafRange(size_t(grainSize)), body);
+        else body(leafs.leafRange());
+    };
+
+    // Reset non-seed voxels; Jacobi with one aux buffer.
+    LeafManagerT leafs(phi, 1, serial);
+    forEachLeaf(leafs, [&](typename LeafRangeT::Iterator& leafIt) {
+        const auto* mask = seeds.probeConstLeaf(leafIt->origin());
+        for (auto it = leafIt->beginValueOn(); it; ++it) {
+            if (!mask || !mask->isValueOn(it.pos())) it.setValue(kUnknownDistance);
+        }
+    });
+    leafs.syncAllBuffers(serial);
+
+    // One Jacobi iteration: read main buffers, write aux buffer 1; returns
+    // max|delta phi| over updated voxels.
+    auto sweep = [&]() -> float {
+        auto body = [&](const LeafRangeT& range, float maxDelta) {
+            DiffersOp op = differs; // per-task copy (may own value accessors)
+            tree::ValueAccessor<const FloatTreeT> acc(phi);
+            for (auto leafIt = range.begin(); leafIt; ++leafIt) {
+                auto& aux = leafIt.buffer(1);
+                const auto* mask = seeds.probeConstLeaf(leafIt->origin());
+                for (auto it = leafIt->cbeginValueOn(); it; ++it) {
+                    if (mask && mask->isValueOn(it.pos())) continue;
+                    const Coord p = it.getCoord();
+                    const float old = *it;
+                    double abar[3], coef[3];
+                    int n = 0;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        float a = kUnknownDistance, a2 = kUnknownDistance;
+                        for (int side = 0; side < 2; ++side) {
+                            float v;
+                            const Coord q = p + offs[2 * axis + side];
+                            if (!acc.probeValue(q, v) || !(v < a)) continue;
+                            a = v;
+                            // a' must lie on p's side of the interface
+                            const Coord q2 = q + offs[2 * axis + side];
+                            if (!acc.probeValue(q2, a2) || op(p, q2)) a2 = kUnknownDistance;
+                        }
+                        if (a == kUnknownDistance) continue;
+                        if (a2 < a) { // second order (Chopp 2001)
+                            abar[n] = (4.0 * a - a2) / 3.0;
+                            coef[n] = 9.0 / 4.0;
+                        } else {
+                            abar[n] = a;
+                            coef[n] = 1.0;
+                        }
+                        ++n;
+                    }
+                    if (n == 0) { aux.setValue(it.pos(), old); continue; }
+                    const float upd = float(solveGodunov(abar, coef, n, dx));
+                    const float val = std::min(old, upd);
+                    aux.setValue(it.pos(), val);
+                    maxDelta = std::max(maxDelta, old - val);
+                }
+            }
+            return maxDelta;
+        };
+        if (grainSize > 0) {
+            return tbb::parallel_reduce(leafs.leafRange(size_t(grainSize)), 0.0f, body,
+                [](float a, float b) { return std::max(a, b); });
+        }
+        return body(leafs.leafRange(), 0.0f);
+    };
+
+    int iter = 0;
+    while (iter < maxIter) {
+        if (util::wasInterrupted(interrupt)) break;
+        ++iter;
+        const float maxDelta = sweep();
+        leafs.swapLeafBuffer(1, serial);
+        if (maxDelta < tolerance) break;
+    }
+
+    // Unreached voxels (no seed nearby, or interrupted) get the background.
+    forEachLeaf(leafs, [&](typename LeafRangeT::Iterator& leafIt) {
+        for (auto it = leafIt->beginValueOn(); it; ++it) {
+            if (*it == kUnknownDistance) it.setValue(bg);
+        }
+    });
+    return iter;
+}
+
 } // namespace lsmo_internal
 
 
@@ -410,7 +570,6 @@ public:
     using FloatTreeT = typename MultiLevelSetT::FloatGridT::TreeType;
     using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
     using BoolTreeT = typename FloatTreeT::template ValueConverter<bool>::Type;
-    using LeafManagerT = tree::LeafManager<FloatTreeT>;
 
     explicit MultiLevelSetRedistance(MultiLevelSetT& mls, InterruptT* interrupt = nullptr)
         : mMls(mls), mInterrupter(interrupt), mTolerance(float(1e-4 * mls.voxelSize()))
@@ -458,9 +617,7 @@ private:
     {
         FloatTreeT& phi = mMls.phi()->tree();
         const double dx = mMls.voxelSize();
-        const float bg = phi.background();
         const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
-        const bool serial = mGrainSize <= 0;
 
         if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
 
@@ -476,132 +633,12 @@ private:
                 /*writeValues=*/false);
         }
 
-        // 5.2: reset non-seed voxels, then Jacobi with one aux buffer.
-        LeafManagerT leafs(phi, 1, serial);
-        this->forEachLeaf(leafs, [&](typename LeafManagerT::LeafRange::Iterator& leafIt) {
-            const auto* mask = seeds.probeConstLeaf(leafIt->origin());
-            for (auto it = leafIt->beginValueOn(); it; ++it) {
-                if (!mask || !mask->isValueOn(it.pos())) it.setValue(kUnknown);
-            }
-        });
-        leafs.syncAllBuffers(serial);
-
-        int iter = 0;
-        while (iter < maxIter) {
-            if (util::wasInterrupted(mInterrupter)) break;
-            ++iter;
-            const float maxDelta = this->sweep(leafs, seeds, dx);
-            leafs.swapLeafBuffer(1, serial);
-            if (maxDelta < mTolerance) break;
-        }
-
-        // Unreached voxels (no seed nearby, or interrupted) get the background.
-        this->forEachLeaf(leafs, [&](typename LeafManagerT::LeafRange::Iterator& leafIt) {
-            for (auto it = leafIt->beginValueOn(); it; ++it) {
-                if (*it == kUnknown) it.setValue(bg);
-            }
-        });
+        // 5.2: outer layers
+        const int iter = lsmo_internal::solveOuterLayers(phi, seeds, differs, dx,
+            mTolerance, maxIter, mGrainSize, mInterrupter);
 
         if (mInterrupter) mInterrupter->end();
         return iter;
-    }
-
-    static constexpr float kUnknown = std::numeric_limits<float>::max();
-
-    template<typename OpT>
-    void forEachLeaf(LeafManagerT& leafs, const OpT& op) const
-    {
-        auto body = [&](const typename LeafManagerT::LeafRange& range) {
-            for (auto leafIt = range.begin(); leafIt; ++leafIt) op(leafIt);
-        };
-        if (mGrainSize > 0) tbb::parallel_for(leafs.leafRange(size_t(mGrainSize)), body);
-        else body(leafs.leafRange());
-    }
-
-    /// One Jacobi iteration: read main buffers, write aux buffer 1.
-    /// @return max|delta phi| over updated voxels.
-    float sweep(LeafManagerT& leafs, const BoolTreeT& seeds, double dx) const
-    {
-        const FloatTreeT& phi = leafs.tree();
-        const LabelTreeT& labels = mMls.labels()->tree();
-        const Coord* offs = lsmo_internal::faceOffsets();
-
-        auto body = [&](const typename LeafManagerT::LeafRange& range, float maxDelta) {
-            tree::ValueAccessor<const FloatTreeT> acc(phi);
-            tree::ValueAccessor<const LabelTreeT> labAcc(labels);
-            for (auto leafIt = range.begin(); leafIt; ++leafIt) {
-                auto& aux = leafIt.buffer(1);
-                const auto* mask = seeds.probeConstLeaf(leafIt->origin());
-                for (auto it = leafIt->cbeginValueOn(); it; ++it) {
-                    if (mask && mask->isValueOn(it.pos())) continue;
-                    const Coord p = it.getCoord();
-                    const float old = *it;
-                    const auto label = labAcc.getValue(p);
-                    double abar[3], coef[3];
-                    int n = 0;
-                    for (int axis = 0; axis < 3; ++axis) {
-                        float a = kUnknown, a2 = kUnknown;
-                        for (int side = 0; side < 2; ++side) {
-                            float v;
-                            const Coord q = p + offs[2 * axis + side];
-                            if (!acc.probeValue(q, v) || !(v < a)) continue;
-                            a = v;
-                            // a' must lie on p's side of the interface (same label)
-                            const Coord q2 = q + offs[2 * axis + side];
-                            if (!acc.probeValue(q2, a2) || labAcc.getValue(q2) != label) {
-                                a2 = kUnknown;
-                            }
-                        }
-                        if (a == kUnknown) continue;
-                        if (a2 < a) { // second order (Chopp 2001)
-                            abar[n] = (4.0 * a - a2) / 3.0;
-                            coef[n] = 9.0 / 4.0;
-                        } else {
-                            abar[n] = a;
-                            coef[n] = 1.0;
-                        }
-                        ++n;
-                    }
-                    if (n == 0) { aux.setValue(it.pos(), old); continue; }
-                    const float upd = float(solveGodunov(abar, coef, n, dx));
-                    const float val = std::min(old, upd);
-                    aux.setValue(it.pos(), val);
-                    maxDelta = std::max(maxDelta, old - val);
-                }
-            }
-            return maxDelta;
-        };
-        if (mGrainSize > 0) {
-            return tbb::parallel_reduce(leafs.leafRange(size_t(mGrainSize)), 0.0f, body,
-                [](float a, float b) { return std::max(a, b); });
-        }
-        return body(leafs.leafRange(), 0.0f);
-    }
-
-    /// Solve sum_i c_i (phi - abar_i)^2 = dx^2 over the sorted upwind set,
-    /// dropping terms with phi <= abar_i.
-    static double solveGodunov(double* abar, double* coef, int n, double dx)
-    {
-        for (int i = 1; i < n; ++i) { // insertion sort by abar
-            for (int j = i; j > 0 && abar[j] < abar[j - 1]; --j) {
-                std::swap(abar[j], abar[j - 1]);
-                std::swap(coef[j], coef[j - 1]);
-            }
-        }
-        const double h2 = dx * dx;
-        double result = abar[0] + dx / std::sqrt(coef[0]);
-        double A = coef[0], B = coef[0] * abar[0], C = coef[0] * abar[0] * abar[0];
-        for (int k = 1; k < n; ++k) {
-            if (result <= abar[k]) break;
-            A += coef[k];
-            B += coef[k] * abar[k];
-            C += coef[k] * abar[k] * abar[k];
-            // A phi^2 - 2 B phi + (C - h^2) = 0
-            const double disc = B * B - A * (C - h2);
-            if (disc < 0.0) break;
-            result = (B + std::sqrt(disc)) / A;
-        }
-        return result;
     }
 
     MultiLevelSetT& mMls;
@@ -615,6 +652,32 @@ private:
 
 
 namespace lsmo_internal {
+
+/// @brief Predicate for MultiLevelSet::extractSignedDistance: membership in
+/// the region {L == label} differs between p and q (labels read with
+/// getValue, so inactive labels count). With @a requireActive, p must also
+/// be an active voxel of @a phi. Copied once per task.
+template<typename FloatTreeT, typename LabelTreeT>
+struct LabelRegionDiffers
+{
+    using LabelT = typename LabelTreeT::ValueType;
+    LabelRegionDiffers(const LabelTreeT& labels, const FloatTreeT& phi, LabelT l, bool active)
+        : lab(labels), phiAcc(phi), label(l), requireActive(active) {}
+    LabelRegionDiffers(const LabelRegionDiffers& o)
+        : lab(o.lab.tree()), phiAcc(o.phiAcc.tree()), label(o.label)
+        , requireActive(o.requireActive) {}
+
+    bool operator()(const Coord& p, const Coord& q)
+    {
+        if (requireActive && !phiAcc.isValueOn(p)) return false;
+        return (lab.getValue(p) == label) != (lab.getValue(q) == label);
+    }
+
+    tree::ValueAccessor<const LabelTreeT> lab;
+    tree::ValueAccessor<const FloatTreeT> phiAcc;
+    LabelT label;
+    bool requireActive;
+};
 
 /// @brief Factory sampler for MultiLevelSet::fromLabelGrid: the label is the
 /// input value; phi is 0.5*dx at voxels with a face neighbour of a different
@@ -797,6 +860,101 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     }
     mls->pruneInactive();
     return mls;
+}
+
+
+template<typename FloatTreeT, typename LabelTreeT>
+typename MultiLevelSet<FloatTreeT, LabelTreeT>::FloatGridT::Ptr
+MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int halfWidth) const
+{
+    if (halfWidth == -1) halfWidth = mHalfWidth;
+    if (halfWidth < 2) {
+        OPENVDB_THROW(ValueError, "MultiLevelSet::extractSignedDistance: halfWidth must be at least 2");
+    }
+    using RegionDiffers = lsmo_internal::LabelRegionDiffers<FloatTreeT, LabelTreeT>;
+    using BoolLeafRangeT = typename tree::LeafManager<BoolTreeT>::LeafRange;
+    using LeafRangeT = typename tree::LeafManager<FloatTreeT>::LeafRange;
+    const FloatTreeT& phi = mPhi->tree();
+    const LabelTreeT& labels = mLabels->tree();
+    const double dx = this->voxelSize();
+    const float bg = float(halfWidth * dx);
+    const int grainSize = 1;
+    const LabelT inLabel = LabelT(label);
+    const Coord* offs = lsmo_internal::faceOffsets();
+    // Seeds must be active in phi (the pair holds distances only there);
+    // the side test of the outer-layer solver is pure region membership.
+    const RegionDiffers seedOp(labels, phi, inLabel, /*requireActive=*/true);
+    const RegionDiffers sideOp(labels, phi, inLabel, /*requireActive=*/false);
+
+    // 1. label | not-label interface voxels of the band, dilated by halfWidth
+    BoolTreeT band(phi, false, TopologyCopy());
+    band.voxelizeActiveTiles();
+    {
+        tree::LeafManager<BoolTreeT> leafs(band);
+        tbb::parallel_for(leafs.leafRange(grainSize), [&](const BoolLeafRangeT& range) {
+            RegionDiffers op(seedOp);
+            for (auto leaf = range.begin(); leaf; ++leaf) {
+                for (auto it = leaf->beginValueOn(); it; ++it) {
+                    const Coord p = it.getCoord();
+                    bool seed = false;
+                    for (int f = 0; f < 6 && !seed; ++f) seed = op(p, p + offs[f]);
+                    if (!seed) leaf->setValueOff(it.pos());
+                }
+            }
+        });
+    }
+    tools::dilateActiveValues(band, halfWidth, NN_FACE_EDGE_VERTEX, IGNORE_TILES);
+    if (halfWidth <= mHalfWidth) band.topologyIntersection(phi);
+
+    // 2. output tree over the band, initialised with phi
+    typename FloatTreeT::Ptr out(new FloatTreeT(band, bg, TopologyCopy()));
+    {
+        tree::LeafManager<FloatTreeT> leafs(*out);
+        tbb::parallel_for(leafs.leafRange(grainSize), [&](const LeafRangeT& range) {
+            tree::ValueAccessor<const FloatTreeT> acc(phi);
+            for (auto leaf = range.begin(); leaf; ++leaf) {
+                for (auto it = leaf->beginValueOn(); it; ++it) it.setValue(acc.getValue(it.getCoord()));
+            }
+        });
+    }
+
+    // 3. seed with label | not-label crossings (5.1), solve |psi| (5.2)
+    BoolTreeT seeds(false);
+    lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize);
+    const int maxIter = int(std::ceil(halfWidth * std::sqrt(3.0))) + 2;
+    lsmo_internal::solveOuterLayers(*out, seeds, sideOp, dx, float(1e-4 * dx), maxIter,
+        grainSize, static_cast<util::NullInterrupter*>(nullptr));
+
+    // 4. sign by region, trim to |psi| < halfWidth*dx, inactive values -/+bg
+    {
+        tree::LeafManager<FloatTreeT> leafs(*out);
+        tbb::parallel_for(leafs.leafRange(grainSize), [&](const LeafRangeT& range) {
+            tree::ValueAccessor<const LabelTreeT> lab(labels);
+            for (auto leaf = range.begin(); leaf; ++leaf) {
+                for (Index i = 0; i < FloatTreeT::LeafNodeType::NUM_VALUES; ++i) {
+                    const bool inside = lab.getValue(leaf->offsetToGlobalCoord(i)) == inLabel;
+                    const float v = leaf->getValue(i);
+                    if (leaf->isValueOn(i) && v < bg) {
+                        leaf->setValueOnly(i, inside ? -v : v);
+                    } else {
+                        leaf->setValueOff(i, inside ? -bg : bg);
+                    }
+                }
+            }
+        });
+    }
+    {
+        tree::ValueAccessor<const LabelTreeT> lab(labels);
+        auto it = out->beginValueOff();
+        it.setMaxDepth(FloatTreeT::ValueOffIter::LEAF_DEPTH - 1); // tiles only
+        for (; it; ++it) it.setValue(lab.getValue(it.getCoord()) == inLabel ? -bg : bg);
+    }
+    tools::pruneLevelSet(*out, /*threaded=*/true, grainSize);
+
+    typename FloatGridT::Ptr grid = FloatGridT::create(out);
+    grid->setTransform(mPhi->transform().copy());
+    grid->setGridClass(GRID_LEVEL_SET);
+    return grid;
 }
 
 

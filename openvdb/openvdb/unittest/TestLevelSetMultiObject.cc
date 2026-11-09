@@ -566,15 +566,31 @@ expectNoSpuriousSeeds(const MLS& m, std::function<double(Vec3d)> distToInterface
 struct TwoSphereErrors { double maxIface[2], rms[2]; };
 
 // Spheres of radius 10*dx at (-+15*dx, 0, 0), labels 1 and 2, via
-// fromSignedGrids; raw signedDistance errors near each sphere, in dx.
-TwoSphereErrors
-twoSphereRoundTrip(double dx)
+// fromSignedGrids.
+MLS::Ptr
+makeTwoSpheres(double dx)
 {
     const double r = 10.0 * dx, cx = 15.0 * dx;
     std::map<int32_t, FloatGrid::ConstPtr> in;
     in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(-cx), 0, 0), float(dx));
     in[2] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(cx), 0, 0), float(dx));
-    auto m = MLS::fromSignedGrids(in);
+    return MLS::fromSignedGrids(in);
+}
+
+// Analytic signed distance of two-sphere label @a label (1 or 2), world units.
+std::function<double(Vec3d)>
+twoSphereDistance(double dx, int label)
+{
+    const double r = 10.0 * dx, c = (label == 2 ? 15.0 : -15.0) * dx;
+    return [r, c](Vec3d w) { return (w - Vec3d(c, 0, 0)).length() - r; };
+}
+
+// Raw signedDistance errors near each sphere of makeTwoSpheres, in dx.
+TwoSphereErrors
+twoSphereRoundTrip(double dx)
+{
+    const double r = 10.0 * dx, cx = 15.0 * dx;
+    auto m = makeTwoSpheres(dx);
     EXPECT_TRUE(m);
     if (!m) return TwoSphereErrors{};
     std::string msg;
@@ -729,4 +745,223 @@ TEST_F(TestLevelSetMultiObject, FromSignedGridsThrows)
     in.clear(); in[1] = a; in[2] = b;
     EXPECT_THROW(MLS::fromSignedGrids(in, 1), ValueError); // halfWidth < 2
     EXPECT_NO_THROW(MLS::fromSignedGrids(in, 2));
+}
+
+namespace {
+
+// Three labels meeting at 120 degrees along a z-parallel junction axis
+// through index (0.37, -0.21): label l (1..3) owns the polar angles
+// [theta0 + (l-1)*120deg, theta0 + l*120deg) about the axis, theta0 = 10deg.
+struct TripleJunction
+{
+    double dx = 0.5;
+    double x0 = 0.37, y0 = -0.21;            // axis, index space
+    double theta0 = 10.0 * M_PI / 180.0;
+
+    Vec2d local(const Vec3d& w) const { return Vec2d(w[0] / dx - x0, w[1] / dx - y0); }
+    Vec2d ray(int k) const
+    {
+        const double a = theta0 + k * 2.0 * M_PI / 3.0;
+        return Vec2d(std::cos(a), std::sin(a));
+    }
+    int sector(const Vec3d& w) const
+    {
+        const Vec2d p = local(w);
+        double a = std::atan2(p[1], p[0]) - theta0;
+        while (a < 0.0) a += 2.0 * M_PI;
+        while (a >= 2.0 * M_PI) a -= 2.0 * M_PI;
+        return std::min(3, int(a / (2.0 * M_PI / 3.0)) + 1);
+    }
+    // Distance from p to the ray {t*u, t >= 0} (index units).
+    static double rayDist(const Vec2d& p, const Vec2d& u)
+    {
+        const double t = p.dot(u);
+        return t >= 0.0 ? (p - u * t).length() : p.length();
+    }
+    // Analytic signed distance to sector @a l, world units.
+    double signedDist(const Vec3d& w, int l) const
+    {
+        const Vec2d p = local(w);
+        const double d = std::min(rayDist(p, ray(l - 1)), rayDist(p, ray(l)));
+        return dx * (sector(w) == l ? -d : d);
+    }
+    double axisDist(const Vec3d& w) const { return local(w).length(); } // index units
+
+    // The pair built directly from analytic data: phi = distance to the
+    // voxel's own sector boundary, active where phi < 3*dx inside
+    // [-20, 19]^3, and a one-voxel inactive shell holding the labels
+    // (ruling R7b).
+    MLS::Ptr build() const
+    {
+        const int halfWidth = 3;
+        auto xform = math::Transform::createLinearTransform(dx);
+        FloatGrid::Ptr phi = FloatGrid::create(float(halfWidth * dx));
+        Int32Grid::Ptr lab = Int32Grid::create(0);
+        phi->setTransform(xform);
+        lab->setTransform(xform->copy());
+        auto pa = phi->getAccessor();
+        auto la = lab->getAccessor();
+        for (int i = -21; i <= 20; ++i)
+            for (int j = -21; j <= 20; ++j)
+                for (int k = -21; k <= 20; ++k) {
+                    const Coord c(i, j, k);
+                    const Vec3d w = xform->indexToWorld(c);
+                    const int l = sector(w);
+                    const double d = std::abs(signedDist(w, l));
+                    const bool inBox = std::max({std::abs(i + 0.5), std::abs(j + 0.5),
+                        std::abs(k + 0.5)}) < 20.0;
+                    if (inBox && d < halfWidth * dx) {
+                        pa.setValue(c, float(d));
+                        la.setValue(c, l);
+                    } else {
+                        pa.touchLeaf(c);
+                        la.setValueOff(c, l);
+                    }
+                }
+        return MLS::Ptr(new MLS(phi, lab, halfWidth));
+    }
+};
+
+void
+expectLevelSetGrid(const FloatGrid& g, const MLS& m, int halfWidth)
+{
+    EXPECT_EQ(g.getGridClass(), GRID_LEVEL_SET);
+    EXPECT_FLOAT_EQ(g.background(), float(halfWidth * m.voxelSize()));
+    EXPECT_EQ(g.transform(), m.phi()->transform());
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, TripleJunction)
+{
+    const TripleJunction tj;
+    auto m = tj.build();
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3}));
+    const double dx = tj.dx;
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+
+    for (int l = 1; l <= 3; ++l) {
+        SCOPED_TRACE("label " + std::to_string(l));
+        const auto analytic = [&tj, l](Vec3d w) { return tj.signedDist(w, l); };
+
+        FloatGrid::Ptr g = m->extractSignedDistance(l);
+        ASSERT_TRUE(g);
+        expectLevelSetGrid(*g, *m, 3);
+
+        const double maxErr = maxInterfaceError(*g, analytic);
+        const double rms = rmsBandError(*g, analytic);
+
+        // Interface-layer error binned by distance to the junction axis.
+        const double edges[4] = {1.0, 2.0, 4.0, 1e9};
+        double binMax[4] = {0, 0, 0, 0};
+        Index64 binN[4] = {0, 0, 0, 0};
+        tree::ValueAccessor<const FloatTree> acc(g->tree());
+        for (auto it = g->tree().cbeginValueOn(); it; ++it) {
+            const Coord p = it.getCoord();
+            bool iface = false;
+            for (int f = 0; f < 6 && !iface; ++f) {
+                float v;
+                if (acc.probeValue(p + offs[f], v)) iface = (v < 0.0f) != (*it < 0.0f);
+            }
+            if (!iface) continue;
+            const Vec3d w = g->indexToWorld(p);
+            int b = 0;
+            while (tj.axisDist(w) >= edges[b]) ++b;
+            ++binN[b];
+            binMax[b] = std::max(binMax[b], std::abs(*it - analytic(w)) / dx);
+        }
+        std::cout << "TripleJunction label " << l << ": max interface error " << maxErr
+            << " dx, RMS band error " << rms << " dx; interface max by axis distance"
+            << " [<1: " << binMax[0] << " (" << binN[0] << ")"
+            << ", 1-2: " << binMax[1] << " (" << binN[1] << ")"
+            << ", 2-4: " << binMax[2] << " (" << binN[2] << ")"
+            << ", >4: " << binMax[3] << " (" << binN[3] << ")]" << std::endl;
+        EXPECT_LT(maxErr, 0.05);
+        EXPECT_LT(rms, 0.1);
+
+        // Every voxel within halfWidth of the label boundary is in the band
+        // (checked 3+ voxels away from the x/y faces of the fixture box,
+        // beyond which the boundary's nearest point may lie outside the
+        // truncated band).
+        for (auto it = g->tree().cbeginValueOn(); it; ++it) EXPECT_LT(std::abs(*it), 3.0 * dx);
+        Index64 missing = 0;
+        for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+            const Coord c = it.getCoord();
+            if (std::max(std::abs(c[0] + 0.5), std::abs(c[1] + 0.5)) > 16.5) continue;
+            const Vec3d w = m->phi()->indexToWorld(c);
+            if (std::abs(analytic(w)) < 2.5 * dx && !g->tree().isValueOn(c)) ++missing;
+        }
+        EXPECT_EQ(missing, Index64(0));
+
+        // Regression guard (spec 5.3): raw +-phi underestimates psi_l
+        // outside l near the junction.
+        auto raw = rawSignedGrid(*m, l, [&tj, l](Vec3d w) { return tj.sector(w) != l; });
+        double maxUnder = 0.0;
+        for (auto it = raw->tree().cbeginValueOn(); it; ++it) {
+            const Vec3d w = raw->indexToWorld(it.getCoord());
+            maxUnder = std::max(maxUnder, (analytic(w) - *it) / dx);
+        }
+        std::cout << "TripleJunction label " << l << ": raw max underestimate outside "
+            << maxUnder << " dx" << std::endl;
+        EXPECT_GT(maxUnder, 0.2);
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, ExtractMatchesRoundTrip)
+{
+    const double dx = 1.0;
+    auto m = makeTwoSpheres(dx);
+    ASSERT_TRUE(m);
+    for (int l = 1; l <= 2; ++l) {
+        SCOPED_TRACE("label " + std::to_string(l));
+        const auto analytic = twoSphereDistance(dx, l);
+        auto raw = rawSignedGrid(*m, l, [l](Vec3d w) { return l == 2 ? w[0] > 0.0 : w[0] < 0.0; });
+        const double rawMax = maxInterfaceError(*raw, analytic);
+        const double rawRms = rmsBandError(*raw, analytic);
+
+        FloatGrid::Ptr g = m->extractSignedDistance(l);
+        ASSERT_TRUE(g);
+        expectLevelSetGrid(*g, *m, 3);
+        const double extMax = maxInterfaceError(*g, analytic);
+        const double extRms = rmsBandError(*g, analytic);
+        std::cout << "ExtractMatchesRoundTrip label " << l << ": max interface error raw "
+            << rawMax << " dx, extracted " << extMax << " dx; RMS raw " << rawRms
+            << " dx, extracted " << extRms << " dx" << std::endl;
+        EXPECT_LE(extMax, rawMax + 1e-4);
+        EXPECT_LE(extRms, rawRms + 1e-4);
+        // the sign is right everywhere and deep values have the right sign
+        for (auto it = g->tree().cbeginValueOn(); it; ++it) {
+            const Vec3d w = g->indexToWorld(it.getCoord());
+            if (std::abs(analytic(w)) > 0.5 * dx) EXPECT_EQ(*it < 0.0f, analytic(w) < 0.0);
+        }
+        EXPECT_LT(g->tree().getValue(g->transform().worldToIndexCellCentered(
+            Vec3d(l == 2 ? 15.0 : -15.0, 0, 0))), 0.0f);
+        EXPECT_GT(g->tree().getValue(Coord(0, 0, 0)), 0.0f);
+
+        // A wider band than the pair's is dilated and solved.
+        FloatGrid::Ptr wide = m->extractSignedDistance(l, 5);
+        ASSERT_TRUE(wide);
+        expectLevelSetGrid(*wide, *m, 5);
+        EXPECT_GT(wide->activeVoxelCount(), g->activeVoxelCount());
+        for (auto it = wide->tree().cbeginValueOn(); it; ++it) EXPECT_LT(std::abs(*it), 5.0 * dx);
+        const double wideRms = rmsBandError(*wide, analytic);
+        std::cout << "ExtractMatchesRoundTrip label " << l << ": halfWidth 5 RMS "
+            << wideRms << " dx" << std::endl;
+        EXPECT_LT(wideRms, 0.1);
+    }
+    EXPECT_THROW(m->extractSignedDistance(1, 1), ValueError);
+}
+
+TEST_F(TestLevelSetMultiObject, ExtractAbsentLabel)
+{
+    auto m = makeTwoSpheres(0.5);
+    ASSERT_TRUE(m);
+    FloatGrid::Ptr g = m->extractSignedDistance(99);
+    ASSERT_TRUE(g);
+    expectLevelSetGrid(*g, *m, 3);
+    EXPECT_EQ(g->activeVoxelCount(), Index64(0));
+    EXPECT_GT(g->background(), 0.0f);
+    EXPECT_GT(g->tree().getValue(Coord(-30, 0, 0)), 0.0f);
 }
