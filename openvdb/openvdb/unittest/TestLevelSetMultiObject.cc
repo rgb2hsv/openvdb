@@ -1863,7 +1863,7 @@ referenceCurvature(FloatGrid& ref)
 
 void
 checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t steps,
-    double angle, const FloatGrid* analytic = nullptr)
+    double angle, const FloatGrid* analytic = nullptr, double exactRadius = -1.0)
 {
     std::string msg;
     ASSERT_TRUE(m.validate(&msg)) << msg;
@@ -1880,6 +1880,18 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
               << "%), sign-count " << d.symDiffSign << " (" << 100.0 * d.symDiffSign / vol
               << "%), Hausdorff " << d.hausdorff / dx << " dx" << std::endl;
     EXPECT_LT(d.hausdorff, 1.0 * dx);
+    if (exactRadius > 0.0) {
+        // Ruling R28: mean zero-crossing radius about the exact centre @a c;
+        // MOGAC's radius error at most max(1.1 x the reference's, 0.25*dx).
+        const double rm = meanRadius(zeroCrossings(*sdf), c);
+        const double rr = meanRadius(zeroCrossings(ref), c);
+        const double em = std::abs(rm - exactRadius), er = std::abs(rr - exactRadius);
+        std::cout << name << ": exact radius " << exactRadius << ", MOGAC mean radius " << rm
+                  << " (error " << em / dx << " dx), reference mean radius " << rr
+                  << " (error " << er / dx << " dx)" << std::endl;
+        EXPECT_LE(em, std::max(1.1 * er, 0.25 * dx));
+        return;
+    }
     if (!analytic) {
         EXPECT_LT(d.symDiff, 0.01 * vol);
         return;
@@ -1928,7 +1940,9 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 20.0);
-    checkEquivalence("SingleObjectCurvature", *m, *ref, steps, 0.0);
+    // exact: r^2 = r0^2 - 2t at the unmoved centre
+    checkEquivalence("SingleObjectCurvature", *m, *ref, steps, 0.0, nullptr,
+        std::sqrt(kEqRadius * kEqRadius - 2.0 * 20.0));
 }
 
 TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
@@ -1950,7 +1964,9 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 10.0);
-    checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 10.0);
+    // exact: r^2 = r0^2 - 2t about the centre rotated by 0.05*10 radians
+    checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 10.0, nullptr,
+        std::sqrt(kEqRadius * kEqRadius - 2.0 * 10.0));
 }
 
 

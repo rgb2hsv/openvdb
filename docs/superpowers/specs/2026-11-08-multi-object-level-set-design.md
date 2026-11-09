@@ -426,11 +426,15 @@ Required integration tests:
      iterations matched to the same total time;
    - combined advection + curvature.
    Compare `extractSignedDistance(1)` against the reference grid: zero-set
-   Hausdorff distance < 1·dx in every case. Curvature only and combined:
-   symmetric difference volume < 1% of object volume. Advection only (ruling
-   R25; both first-order schemes diffuse by different amounts): MOGAC's
-   symmetric difference against the exact (rotated) solution is at most
-   1.1 × the reference's symmetric difference against it.
+   Hausdorff distance < 1·dx in every case. Both methods are compared with
+   the exact solution rather than with each other at 1%. Advection only
+   (ruling R25; both first-order schemes diffuse by different amounts):
+   MOGAC's symmetric difference against the exact (rotated) solution is at
+   most 1.1 × the reference's symmetric difference against it. Curvature only
+   and combined (ruling R28): the mean zero-crossing radius about the exact
+   centre (unmoved, or rotated analytically for combined) is compared with
+   r² = r₀² − 2t; MOGAC's |radius error| ≤ max(1.1 × the reference's
+   |radius error|, 0.25·dx).
 9. **Eight objects in a tornado vortex** (parameters per ruling R27). Eight
    shapes with **eight distinct labels** (sphere, cube, tetrahedron,
    octahedron, dodecahedron, icosahedron, capsule, closed tube ring; via
