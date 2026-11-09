@@ -117,8 +117,14 @@ struct SpeedFunctor {
     float operator()(const Coord& ijk, int32_t label, const LabelAwareStencil<...>& s) const;
     bool  isFixed(int32_t label) const;   // speed forced to 0 (walls, background)
     bool  isActive(int32_t label) const;  // false → constant expansion speed
-    float maxSpeedHint() const;           // optional; <0 if unknown
+    float stableDt(float dx) const;       // extra stability bound (e.g. dx²/(6w)
+                                          // for curvature); +inf if none
 };
+
+Units: ψ, φ and speeds are world space; dt is world time.
+dt = min(maxDt, cfl·dx / max|F|, speed.stableDt(dx)). Curvature uses
+κ = (k₁+k₂)/2, matching `math::CurvatureStencil::meanCurvatureNormGrad`
+and wedge.
 ```
 
 Label 0 is always fixed regardless of `isFixed`.
@@ -144,8 +150,7 @@ Reproduces wedge's force model:
 The evolver.
 
 - `LevelSetMultiObject(MultiLevelSetT&, const SpeedT&, InterruptT* = nullptr)`
-- `float step(float maxDt)` — one Euler step, returns dt used (index-space
-  time units scaled by dx).
+- `float step(float maxDt)` — one Euler step, returns dt used (world time).
 - `size_t advect(double t0, double t1)` — steps until t1; returns step count.
   Checks interrupter each step; on interrupt returns with valid state.
 - Setters: `setCFL(float = 0.999)`, `setClampSpeed(bool)`, `setGrainSize(int)`,
@@ -181,7 +186,8 @@ Forward Euler. All reads from time-n main buffers, writes to aux buffers.
    convention, i.e. ψ of the *other* labels grows).
 2. **Speeds.** F_l = `speed(ijk, l, stencil)` per (voxel, candidate). Stored per
    leaf in a compact candidate list (≤ 7 entries per voxel).
-3. **CFL.** dt = min(maxDt, cfl·dx / max|F|) via `tbb::parallel_reduce`.
+3. **CFL.** dt = min(maxDt, cfl·dx / max|F|, speed.stableDt(dx)) via
+   `tbb::parallel_reduce`.
    With clampSpeed, F is clamped to [−1, 1] and dt = maxDt.
 4. **Two-smallest projection.** v_l = ψ_l + dt·F_l; label = argmin (ties →
    smaller label); φ = |(v₁ − v₂)/2|, or |v₁| with a single candidate.
@@ -362,7 +368,8 @@ Analytic / unit tests:
    pairwise disjoint (up to 1e-3·dx) and their union with the background
    region covers the band (no gaps).
 5. **Motion sanity.** Constant pressure grows a sphere by ∫F dt (± 0.5·dx);
-   mean-curvature flow follows r² = r₀² − 4t (3D, within tolerance); uniform
+   mean-curvature flow with κ = (k₁+k₂)/2 and weight w follows
+   r² = r₀² − 2·w·t (3D, world units, within tolerance); uniform
    advection translates a sphere.
 6. **Fixed labels.** A fixed label's voxels are bit-identical after N steps.
 7. **Band maintenance.** Topology equality after dilate/erode; band width never
