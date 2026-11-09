@@ -16,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1227,4 +1228,379 @@ TEST_F(TestLevelSetMultiObject, ForcesMissingGrid)
     Forces f;
     EXPECT_THROW(f.setPressure(nullptr, 1.0f), ValueError);
     EXPECT_THROW(f.setAdvection(nullptr, 1.0f), ValueError);
+}
+
+
+////////////////////////////////////////
+// Evolver (spec section 4, tests 4-7)
+
+namespace {
+
+// dpsi/dt = s for every non-fixed label (unit normal speed where |grad psi| = 1).
+struct ConstantSpeed
+{
+    float s = 0.0f;
+    std::set<int32_t> fixed;
+    float operator()(const Coord&, int32_t, const Stencil&) const { return s; }
+    bool isFixed(int32_t l) const { return l != 0 && fixed.count(l) != 0; }
+    bool isActive(int32_t) const { return true; }
+    float stableDt(float) const { return std::numeric_limits<float>::infinity(); }
+};
+
+// Per-label constant dpsi/dt drawn once from a seeded generator in [-1, 1].
+struct RandomSpeed
+{
+    std::map<int32_t, float> speeds;
+    RandomSpeed(const std::vector<int32_t>& labels, unsigned seed)
+    {
+        std::mt19937 gen(seed);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (int32_t l : labels) speeds[l] = dist(gen);
+    }
+    float operator()(const Coord&, int32_t l, const Stencil&) const
+    {
+        auto it = speeds.find(l);
+        return it == speeds.end() ? 0.0f : it->second;
+    }
+    bool isFixed(int32_t) const { return false; }
+    bool isActive(int32_t) const { return true; }
+    float stableDt(float) const { return std::numeric_limits<float>::infinity(); }
+};
+
+// wasInterrupted() returns true from its third call on.
+struct CountingInterrupter: public util::NullInterrupter
+{
+    int calls = 0;
+    bool wasInterrupted(int = -1) override { return ++calls >= 3; }
+};
+
+// Single sphere of label 1 via fromSignedGrids.
+MLS::Ptr
+makeSphere(double r, const Vec3d& c = Vec3d(0.0), double dx = 1.0)
+{
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(c), float(dx));
+    return MLS::fromSignedGrids(in);
+}
+
+// Zero crossings of a signed grid along active +x/+y/+z voxel edges (world).
+std::vector<Vec3d>
+zeroCrossings(const FloatGrid& sdf)
+{
+    std::vector<Vec3d> pts;
+    tree::ValueAccessor<const FloatTree> acc(sdf.tree());
+    for (auto it = sdf.tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        const float a = *it;
+        for (int axis = 0; axis < 3; ++axis) {
+            Coord q = p;
+            q[axis] += 1;
+            float b;
+            if (!acc.probeValue(q, b) || ((a < 0.0f) == (b < 0.0f))) continue;
+            const double t = double(a) / (double(a) - double(b));
+            pts.push_back(sdf.indexToWorld(p.asVec3d() + (q.asVec3d() - p.asVec3d()) * t));
+        }
+    }
+    return pts;
+}
+
+double
+meanRadius(const std::vector<Vec3d>& pts, const Vec3d& c)
+{
+    double sum = 0.0;
+    for (const Vec3d& p : pts) sum += (p - c).length();
+    return pts.empty() ? 0.0 : sum / double(pts.size());
+}
+
+Vec3d
+centroid(const std::vector<Vec3d>& pts)
+{
+    Vec3d sum(0.0);
+    for (const Vec3d& p : pts) sum += p;
+    return pts.empty() ? sum : sum / double(pts.size());
+}
+
+// Every active voxel has a voxel of its own label (active or not) among its
+// 26 neighbours.
+Index64
+countOrphans(const MLS& m)
+{
+    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    Index64 n = 0;
+    for (auto it = m.labels()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        bool found = false;
+        for (int i = -1; i <= 1 && !found; ++i)
+            for (int j = -1; j <= 1 && !found; ++j)
+                for (int k = -1; k <= 1 && !found; ++k) {
+                    if (i == 0 && j == 0 && k == 0) continue;
+                    found = lab.getValue(p.offsetBy(i, j, k)) == *it;
+                }
+        if (!found) ++n;
+    }
+    return n;
+}
+
+float
+maxActivePhi(const MLS& m)
+{
+    float mx = 0.0f;
+    for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) mx = std::max(mx, *it);
+    return mx;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, PartitionInvariant)
+{
+    // 4 labels in a 32^3 checker of 8^3 blocks, background label 0 outside.
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (int i = 0; i < 32; ++i)
+            for (int j = 0; j < 32; ++j)
+                for (int k = 0; k < 32; ++k) {
+                    acc.setValue(Coord(i, j, k), 1 + ((i / 8 + j / 8 + k / 8) % 4));
+                }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4}));
+    const double dx = m->voxelSize();
+    RandomSpeed speed({1, 2, 3, 4}, 20261108u);
+    tools::LevelSetMultiObject<MLS, RandomSpeed> lsmo(*m, speed);
+    for (int n = 0; n < 50; ++n) {
+        const float dt = lsmo.step(1.0f);
+        ASSERT_GT(dt, 0.0f);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+    }
+    EXPECT_EQ(countOrphans(*m), Index64(0));
+
+    const std::vector<int32_t> ls = m->labelSet();
+    ASSERT_FALSE(ls.empty());
+    std::map<int32_t, FloatGrid::Ptr> sdf;
+    for (int32_t l : ls) sdf[l] = m->extractSignedDistance(l);
+    const float eps = float(-1e-3 * dx);
+    Index64 overlaps = 0, badCover = 0;
+    tree::ValueAccessor<const Int32Tree> lab(m->labels()->tree());
+    for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        int inside = 0, deep = 0;
+        int32_t which = 0;
+        for (int32_t l : ls) {
+            const float v = sdf[l]->tree().getValue(p);
+            if (v < 0.0f) { ++inside; which = l; }
+            if (v < eps) ++deep;
+        }
+        if (deep > 1) ++overlaps;
+        if (inside > 1 || (inside == 1 && lab.getValue(p) != which)
+            || (inside == 0 && lab.getValue(p) != 0)) ++badCover;
+    }
+    EXPECT_EQ(overlaps, Index64(0));
+    EXPECT_EQ(badCover, Index64(0));
+}
+
+TEST_F(TestLevelSetMultiObject, PressureGrowth)
+{
+    auto m = makeSphere(8.0);
+    const double dx = m->voxelSize();
+    ConstantSpeed speed;
+    speed.s = -1.0f; // dpsi/dt = -1: the object grows at unit speed
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    const size_t steps = lsmo.advect(0.0, 4.0);
+    EXPECT_GE(steps, size_t(4));
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
+    std::cout << "PressureGrowth: steps " << steps << " mean radius " << r << std::endl;
+    EXPECT_NEAR(r, 12.0, 0.5 * dx);
+}
+
+TEST_F(TestLevelSetMultiObject, CurvatureFlow)
+{
+    auto m = makeSphere(10.0);
+    const double dx = m->voxelSize();
+    Forces forces;
+    forces.setCurvatureWeight(1.0f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    const size_t steps = lsmo.advect(0.0, 20.0);
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
+    std::cout << "CurvatureFlow: steps " << steps << " r^2 " << r * r << " (expected 60)" << std::endl;
+    EXPECT_NEAR(r * r, 60.0, 2.0 * std::sqrt(60.0) * 0.5 * dx);
+}
+
+TEST_F(TestLevelSetMultiObject, UniformAdvection)
+{
+    auto m = makeSphere(8.0);
+    const double dx = m->voxelSize();
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    const Vec3d c0 = centroid(zeroCrossings(*m->extractSignedDistance(1)));
+    const size_t steps = lsmo.advect(0.0, 5.0);
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const auto pts = zeroCrossings(*m->extractSignedDistance(1));
+    const Vec3d c1 = centroid(pts);
+    std::cout << "UniformAdvection: steps " << steps << " shift " << (c1 - c0)
+              << " mean radius " << meanRadius(pts, c1) << std::endl;
+    EXPECT_NEAR(c1[0] - c0[0], 5.0, 0.5 * dx);
+    EXPECT_NEAR(c1[1] - c0[1], 0.0, 0.5 * dx);
+    EXPECT_NEAR(c1[2] - c0[2], 0.0, 0.5 * dx);
+}
+
+TEST_F(TestLevelSetMultiObject, FixedLabels)
+{
+    auto m = makeTwoSpheres(1.0);
+    std::map<Coord, float> before;
+    for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
+        if (*it == 2) before[it.getCoord()] = m->phi()->tree().getValue(it.getCoord());
+    }
+    ASSERT_FALSE(before.empty());
+    ConstantSpeed speed;
+    speed.s = -1.0f;
+    speed.fixed = {2};
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    for (int n = 0; n < 20; ++n) {
+        lsmo.step(0.75f); // sphere 1 grows ~15 voxels: it reaches the wall
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+    }
+    Index64 changed = 0;
+    for (const auto& kv : before) {
+        const float phi = m->phi()->tree().getValue(kv.first);
+        if (!m->labels()->tree().isValueOn(kv.first)
+            || m->labels()->tree().getValue(kv.first) != 2
+            || std::memcmp(&phi, &kv.second, sizeof(float)) != 0) ++changed;
+    }
+    EXPECT_EQ(changed, Index64(0));
+    // the moving label is in contact with the fixed one
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    Index64 contact = 0;
+    for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
+        if (*it != 1) continue;
+        for (int f = 0; f < 6; ++f) contact += m->labels()->tree().getValue(it.getCoord() + offs[f]) == 2;
+    }
+    EXPECT_GT(contact, Index64(0));
+}
+
+TEST_F(TestLevelSetMultiObject, BandMaintenance)
+{
+    auto m = makeSphere(8.0);
+    const double dx = m->voxelSize();
+    ConstantSpeed speed;
+    speed.s = -1.0f;
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    double t = 0.0;
+    int n = 0;
+    while (t < 4.0) {
+        t += lsmo.step(float(4.0 - t));
+        ++n;
+        ASSERT_TRUE(m->phi()->tree().hasSameTopology(m->labels()->tree())) << "step " << n;
+        ASSERT_LE(maxActivePhi(*m), float((m->halfWidth() + 1) * dx)) << "step " << n;
+        // inactive phi is the background (R7b)
+        for (auto it = m->phi()->tree().cbeginValueOff(); it; ++it) {
+            ASSERT_EQ(*it, m->phi()->background()) << "step " << n;
+        }
+    }
+    EXPECT_GE(n, 4);
+}
+
+TEST_F(TestLevelSetMultiObject, EmptyStep)
+{
+    FloatGrid::Ptr phi = FloatGrid::create(3.0f);
+    Int32Grid::Ptr lab = Int32Grid::create(0);
+    {
+        auto pa = phi->getAccessor();
+        auto la = lab->getAccessor();
+        for (int i = 0; i < 8; ++i)
+            for (int j = 0; j < 8; ++j)
+                for (int k = 0; k < 8; ++k) {
+                    pa.setValue(Coord(i, j, k), 1.0f);
+                    la.setValue(Coord(i, j, k), 0);
+                }
+    }
+    MLS m(phi, lab, 3);
+    const FloatTree phiBefore(m.phi()->tree());
+    const Int32Tree labBefore(m.labels()->tree());
+    ConstantSpeed speed;
+    speed.s = -1.0f;
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(m, speed);
+    EXPECT_EQ(lsmo.step(0.5f), 0.5f);
+    EXPECT_TRUE(m.phi()->tree().hasSameTopology(phiBefore));
+    EXPECT_TRUE(m.labels()->tree().hasSameTopology(labBefore));
+    for (auto it = phiBefore.cbeginValueOn(); it; ++it) {
+        EXPECT_EQ(m.phi()->tree().getValue(it.getCoord()), *it);
+        EXPECT_EQ(m.labels()->tree().getValue(it.getCoord()), 0);
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, InterruptMidAdvect)
+{
+    auto m = makeSphere(8.0);
+    ConstantSpeed speed;
+    speed.s = -1.0f;
+    CountingInterrupter interrupter;
+    tools::LevelSetMultiObject<MLS, ConstantSpeed, CountingInterrupter> lsmo(*m, speed, &interrupter);
+    // uninterrupted, t = 10 needs at least 10 steps (dt <= cfl*dx)
+    const size_t steps = lsmo.advect(0.0, 10.0);
+    EXPECT_LT(steps, size_t(10));
+    EXPECT_EQ(steps, size_t(2));
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+}
+
+TEST_F(TestLevelSetMultiObject, ThinFeatureVanishes)
+{
+    // 1-voxel-thick slab of label 1 inside a 16^3 block of label 2
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (int i = 0; i < 16; ++i)
+            for (int j = 0; j < 16; ++j)
+                for (int k = 0; k < 16; ++k) acc.setValue(Coord(i, j, k), i == 8 ? 1 : 2);
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2}));
+    Forces forces;
+    forces.setCurvatureWeight(1.0f);
+    forces.setPressure(FloatGrid::create(-1.0f), 1.0f); // inward
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    for (int n = 0; n < 30; ++n) {
+        lsmo.step(1.0f);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+    }
+    EXPECT_EQ(countOrphans(*m), Index64(0));
+    const auto ls = m->labelSet();
+    EXPECT_EQ(std::count(ls.begin(), ls.end(), 1), 0) << "the slab did not vanish";
+}
+
+TEST_F(TestLevelSetMultiObject, EvolverSerialMatchesParallel)
+{
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (int i = 0; i < 24; ++i)
+            for (int j = 0; j < 24; ++j)
+                for (int k = 0; k < 24; ++k) acc.setValue(Coord(i, j, k), 1 + ((i / 8 + j / 8 + k / 8) % 3));
+    }
+    auto a = MLS::fromLabelGrid(*labels);
+    auto b = MLS::fromLabelGrid(*labels);
+    RandomSpeed speed({1, 2, 3}, 7u);
+    tools::LevelSetMultiObject<MLS, RandomSpeed> serial(*a, speed), parallel(*b, speed);
+    serial.setGrainSize(0);
+    for (int n = 0; n < 10; ++n) {
+        EXPECT_EQ(serial.step(1.0f), parallel.step(1.0f));
+    }
+    ASSERT_TRUE(a->phi()->tree().hasSameTopology(b->phi()->tree()));
+    Index64 diff = 0;
+    for (auto it = a->phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        diff += (*it != b->phi()->tree().getValue(p))
+            || (a->labels()->tree().getValue(p) != b->labels()->tree().getValue(p));
+    }
+    EXPECT_EQ(diff, Index64(0));
 }
