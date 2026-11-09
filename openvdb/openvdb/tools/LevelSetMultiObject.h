@@ -1471,11 +1471,15 @@ private:
 ///    |v_1| with one candidate. Results are written to copies of both trees
 ///    (time-n data stays readable until both are swapped in together).
 ///    A voxel whose face neighbour changed label is (re)projected with that
-///    new label added to its candidates (still evaluated on time-n data),
-///    repeated until no label changes: the redistancer freezes every voxel
-///    next to a label change (ruling R12), so each such voxel must carry a
-///    projected value. Speeds first evaluated here are bounded by the
-///    max|F| that set dt.
+///    new label added to its candidates, repeated until no label changes:
+///    the redistancer freezes every voxel next to a label change (ruling
+///    R12), so each such voxel must carry a projected value. The time-n
+///    estimate of a label l seen only at time n+1 is (ruling R23)
+///    psi_l^n(q) = max(phi_q^n, min over face neighbours c now labelled l of
+///    psi_l^n(c) + dx), with psi_l^n(c) the value c's projection used: an
+///    upper Lipschitz bound floored by the pair lower bound, so a front
+///    cannot cascade along an interface shell within one step. Speeds first
+///    evaluated here are clamped to the max|F| that set dt.
 /// -# <b>Orphan cleanup</b> (4.5): a voxel whose label occurs nowhere in its
 ///    26-neighbourhood takes the label and phi of its smallest-phi active
 ///    neighbour (fixed labels excluded).
@@ -1544,6 +1548,9 @@ public:
     bool clampSpeed() const { return mClampSpeed; }
     int grainSize() const { return mGrainSize; }
     float redistanceTolerance() const { return mTolerance; }
+    /// @brief Number of candidate labels dropped so far because a voxel
+    /// already had kMaxCandidates (13) of them; 0 in any sane scene.
+    size_t candidateOverflows() const { return mOverflow; }
 
     /// @brief One forward Euler step of at most @a maxDt (world time).
     /// @return the time step taken; @a maxDt (or speed.stableDt if smaller)
@@ -1575,8 +1582,19 @@ private:
     /// Own label + 6 face labels at time n + 6 face labels at time n+1.
     static constexpr int kMaxCandidates = 13;
 
+    /// A non-zero candidate label with its speed and the time-n estimate
+    /// psi_l^n used by the projection. @c derived marks a label seen only on
+    /// a face neighbour at time n+1 (ruling R23 estimate).
+    struct Candidate
+    {
+        int32_t label;
+        float speed; // NaN until evaluated
+        float psi;
+        bool derived;
+    };
+
     /// Candidate list of one updated voxel: non-zero labels with their
-    /// speeds, and whether passive label 0 participates.
+    /// speeds and psi estimates, and whether passive label 0 participates.
     struct VoxelEntry
     {
         Index offset = 0;
@@ -1584,12 +1602,12 @@ private:
         float phi = 0.0f; // time n
         int n = 0;
         bool zero = false;
-        std::array<std::pair<int32_t, float>, kMaxCandidates> cand;
+        std::array<Candidate, kMaxCandidates> cand;
 
-        bool has(int32_t l) const
+        int find(int32_t l) const
         {
-            for (int i = 0; i < n; ++i) if (cand[i].first == l) return true;
-            return false;
+            for (int i = 0; i < n; ++i) if (cand[i].label == l) return i;
+            return -1;
         }
     };
 
@@ -1598,6 +1616,7 @@ private:
         std::vector<VoxelEntry> entries;
         std::vector<int32_t> slot; // voxel offset -> entry index, or -1
         std::vector<Coord> changed;
+        size_t overflow = 0;
         float maxSpeed = 0.0f;
         bool any = false;
 
@@ -1643,30 +1662,34 @@ private:
     }
 
     /// Add @a l to @a e's candidates (R21): label 0 and fixed labels only
-    /// make passive label 0 participate. A new non-zero label gets a NaN
-    /// speed (not yet evaluated). Returns true if the candidate set grew.
-    bool addCandidate(VoxelEntry& e, int32_t l) const
+    /// make passive label 0 participate. A new non-zero label gets
+    /// psi_l^n = @a psi (default: the pair value, -phi for the own label and
+    /// +phi otherwise) and a NaN speed (not yet evaluated). A label that does
+    /// not fit is counted in @a overflow. Returns true if the set grew.
+    bool addCandidate(VoxelEntry& e, int32_t l, size_t& overflow,
+        float psi = std::numeric_limits<float>::quiet_NaN(), bool derived = false) const
     {
         if (l == 0 || mSpeed.isFixed(l)) { // label 0, or a wall: passive 0
             const bool grew = !e.zero;
             e.zero = true;
             return grew;
         }
-        if (e.has(l) || e.n >= kMaxCandidates) return false;
-        e.cand[e.n++] = std::make_pair(l, std::numeric_limits<float>::quiet_NaN());
+        if (e.find(l) >= 0) return false;
+        if (e.n >= kMaxCandidates) { ++overflow; return false; }
+        if (std::isnan(psi)) psi = (l == e.own) ? -e.phi : e.phi;
+        e.cand[e.n++] = Candidate{l, std::numeric_limits<float>::quiet_NaN(), psi, derived};
         return true;
     }
 
-    /// Evaluate the NaN speeds of @a e at @a ijk; with @a bound > 0 they are
-    /// clamped to [-bound, bound]. Returns the max |speed| evaluated.
+    /// Evaluate the NaN speeds of @a e at @a ijk, clamped to
+    /// [-bound, bound]. Returns the max |speed| evaluated.
     float evalSpeeds(StencilT& s, const Coord& ijk, VoxelEntry& e, float bound) const
     {
         float mx = 0.0f;
         for (int c = 0; c < e.n; ++c) {
-            if (!std::isnan(e.cand[c].second)) continue;
-            float f = this->evalSpeed(s, ijk, e.cand[c].first);
-            if (bound > 0.0f) f = std::max(-bound, std::min(bound, f));
-            e.cand[c].second = f;
+            if (!std::isnan(e.cand[c].speed)) continue;
+            const float f = std::max(-bound, std::min(bound, this->evalSpeed(s, ijk, e.cand[c].label)));
+            e.cand[c].speed = f;
             mx = std::max(mx, std::abs(f));
         }
         return mx;
@@ -1689,9 +1712,8 @@ private:
             }
         };
         for (int i = 0; i < e.n; ++i) {
-            const int32_t l = e.cand[i].first;
-            const float psi = (l == e.own) ? -e.phi : e.phi;
-            const float v = psi + dt * e.cand[i].second;
+            const int32_t l = e.cand[i].label;
+            const float v = e.cand[i].psi + dt * e.cand[i].speed;
             consider(l, v);
             minV = std::min(minV, v);
         }
@@ -1708,7 +1730,7 @@ private:
         mMls.labels()->setTree(labels);
     }
 
-    void propagate(const tree::LeafManager<const FloatTreeT>& leafs, std::vector<LeafData>& data,
+    size_t propagate(const tree::LeafManager<const FloatTreeT>& leafs, std::vector<LeafData>& data,
         FloatTreeT& newPhi, LabelTreeT& newLabels, float dt, float bound);
     void cleanOrphans(FloatTreeT& newPhi, LabelTreeT& newLabels);
     void bandMaintenance(const FloatTreeT& oldPhi);
@@ -1720,6 +1742,7 @@ private:
     bool mClampSpeed = false;
     int mGrainSize = 1;
     float mTolerance;
+    size_t mOverflow = 0;
 };
 
 
@@ -1763,16 +1786,22 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
             VoxelEntry& e = d.add(it.pos());
             e.own = own;
             e.phi = *it;
-            this->addCandidate(e, own);
-            for (int f = 0; f < 6; ++f) this->addCandidate(e, nb[f]);
-            d.maxSpeed = std::max(d.maxSpeed, this->evalSpeeds(stencil, p, e, 0.0f));
+            this->addCandidate(e, own, d.overflow);
+            for (int f = 0; f < 6; ++f) this->addCandidate(e, nb[f], d.overflow);
+            d.maxSpeed = std::max(d.maxSpeed,
+                this->evalSpeeds(stencil, p, e, std::numeric_limits<float>::infinity()));
             d.any |= e.n > 0;
         }
     });
 
     float maxSpeed = 0.0f;
     bool any = false;
-    for (const LeafData& d : data) { maxSpeed = std::max(maxSpeed, d.maxSpeed); any |= d.any; }
+    size_t overflow = 0;
+    for (const LeafData& d : data) {
+        maxSpeed = std::max(maxSpeed, d.maxSpeed);
+        any |= d.any;
+        overflow += d.overflow;
+    }
 
     // 3. time step
     float dt = std::min(maxDt, mSpeed.stableDt(float(dx)));
@@ -1796,8 +1825,10 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
             if (l != e.own) d.changed.push_back(leaf.offsetToGlobalCoord(e.offset));
         }
     });
-    this->propagate(leafs, data, *newPhi, *newLabels, dt,
-        (mClampSpeed || maxSpeed <= 0.0f) ? 1.0f : maxSpeed);
+    overflow += this->propagate(leafs, data, *newPhi, *newLabels, dt,
+        mClampSpeed ? 1.0f : maxSpeed);
+    mOverflow += overflow;
+    assert(overflow == 0 && "LevelSetMultiObject: more than 13 candidate labels at a voxel");
 
     // 5. orphan cleanup
     this->cleanOrphans(*newPhi, *newLabels);
@@ -1808,27 +1839,27 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 
     // 6b-e.
     this->bandMaintenance(*oldPhi);
-#ifndef NDEBUG
     assert(mMls.validate());
-#endif
     return dt;
 }
 
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
-void
+size_t
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::propagate(
     const tree::LeafManager<const FloatTreeT>& leafs, std::vector<LeafData>& data,
     FloatTreeT& newPhi, LabelTreeT& newLabels, float dt, float bound)
 {
     using LeafT = typename FloatTreeT::LeafNodeType;
     const Coord* offs = lsmo_internal::faceOffsets();
+    const float dx = float(mMls.voxelSize());
+    size_t overflow = 0;
     std::vector<Coord> front;
     for (LeafData& d : data) {
         front.insert(front.end(), d.changed.begin(), d.changed.end());
         d.changed.clear();
     }
-    if (front.empty()) return;
+    if (front.empty()) return overflow;
 
     std::map<Coord, size_t> leafIndex;
     for (size_t i = 0; i < leafs.leafCount(); ++i) leafIndex[leafs.leaf(i).origin()] = i;
@@ -1837,6 +1868,22 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::propagate(
     tree::ValueAccessor<const LabelTreeT> labAcc(mMls.labels()->tree());
     tree::ValueAccessor<FloatTreeT> newPhiAcc(newPhi);
     tree::ValueAccessor<LabelTreeT> newLabAcc(newLabels);
+
+    auto findEntry = [&](const Coord& p) -> VoxelEntry* {
+        const auto found = leafIndex.find(p & ~(LeafT::DIM - 1));
+        if (found == leafIndex.end()) return nullptr;
+        return data[found->second].find(LeafT::coordToOffset(p));
+    };
+    // psi_l^n at carrier c as c's own projection used it; otherwise the
+    // time-n pair value.
+    auto carrierPsi = [&](const Coord& c, int32_t l) -> float {
+        if (const VoxelEntry* e = findEntry(c)) {
+            const int k = e->find(l);
+            if (k >= 0) return e->cand[k].psi;
+        }
+        const float phiC = phiAcc.getValue(c);
+        return (static_cast<int32_t>(labAcc.getValue(c)) == l) ? -phiC : phiC;
+    };
 
     while (!front.empty()) {
         std::vector<Coord> next;
@@ -1857,15 +1904,35 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::propagate(
                     e = &d.add(offset);
                     e->own = own;
                     e->phi = phiQ;
-                    this->addCandidate(*e, own);
+                    this->addCandidate(*e, own, overflow);
                     for (int g = 0; g < 6; ++g) {
-                        this->addCandidate(*e, static_cast<int32_t>(labAcc.getValue(q + offs[g])));
+                        this->addCandidate(*e,
+                            static_cast<int32_t>(labAcc.getValue(q + offs[g])), overflow);
                     }
                     grew = true;
                 }
+                // Labels q sees only at time n+1 (R23): psi_l^n(q) =
+                // max(phi_q^n, min over carriers c of psi_l^n(c) + |q - c|).
                 for (int g = 0; g < 6; ++g) {
-                    grew |= this->addCandidate(*e,
-                        static_cast<int32_t>(newLabAcc.getValue(q + offs[g])));
+                    const int32_t l = static_cast<int32_t>(newLabAcc.getValue(q + offs[g]));
+                    if (l == 0 || mSpeed.isFixed(l)) {
+                        grew |= this->addCandidate(*e, l, overflow);
+                        continue;
+                    }
+                    const int k = e->find(l);
+                    if (k >= 0 && !e->cand[k].derived) continue; // seen at time n
+                    float best = std::numeric_limits<float>::infinity();
+                    for (int h = 0; h < 6; ++h) {
+                        const Coord cc = q + offs[h];
+                        if (static_cast<int32_t>(newLabAcc.getValue(cc)) != l) continue;
+                        best = std::min(best, carrierPsi(cc, l) + dx);
+                    }
+                    const float psi = std::max(phiQ, best);
+                    if (k >= 0) {
+                        if (psi < e->cand[k].psi) { e->cand[k].psi = psi; grew = true; }
+                    } else {
+                        grew |= this->addCandidate(*e, l, overflow, psi, /*derived=*/true);
+                    }
                 }
                 if (!grew) continue;
                 this->evalSpeeds(stencil, q, *e, bound);
@@ -1879,6 +1946,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::propagate(
         }
         front.swap(next);
     }
+    return overflow;
 }
 
 

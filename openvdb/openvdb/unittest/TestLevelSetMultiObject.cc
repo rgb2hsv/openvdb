@@ -1573,6 +1573,9 @@ TEST_F(TestLevelSetMultiObject, ThinFeatureVanishes)
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
     }
+    for (auto it = m->phi()->tree().cbeginValueAll(); it; ++it) {
+        ASSERT_TRUE(std::isfinite(*it)) << "NaN/inf phi at " << it.getCoord();
+    }
     EXPECT_EQ(countOrphans(*m), Index64(0));
     const auto ls = m->labelSet();
     EXPECT_EQ(std::count(ls.begin(), ls.end(), 1), 0) << "the slab did not vanish";
@@ -1603,4 +1606,122 @@ TEST_F(TestLevelSetMultiObject, EvolverSerialMatchesParallel)
             || (a->labels()->tree().getValue(p) != b->labels()->tree().getValue(p));
     }
     EXPECT_EQ(diff, Index64(0));
+}
+
+namespace {
+
+// Per-label constant dpsi/dt.
+struct LabelSpeed
+{
+    std::map<int32_t, float> speeds;
+    std::set<int32_t> fixed;
+    float operator()(const Coord&, int32_t l, const Stencil&) const
+    {
+        auto it = speeds.find(l);
+        return it == speeds.end() ? 0.0f : it->second;
+    }
+    bool isFixed(int32_t l) const { return l != 0 && fixed.count(l) != 0; }
+    bool isActive(int32_t) const { return true; }
+    float stableDt(float) const { return std::numeric_limits<float>::infinity(); }
+};
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, ContactNoCascade)
+{
+    // Review probe: label 1 slab x < 10, label 2 block x in [10,13), y < 3,
+    // in contact; label 2 is faster. Along the contact shell (10, y, 12)
+    // label 2 may advance at most cfl*dx + 0.5*dx per step (ruling R23).
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (int i = 0; i < 13; ++i)
+            for (int j = 0; j < 24; ++j)
+                for (int k = 0; k < 24; ++k) {
+                    if (i < 10) acc.setValue(Coord(i, j, k), 1);
+                    else if (j < 3) acc.setValue(Coord(i, j, k), 2);
+                }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    LabelSpeed speed;
+    speed.speeds = {{1, -0.5f}, {2, -1.0f}};
+    tools::LevelSetMultiObject<MLS, LabelSpeed> lsmo(*m, speed);
+    auto extent = [&]() {
+        int maxj = -1;
+        for (int j = 0; j < 24; ++j) {
+            const Coord c(10, j, 12);
+            if (m->labels()->tree().isValueOn(c) && m->labels()->tree().getValue(c) == 2) maxj = j;
+        }
+        return maxj;
+    };
+    auto count = [&]() {
+        Index64 n = 0;
+        for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) n += *it == 2;
+        return n;
+    };
+    const int y0 = extent();
+    ASSERT_EQ(y0, 2);
+    std::vector<Index64> counts{count()};
+    std::vector<int> extents{y0};
+    for (int s = 1; s <= 3; ++s) {
+        const float dt = lsmo.step(1.0f);
+        EXPECT_FLOAT_EQ(dt, 0.999f);
+        counts.push_back(count());
+        extents.push_back(extent());
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+    }
+    std::cout << "ContactNoCascade: extent " << extents[0] << " " << extents[1] << " "
+              << extents[2] << " " << extents[3] << ", label-2 voxels " << counts[0] << " "
+              << counts[1] << " " << counts[2] << " " << counts[3] << std::endl;
+    const double cfl = 0.999;
+    for (int s = 1; s <= 3; ++s) {
+        EXPECT_LE(extents[s] - extents[s - 1], int(std::floor(cfl + 0.5))) << "step " << s;
+    }
+    // No cascade anywhere: after 3 steps every label-2 voxel (active or not)
+    // is within 3*cfl*dx + dx of a voxel of the initial block
+    // x in [10,13), y in [0,3), z in [0,24).
+    Index64 far = 0;
+    const double bound = 3.0 * cfl + 1.0;
+    for (auto it = m->labels()->tree().cbeginValueAll(); it; ++it) {
+        if (*it != 2) continue;
+        CoordBBox box;
+        it.getBoundingBox(box);
+        for (auto p = box.begin(); p; ++p) {
+            const Coord c = *p;
+            const double dxv = std::max({10 - c[0], c[0] - 12, 0});
+            const double dyv = std::max({0 - c[1], c[1] - 2, 0});
+            const double dzv = std::max({0 - c[2], c[2] - 23, 0});
+            if (std::sqrt(dxv * dxv + dyv * dyv + dzv * dzv) > bound + 1e-6) ++far;
+        }
+    }
+    EXPECT_EQ(far, Index64(0));
+}
+
+TEST_F(TestLevelSetMultiObject, WallRetreat)
+{
+    // Label 2 (fixed) for x < 8, label 1 for x in [8,16); label 1 retreats
+    // from the wall: its voxels next to the wall become passive label 0.
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (int i = 0; i < 16; ++i)
+            for (int j = 0; j < 16; ++j)
+                for (int k = 0; k < 16; ++k) acc.setValue(Coord(i, j, k), i < 8 ? 2 : 1);
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    LabelSpeed speed;
+    speed.speeds = {{1, 1.0f}};
+    speed.fixed = {2};
+    tools::LevelSetMultiObject<MLS, LabelSpeed> lsmo(*m, speed);
+    const Coord wallSide(7, 8, 8), retreat(8, 8, 8);
+    const float wallPhi = m->phi()->tree().getValue(wallSide);
+    ASSERT_EQ(m->labels()->tree().getValue(retreat), 1);
+    lsmo.step(1.0f);
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_EQ(m->labels()->tree().getValue(retreat), 0);
+    EXPECT_EQ(m->labels()->tree().getValue(wallSide), 2);
+    EXPECT_EQ(m->phi()->tree().getValue(wallSide), wallPhi);
+    EXPECT_EQ(lsmo.candidateOverflows(), size_t(0));
 }
