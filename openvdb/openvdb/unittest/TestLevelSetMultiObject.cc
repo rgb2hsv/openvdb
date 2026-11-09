@@ -7,7 +7,9 @@
 #include <openvdb/tools/LevelSetAdvect.h>
 #include <openvdb/tools/LevelSetFilter.h>
 #include <openvdb/tools/LevelSetMeasure.h>
+#include <openvdb/tools/LevelSetPlatonic.h>
 #include <openvdb/tools/LevelSetSphere.h>
+#include <openvdb/tools/LevelSetTubes.h>
 #include <openvdb/tools/VelocityFields.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -1355,6 +1358,35 @@ maxActivePhi(const MLS& m)
     return mx;
 }
 
+// Spec section 8 test 4: the interiors {psi_l < 0} of the per-label
+// extractSignedDistance grids are pairwise disjoint (up to 1e-3*dx;
+// @a overlaps counts violations) and, with the background region, cover the
+// band consistently with the labels (@a badCover counts violations).
+void
+partitionErrors(const MLS& m, Index64& overlaps, Index64& badCover)
+{
+    const double dx = m.voxelSize();
+    const std::vector<int32_t> ls = m.labelSet();
+    std::map<int32_t, FloatGrid::Ptr> sdf;
+    for (int32_t l : ls) sdf[l] = m.extractSignedDistance(l);
+    const float eps = float(-1e-3 * dx);
+    overlaps = badCover = 0;
+    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        int inside = 0, deep = 0;
+        int32_t which = 0;
+        for (int32_t l : ls) {
+            const float v = sdf[l]->tree().getValue(p);
+            if (v < 0.0f) { ++inside; which = l; }
+            if (v < eps) ++deep;
+        }
+        if (deep > 1) ++overlaps;
+        if (inside > 1 || (inside == 1 && lab.getValue(p) != which)
+            || (inside == 0 && lab.getValue(p) != 0)) ++badCover;
+    }
+}
+
 } // anonymous namespace
 
 TEST_F(TestLevelSetMultiObject, PartitionInvariant)
@@ -1371,7 +1403,6 @@ TEST_F(TestLevelSetMultiObject, PartitionInvariant)
     }
     auto m = MLS::fromLabelGrid(*labels);
     ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4}));
-    const double dx = m->voxelSize();
     RandomSpeed speed({1, 2, 3, 4}, 20261108u);
     tools::LevelSetMultiObject<MLS, RandomSpeed> lsmo(*m, speed);
     for (int n = 0; n < 50; ++n) {
@@ -1382,26 +1413,9 @@ TEST_F(TestLevelSetMultiObject, PartitionInvariant)
     }
     EXPECT_EQ(countOrphans(*m), Index64(0));
 
-    const std::vector<int32_t> ls = m->labelSet();
-    ASSERT_FALSE(ls.empty());
-    std::map<int32_t, FloatGrid::Ptr> sdf;
-    for (int32_t l : ls) sdf[l] = m->extractSignedDistance(l);
-    const float eps = float(-1e-3 * dx);
+    ASSERT_FALSE(m->labelSet().empty());
     Index64 overlaps = 0, badCover = 0;
-    tree::ValueAccessor<const Int32Tree> lab(m->labels()->tree());
-    for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
-        const Coord p = it.getCoord();
-        int inside = 0, deep = 0;
-        int32_t which = 0;
-        for (int32_t l : ls) {
-            const float v = sdf[l]->tree().getValue(p);
-            if (v < 0.0f) { ++inside; which = l; }
-            if (v < eps) ++deep;
-        }
-        if (deep > 1) ++overlaps;
-        if (inside > 1 || (inside == 1 && lab.getValue(p) != which)
-            || (inside == 0 && lab.getValue(p) != 0)) ++badCover;
-    }
+    partitionErrors(*m, overlaps, badCover);
     EXPECT_EQ(overlaps, Index64(0));
     EXPECT_EQ(badCover, Index64(0));
 }
@@ -1916,4 +1930,150 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 10.0);
     checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 10.0);
+}
+
+
+////////////////////////////////////////
+// Spec section 8, test 9: eight objects in a tornado vortex.
+
+namespace {
+
+// Voxel count per label over the whole label tree (active and inactive
+// voxels, tiles counted by their voxel count; label 0 excluded).
+std::map<int32_t, Index64>
+labelVoxelCounts(const MLS& m)
+{
+    std::map<int32_t, Index64> n;
+    for (auto it = m.labels()->tree().cbeginValueAll(); it; ++it) {
+        if (*it == 0) continue;
+        n[*it] += it.getVoxelCount();
+    }
+    return n;
+}
+
+// Distinct unordered label pairs (a, b), a != b, both non-zero, with
+// face-adjacent voxels (one of them active).
+std::set<std::pair<int32_t, int32_t>>
+contactPairs(const MLS& m)
+{
+    std::set<std::pair<int32_t, int32_t>> pairs;
+    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    for (auto it = m.labels()->tree().cbeginValueOn(); it; ++it) {
+        const int32_t a = *it;
+        if (a == 0) continue;
+        for (int f = 0; f < 6; ++f) {
+            const int32_t b = lab.getValue(it.getCoord() + offs[f]);
+            if (b != 0 && b != a) pairs.insert({std::min(a, b), std::max(a, b)});
+        }
+    }
+    return pairs;
+}
+
+Index64
+countNaN(const FloatGrid& g)
+{
+    Index64 n = 0;
+    for (auto it = g.tree().cbeginValueAll(); it; ++it) n += std::isnan(*it) ? 1 : 0;
+    return n;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
+{
+    // Eight shapes (labels 1-8) of characteristic size 8 (sphere radius,
+    // Platonic factory scale, capsule half-extent, ring outer radius) at
+    // radius 40 in the z = -20 plane, angles k*45 degrees; dx = 1,
+    // halfWidth 3, no rotations.
+    const float dx = 1.0f, hw = 3.0f, size = 8.0f;
+    auto center = [](int k) {
+        const double a = k * math::pi<double>() / 4.0;
+        return Vec3f(float(40.0 * std::cos(a)), float(40.0 * std::sin(a)), -20.0f);
+    };
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(size, center(0), dx, hw);
+    in[2] = tools::createLevelSetCube<FloatGrid>(size, center(1), dx, hw);
+    in[3] = tools::createLevelSetTetrahedron<FloatGrid>(size, center(2), dx, hw);
+    in[4] = tools::createLevelSetOctahedron<FloatGrid>(size, center(3), dx, hw);
+    in[5] = tools::createLevelSetDodecahedron<FloatGrid>(size, center(4), dx, hw);
+    in[6] = tools::createLevelSetIcosahedron<FloatGrid>(size, center(5), dx, hw);
+    {
+        // capsule along z: radius 4, axis endpoints +-4 (extent 16 x 8)
+        const Vec3f c = center(6);
+        in[7] = tools::createLevelSetCapsule<FloatGrid>(
+            c - Vec3f(0.0f, 0.0f, 4.0f), c + Vec3f(0.0f, 0.0f, 4.0f), 4.0f, dx, hw);
+    }
+    {
+        // closed ring: 8-segment polygon of radius 6 in the xy plane, tube radius 2
+        const Vec3f c = center(7);
+        std::vector<Vec3f> verts;
+        std::vector<Vec2I> segs;
+        for (int i = 0; i < 8; ++i) {
+            const double a = i * math::pi<double>() / 4.0;
+            verts.push_back(c + Vec3f(float(6.0 * std::cos(a)), float(6.0 * std::sin(a)), 0.0f));
+            segs.push_back(Vec2I(i, (i + 1) % 8));
+        }
+        in[8] = tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 2.0f, dx, hw);
+    }
+    auto m = MLS::fromSignedGrids(in, int(hw));
+    ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}));
+    const std::map<int32_t, Index64> vol0 = labelVoxelCounts(*m);
+    ASSERT_TRUE(contactPairs(*m).empty());
+
+    // Rankine-style vortex about z (core radius R = 16): swirl
+    // u_theta = r/R (r < R) or R/r, inflow u_r = -0.3*exp(-(z+20)^2/200),
+    // updraft u_z = 0.4*exp(-r^2/(2 R^2)); dense over [-64, 64]^3.
+    const double R = 16.0;
+    Vec3SGrid::Ptr vel = makeVelocity(CoordBBox(Coord(-64), Coord(64)), dx,
+        [R](const Vec3d& p) {
+            const double r = std::sqrt(p[0] * p[0] + p[1] * p[1]);
+            const double ut = r < R ? r / R : R / r;
+            const double ur = -0.3 * std::exp(-(p[2] + 20.0) * (p[2] + 20.0) / 200.0);
+            const double uz = 0.4 * std::exp(-r * r / (2.0 * R * R));
+            Vec3d v(0.0, 0.0, uz);
+            if (r > 0.0) v += Vec3d(-p[1], p[0], 0.0) * (ut / r) + Vec3d(p[0], p[1], 0.0) * (ur / r);
+            return Vec3s(v);
+        });
+
+    Forces forces;
+    forces.setAdvection(vel, 1.0f);
+    forces.setCurvatureWeight(0.05f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+
+    const double tEnd = 120.0, chunk = 10.0;
+    size_t steps = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (double t = 0.0; t < tEnd - 1e-9; t += chunk) {
+        steps += lsmo.advect(t, t + chunk);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "t " << t + chunk << ": " << msg;
+        Index64 overlaps = 0, badCover = 0;
+        partitionErrors(*m, overlaps, badCover);
+        ASSERT_EQ(overlaps, Index64(0)) << "t " << t + chunk;
+        ASSERT_EQ(badCover, Index64(0)) << "t " << t + chunk;
+        ASSERT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << t + chunk;
+        std::cout << "Tornado: t " << t + chunk << " steps " << steps << " contacts "
+                  << contactPairs(*m).size() << " active " << m->phi()->activeVoxelCount();
+        for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
+        std::cout << std::endl;
+    }
+    const double secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+
+    const auto pairs = contactPairs(*m);
+    std::cout << "Tornado: " << steps << " steps, " << secs << " s, contact pairs";
+    for (const auto& pr : pairs) std::cout << " " << pr.first << "-" << pr.second;
+    std::cout << std::endl;
+    EXPECT_GE(pairs.size(), size_t(4));
+
+    const std::map<int32_t, Index64> vol1 = labelVoxelCounts(*m);
+    for (int32_t l = 1; l <= 8; ++l) {
+        const double v0 = double(vol0.at(l));
+        const double v1 = vol1.count(l) ? double(vol1.at(l)) : 0.0;
+        std::cout << "Tornado: label " << l << " voxels " << v0 << " -> " << v1 << " ("
+                  << 100.0 * (v1 - v0) / v0 << "%)" << std::endl;
+        EXPECT_GE(v1, 1.0) << "label " << l;
+        EXPECT_NEAR(v1, v0, 0.25 * v0) << "label " << l;
+    }
 }
