@@ -123,6 +123,7 @@ else()
     TestLevelSetDilatedMesh.cc
     TestLevelSetFilter.cc
     TestLevelSetMultiObject.cc
+    TestLevelSetMultiObjectMesh.cc
     TestLevelSetRayIntersector.cc
     TestLevelSetTubes.cc
     TestLevelSetUtil.cc
