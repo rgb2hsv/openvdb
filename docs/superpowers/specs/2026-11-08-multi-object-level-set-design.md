@@ -478,13 +478,14 @@ Required integration tests:
    flow keeps the angular gaps of objects at one radius, so contact comes
    from pairs pressed together in the convergence zone until their gap is
    below a voxel.) Advection weight 1, curvature weight 0.01; advect in
-   chunks of 2 until ≥ 4 contact pairs, capped at t = 40.
+   chunks of 2 until ≥ 4 contact pairs (capped at t = 40), then two more
+   chunks during which the contacts must persist (ruling R31).
    - Every chunk: `validate()`, partition invariant, no NaN.
    - At end: ≥ 4 distinct label pairs sharing a face; every label still owns
-     at least one voxel; each label's voxel-count loss ≤ 1.1 × the volume loss
-     of the same shape advected alone by `LevelSetAdvection`
-     (FIRST_BIAS/TVD_RK1) in the same field over the same time, + 2%
-     absolute.
+     at least one voxel; with refLoss the volume loss of the same shape
+     advected alone by `LevelSetAdvection` (FIRST_BIAS/TVD_RK1) in the same
+     field over the same time, each label's voxel-count loss lies in
+     [1.1·min(refLoss, 0) − 2%, 1.1·max(refLoss, 0) + 2%] (ruling R31).
    - Different labels never merge; contact means shared interfaces.
 
 Contouring tests (`TestLevelSetMultiObjectMesh.cc`):

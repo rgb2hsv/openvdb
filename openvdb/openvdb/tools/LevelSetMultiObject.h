@@ -1359,9 +1359,12 @@ private:
 /// model: curvature + upwind pressure + upwind advection (spec 3.4).
 /// @note Deviation from wedge (ruling R26): the curvature term uses the
 /// interface curvature k_x/(1 - psi*k_x) instead of the voxel-centre mean
-/// curvature k_x (fallback k_x when |psi*k_x| >= 0.5), so that voxels on both
-/// sides of the interface move it at its own curvature. Without it, mean
-/// curvature flow of a sphere runs ~3.5% fast with this method's band.
+/// curvature k_x (fallback k_x when |psi*k_x| >= 0.5), which makes the
+/// evaluation point exact for a sphere. It does not remove the measured bias
+/// of mean curvature flow (a sphere shrinks ~3.5% fast; R26 changes r^2 at
+/// t = 20 only from 58.32 to 58.53 against 60): that residual comes from an
+/// ~0.01*dx error of the interface-voxel phi, amplified by the second
+/// differences (ruling R28 gates it against the reference's error).
 /// @details Satisfies the speed functor concept of spec 3.3. Label 0 is
 /// handled by the evolver as passive (rulings R3, R20), so isFixed(0) is
 /// false here. Speeds are world-space; with unit voxel size they equal

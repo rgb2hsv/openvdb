@@ -1894,10 +1894,7 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
         EXPECT_LE(em, std::max({1.1 * er, er + radiusSlack, 0.25 * dx}));
         return;
     }
-    if (!analytic) {
-        EXPECT_LT(d.symDiff, 0.01 * vol);
-        return;
-    }
+    ASSERT_TRUE(analytic) << "give an exact grid or an exact radius";
     // Ruling R25: both first-order schemes diffuse, by different amounts, so
     // MOGAC must be at least as close to the exact solution as the reference
     // (10% slack) instead of within 1% of the reference.
@@ -2079,10 +2076,12 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     // - Tornado field (see Tornado): R = 16, swirl 0.1, inflow 0.2 towards
     //   rs = 38.5 with zone width 1, updraft 0.2; dense over [-64, 64]^3;
     //   advection weight 1, curvature weight 0.01.
-    // - Advect in chunks of 2 until >= 4 contact pairs, capped at t = 40.
-    // Volume gate: each label's voxel loss <= 1.1 x the loss of the same
+    // - Advect in chunks of 2 until >= 4 contact pairs (capped at t = 40),
+    //   then two more chunks (ruling R31); contacts must stay >= 4.
+    // Volume gate (two-sided, ruling R31): with refLoss the loss of the same
     // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
-    // same field over the same time, + 2% absolute.
+    // same field over the same time, each label's voxel loss lies in
+    // [1.1*min(refLoss, 0) - 2%, 1.1*max(refLoss, 0) + 2%].
     const float dx = 1.0f, hw = 3.0f;
     const Tornado tornado;
     auto make = [&](int32_t l, const Vec3f& c) -> FloatGrid::Ptr {
@@ -2142,7 +2141,12 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     size_t steps = 0;
     std::set<std::pair<int32_t, int32_t>> pairs;
     const auto start = std::chrono::steady_clock::now();
-    while (t < tCap - 1e-9 && pairs.size() < 4) {
+    // Ruling R31: keep going for two chunks after the first chunk with >= 4
+    // contact pairs; contacts must persist.
+    int after = -1; // chunks run after the first one with >= 4 pairs
+    double tContact = -1.0;
+    while (after < 2) {
+        if (after < 0 && t >= tCap - 1e-9) break;
         steps += lsmo.advect(t, t + chunk);
         t += chunk;
         std::string msg;
@@ -2156,7 +2160,15 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
         std::cout << "Tornado: t " << t << " steps " << steps << " contacts " << pairs.size();
         for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
         std::cout << std::endl;
+        if (after >= 0) {
+            ++after;
+            EXPECT_GE(pairs.size(), size_t(4)) << "t " << t;
+        } else if (pairs.size() >= 4) {
+            after = 0;
+            tContact = t;
+        }
     }
+    std::cout << "Tornado: >= 4 contact pairs first at t " << tContact << std::endl;
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     std::cout << "Tornado: t " << t << ", " << steps << " steps, " << secs << " s, contact pairs";
@@ -2177,6 +2189,8 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
         std::cout << "Tornado: label " << l << " voxels " << v0 << " -> " << v1 << " (loss "
                   << 100.0 * loss << "%), reference loss " << 100.0 * refLoss << "%" << std::endl;
         EXPECT_GE(v1, 1.0) << "label " << l;
-        EXPECT_LE(loss, 1.1 * refLoss + 0.02) << "label " << l;
+        // ruling R31: two-sided (a reference gain bounds MOGAC's gain too)
+        EXPECT_LE(loss, 1.1 * std::max(refLoss, 0.0) + 0.02) << "label " << l;
+        EXPECT_GE(loss, 1.1 * std::min(refLoss, 0.0) - 0.02) << "label " << l;
     }
 }
