@@ -142,7 +142,8 @@ public:
     /// equals @a label. Seeds are the active phi voxels with a face neighbour
     /// on the other side of that region. They keep phi (no 5.1 reseed),
     /// except outside seeds next to a third label, which are rebuilt from
-    /// label-side values (lsmo_internal::rebuildJunctionSeeds, ruling R17);
+    /// label-side values within proven bounds (lsmo_internal::
+    /// rebuildJunctionSeeds, rulings R17, R19; first order at junction lines);
     /// the outer layers solve spec 5.2 on |psi|, and the sign is applied last.
     /// The result is active exactly at the voxels with |psi| < halfWidth*dx
     /// (the seeds dilated by @a halfWidth; for @a halfWidth up to this
@@ -680,30 +681,28 @@ struct LabelRegionDiffers
     bool requireActive;
 };
 
-/// @brief Per-label reconstruction near junctions (spec 5.3, ruling R17).
-/// @details A seed q of @a out (active in @a seeds) outside the region
-/// {L == @a label} holds phi_q, the distance to its own label's boundary,
-/// which next to a third label may be a boundary with that label rather than
-/// the region's. It is rebuilt only if it has a face neighbour (active or
-/// not) of a third label (neither @a label nor L(q)) AND phi_q is provably
-/// not the distance to the region (ruling R18): for a planar region
-/// boundary with unit normal n, psi is linear, so the jump to a face
-/// neighbour p inside the region along axis i is
-/// phi_q + phi_p = dx*|n_i|, and the neighbour along the dominant axis of n
-/// (|n_i| >= 1/sqrt(3)) is always across the boundary when any is. A
-/// correct phi_q therefore has max_p (phi_q + phi_p) >= dx/sqrt(3) over its
-/// region seed neighbours p (phi_p is exact: region voxels store the distance
-/// to the region's own boundary); a smaller maximum means phi_q measures a
-/// nearer boundary with a third label. (Comparing crossing fractions
-/// phi_q/(phi_q + phi_n) towards third-label and region neighbours does not
-/// separate the cases: both are along-axis distances that bound the normal
-/// distances only from above.) Selected seeds are rebuilt by a local
-/// Godunov extension of psi = -phi inside / +phi outside: per axis the
-/// smallest known psi among the two face neighbours (label-side seeds, other
-/// outside seeds, rebuilt seeds once solved), then
-/// sum_i (psi - a_i)^2 = dx^2. Jacobi sweeps over just these seeds until no
-/// value changes by more than 1e-4*dx (at most 8). A seed with no known
-/// neighbour keeps its value. Results are clamped to [0, background].
+/// @brief Per-label reconstruction near junctions (spec 5.3, rulings R17, R19).
+/// @details Let psi be the signed distance to the region {L == @a label}
+/// and q a seed of @a out (active in @a seeds) outside the region. Its value
+/// phi_q is the distance to its own label's boundary, which next to a third
+/// label may be a boundary with that label rather than the region's. Two
+/// bounds hold whenever region voxels store their exact distance to the
+/// region's boundary (which is that label's own boundary):
+/// - lower: phi_q <= psi(q), since the region's boundary seen from q is part
+///   of the boundary of L(q)'s region;
+/// - upper: psi(q) <= |q - p| - phi_p for every region voxel p, since the
+///   ball of radius phi_p about p lies inside the region.
+/// Every outside seed with a face neighbour (active or not) of a third label
+/// (neither @a label nor L(q)) is rebuilt by a local Godunov extension of
+/// psi: per axis the smallest known psi among the two face neighbours
+/// (-phi at region seeds, +value at other outside seeds and at rebuilt seeds
+/// once solved), then sum_i (psi - a_i)^2 = dx^2, clamped to
+/// [phi_q, min(B, background)] with B the upper bound over the active region
+/// voxels p within the 5x5x5 neighbourhood of q. Jacobi sweeps over just
+/// these seeds until no value changes by more than 1e-4*dx (at most 8). A
+/// seed with no known neighbour keeps phi_q. psi is not smooth at junction
+/// lines, so the rebuilt values are only first-order accurate there; seeds
+/// whose phi_q is already exact stay within the interval but may move.
 /// Runs serially (junction seeds are few).
 template<typename FloatTreeT, typename BoolTreeT, typename LabelTreeT>
 void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTreeT& labels,
@@ -714,9 +713,9 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
     tree::ValueAccessor<FloatTreeT> acc(out);
     tree::ValueAccessor<const BoolTreeT> seedAcc(seeds);
 
-    const double minJump = dx * (1.0 / std::sqrt(3.0) - 1e-4);
+    const float bg = out.background();
     std::vector<Coord> todo;
-    std::vector<float> keep;
+    std::vector<float> keep, upper;
     for (auto it = seeds.cbeginValueOn(); it; ++it) {
         const Coord q = it.getCoord();
         const auto lq = lab.getValue(q);
@@ -727,24 +726,26 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
             third = ln != label && ln != lq;
         }
         if (!third) continue;
-        // Provably-wrong test (ruling R18): if phi_q is the distance to the
-        // region, the jump psi(q) - psi(p) = phi_q + phi_p to some region
-        // neighbour p is at least dx/sqrt(3) (see the function doc).
+        // upper bound from the balls inside the region (see above)
         const float phiQ = acc.getValue(q);
-        double jump = 0.0;
-        for (int f = 0; f < 6; ++f) {
-            const Coord p = q + offs[f];
-            if (lab.getValue(p) != label || !seedAcc.isValueOn(p)) continue;
-            jump = std::max(jump, double(phiQ) + double(acc.getValue(p)));
+        double ball = double(bg);
+        for (int k = -2; k <= 2; ++k) {
+            for (int j = -2; j <= 2; ++j) {
+                for (int i = -2; i <= 2; ++i) {
+                    const Coord p = q + Coord(i, j, k);
+                    float v;
+                    if (lab.getValue(p) != label || !acc.probeValue(p, v)) continue;
+                    ball = std::min(ball, dx * std::sqrt(double(i * i + j * j + k * k)) - double(v));
+                }
+            }
         }
-        if (jump >= minJump) continue;
         todo.push_back(q);
-        keep.push_back(acc.getValue(q));
+        keep.push_back(phiQ);
+        upper.push_back(float(std::max(ball, double(phiQ))));
     }
     if (todo.empty()) return;
     for (const Coord& q : todo) acc.setValue(q, kUnknownDistance);
 
-    const float bg = out.background();
     const float tol = float(1e-4 * dx);
     std::vector<float> next(todo.size());
     for (int sweep = 0; sweep < 8; ++sweep) {
@@ -766,7 +767,8 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
             }
             const float old = acc.getValue(q);
             next[n] = m == 0 ? old
-                : float(std::min(std::max(solveGodunov(abar, coef, m, dx), 0.0), double(bg)));
+                : float(std::min(std::max(solveGodunov(abar, coef, m, dx), double(keep[n])),
+                    double(upper[n])));
             if (old == kUnknownDistance) {
                 if (next[n] != kUnknownDistance) maxDelta = std::numeric_limits<float>::max();
             } else {
@@ -1022,8 +1024,8 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
 
     // 3. seeds: label | not-label crossings, keeping the pair's phi (ruling
     // R17: no subcell reseed, which is not a fixed point of reinitialized
-    // phi). Not-label seeds next to a third label store the distance to the
-    // wrong boundary and are rebuilt from label-side data.
+    // phi). Not-label seeds next to a third label may store the distance to
+    // the wrong boundary and are rebuilt from label-side data.
     BoolTreeT seeds(false);
     lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize,
         /*writeValues=*/false);

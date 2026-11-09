@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -749,34 +750,49 @@ TEST_F(TestLevelSetMultiObject, FromSignedGridsThrows)
 
 namespace {
 
-// Three labels meeting at 120 degrees along a z-parallel junction axis
-// through index (0.37, -0.21): label l (1..3) owns the polar angles
-// [theta0 + (l-1)*120deg, theta0 + l*120deg) about the axis, theta0 = 10deg.
+// Three labels meeting at 120 degrees along a straight junction line through
+// index point c with unit direction a. In the plane frame (u, v) normal to a
+// (u = x projected off a, v = a x u, so u = x and v = y for a z-parallel
+// line), label l (1..3) owns the polar angles
+// [theta0 + (l-1)*120deg, theta0 + l*120deg) about the line.
 struct TripleJunction
 {
     double dx = 0.5;
-    double x0 = 0.37, y0 = -0.21;            // axis, index space
-    double theta0 = 10.0 * M_PI / 180.0;
+    double theta0;
+    Vec3d c, a, u, v;  // index space
+    int H;             // active box [-H, H-1]^3
 
-    Vec2d local(const Vec3d& w) const { return Vec2d(w[0] / dx - x0, w[1] / dx - y0); }
+    TripleJunction(double th, const Vec3d& centre, const Vec3d& dir, int h = 12)
+        : theta0(th), c(centre), a(dir.unitSafe()), H(h)
+    {
+        const Vec3d ref = std::abs(a[0]) < 0.9 ? Vec3d(1, 0, 0) : Vec3d(0, 1, 0);
+        u = (ref - a * ref.dot(a)).unitSafe();
+        v = a.cross(u);
+    }
+
+    Vec2d local(const Vec3d& w) const
+    {
+        const Vec3d d = w / dx - c;
+        return Vec2d(d.dot(u), d.dot(v));
+    }
     Vec2d ray(int k) const
     {
-        const double a = theta0 + k * 2.0 * M_PI / 3.0;
-        return Vec2d(std::cos(a), std::sin(a));
+        const double t = theta0 + k * 2.0 * M_PI / 3.0;
+        return Vec2d(std::cos(t), std::sin(t));
     }
     int sector(const Vec3d& w) const
     {
         const Vec2d p = local(w);
-        double a = std::atan2(p[1], p[0]) - theta0;
-        while (a < 0.0) a += 2.0 * M_PI;
-        while (a >= 2.0 * M_PI) a -= 2.0 * M_PI;
-        return std::min(3, int(a / (2.0 * M_PI / 3.0)) + 1);
+        double t = std::atan2(p[1], p[0]) - theta0;
+        while (t < 0.0) t += 2.0 * M_PI;
+        while (t >= 2.0 * M_PI) t -= 2.0 * M_PI;
+        return std::min(3, int(t / (2.0 * M_PI / 3.0)) + 1);
     }
-    // Distance from p to the ray {t*u, t >= 0} (index units).
-    static double rayDist(const Vec2d& p, const Vec2d& u)
+    // Distance from p to the ray {t*r, t >= 0} (index units).
+    static double rayDist(const Vec2d& p, const Vec2d& r)
     {
-        const double t = p.dot(u);
-        return t >= 0.0 ? (p - u * t).length() : p.length();
+        const double t = p.dot(r);
+        return t >= 0.0 ? (p - r * t).length() : p.length();
     }
     // Analytic signed distance to sector @a l, world units.
     double signedDist(const Vec3d& w, int l) const
@@ -785,12 +801,16 @@ struct TripleJunction
         const double d = std::min(rayDist(p, ray(l - 1)), rayDist(p, ray(l)));
         return dx * (sector(w) == l ? -d : d);
     }
-    double axisDist(const Vec3d& w) const { return local(w).length(); } // index units
+    double lineDist(const Vec3d& w) const { return local(w).length(); } // index units
+    // Chebyshev distance (index units) from the voxel centre to the box faces.
+    double boxDepth(const Coord& p) const
+    {
+        return H - std::max({std::abs(p[0] + 0.5), std::abs(p[1] + 0.5), std::abs(p[2] + 0.5)});
+    }
 
     // The pair built directly from analytic data: phi = distance to the
-    // voxel's own sector boundary, active where phi < 3*dx inside
-    // [-20, 19]^3, and a one-voxel inactive shell holding the labels
-    // (ruling R7b).
+    // voxel's own sector boundary, active where phi < 3*dx inside the box,
+    // and a one-voxel inactive shell holding the labels (ruling R7b).
     MLS::Ptr build() const
     {
         const int halfWidth = 3;
@@ -801,26 +821,49 @@ struct TripleJunction
         lab->setTransform(xform->copy());
         auto pa = phi->getAccessor();
         auto la = lab->getAccessor();
-        for (int i = -21; i <= 20; ++i)
-            for (int j = -21; j <= 20; ++j)
-                for (int k = -21; k <= 20; ++k) {
-                    const Coord c(i, j, k);
-                    const Vec3d w = xform->indexToWorld(c);
+        for (int i = -H - 1; i <= H; ++i)
+            for (int j = -H - 1; j <= H; ++j)
+                for (int k = -H - 1; k <= H; ++k) {
+                    const Coord q(i, j, k);
+                    const Vec3d w = xform->indexToWorld(q);
                     const int l = sector(w);
                     const double d = std::abs(signedDist(w, l));
-                    const bool inBox = std::max({std::abs(i + 0.5), std::abs(j + 0.5),
-                        std::abs(k + 0.5)}) < 20.0;
-                    if (inBox && d < halfWidth * dx) {
-                        pa.setValue(c, float(d));
-                        la.setValue(c, l);
+                    if (boxDepth(q) > 0.0 && d < halfWidth * dx) {
+                        pa.setValue(q, float(d));
+                        la.setValue(q, l);
                     } else {
-                        pa.touchLeaf(c);
-                        la.setValueOff(c, l);
+                        pa.touchLeaf(q);
+                        la.setValueOff(q, l);
                     }
                 }
         return MLS::Ptr(new MLS(phi, lab, halfWidth));
     }
 };
+
+// Seeded junction set (ruling R19): the original fixture (theta0 = 10deg,
+// z-parallel through (0.37, -0.21)), seven z-parallel lines with random
+// theta0 and sub-voxel offset, and four tilted lines. Uses its own
+// generator arithmetic so the set is the same on every platform.
+std::vector<TripleJunction>
+junctionSet()
+{
+    std::mt19937 rng(20261108u);
+    auto u01 = [&rng]() { return double(rng()) / 4294967296.0; };
+    std::vector<TripleJunction> set;
+    set.emplace_back(10.0 * M_PI / 180.0, Vec3d(0.37, -0.21, 0.0), Vec3d(0, 0, 1));
+    for (int n = 0; n < 7; ++n) {
+        const double th = u01() * 2.0 * M_PI;
+        const Vec3d c(u01() - 0.5, u01() - 0.5, u01() - 0.5);
+        set.emplace_back(th, c, Vec3d(0, 0, 1));
+    }
+    for (int n = 0; n < 4; ++n) {
+        const double th = u01() * 2.0 * M_PI;
+        const Vec3d c(u01() - 0.5, u01() - 0.5, u01() - 0.5);
+        const Vec3d dir(u01() - 0.5, u01() - 0.5, 1.0);
+        set.emplace_back(th, c, dir);
+    }
+    return set;
+}
 
 void
 expectLevelSetGrid(const FloatGrid& g, const MLS& m, int halfWidth)
@@ -834,86 +877,89 @@ expectLevelSetGrid(const FloatGrid& g, const MLS& m, int halfWidth)
 
 TEST_F(TestLevelSetMultiObject, TripleJunction)
 {
-    const TripleJunction tj;
-    auto m = tj.build();
-    std::string msg;
-    ASSERT_TRUE(m->validate(&msg)) << msg;
-    ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3}));
-    const double dx = tj.dx;
     const Coord* offs = tools::lsmo_internal::faceOffsets();
+    const std::vector<TripleJunction> set = junctionSet();
+    double worstFar = 0.0, worstNear = 0.0, worstRms = 0.0;
+    for (size_t n = 0; n < set.size(); ++n) {
+        const TripleJunction& tj = set[n];
+        const double dx = tj.dx;
+        auto m = tj.build();
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3}));
 
-    for (int l = 1; l <= 3; ++l) {
-        SCOPED_TRACE("label " + std::to_string(l));
-        const auto analytic = [&tj, l](Vec3d w) { return tj.signedDist(w, l); };
+        for (int l = 1; l <= 3; ++l) {
+            SCOPED_TRACE("junction " + std::to_string(n) + " label " + std::to_string(l));
+            const auto analytic = [&tj, l](Vec3d w) { return tj.signedDist(w, l); };
 
-        FloatGrid::Ptr g = m->extractSignedDistance(l);
-        ASSERT_TRUE(g);
-        expectLevelSetGrid(*g, *m, 3);
+            FloatGrid::Ptr g = m->extractSignedDistance(l);
+            ASSERT_TRUE(g);
+            expectLevelSetGrid(*g, *m, 3);
+            const double rms = rmsBandError(*g, analytic);
 
-        const double maxErr = maxInterfaceError(*g, analytic);
-        const double rms = rmsBandError(*g, analytic);
-
-        // Interface-layer error binned by distance to the junction axis.
-        const double edges[4] = {1.0, 2.0, 4.0, 1e9};
-        double binMax[4] = {0, 0, 0, 0};
-        Index64 binN[4] = {0, 0, 0, 0};
-        tree::ValueAccessor<const FloatTree> acc(g->tree());
-        for (auto it = g->tree().cbeginValueOn(); it; ++it) {
-            const Coord p = it.getCoord();
-            bool iface = false;
-            for (int f = 0; f < 6 && !iface; ++f) {
-                float v;
-                if (acc.probeValue(p + offs[f], v)) iface = (v < 0.0f) != (*it < 0.0f);
+            // Interface-layer error binned by distance to the junction line.
+            const double edges[4] = {1.0, 2.0, 4.0, 1e9};
+            double binMax[4] = {0, 0, 0, 0};
+            Index64 binN[4] = {0, 0, 0, 0};
+            tree::ValueAccessor<const FloatTree> acc(g->tree());
+            for (auto it = g->tree().cbeginValueOn(); it; ++it) {
+                const Coord p = it.getCoord();
+                bool iface = false;
+                for (int f = 0; f < 6 && !iface; ++f) {
+                    float v;
+                    if (acc.probeValue(p + offs[f], v)) iface = (v < 0.0f) != (*it < 0.0f);
+                }
+                if (!iface) continue;
+                const Vec3d w = g->indexToWorld(p);
+                int b = 0;
+                while (tj.lineDist(w) >= edges[b]) ++b;
+                ++binN[b];
+                binMax[b] = std::max(binMax[b], std::abs(*it - analytic(w)) / dx);
             }
-            if (!iface) continue;
-            const Vec3d w = g->indexToWorld(p);
-            int b = 0;
-            while (tj.axisDist(w) >= edges[b]) ++b;
-            ++binN[b];
-            binMax[b] = std::max(binMax[b], std::abs(*it - analytic(w)) / dx);
-        }
-        std::cout << "TripleJunction label " << l << ": max interface error " << maxErr
-            << " dx, RMS band error " << rms << " dx; interface max by axis distance"
-            << " [<1: " << binMax[0] << " (" << binN[0] << ")"
-            << ", 1-2: " << binMax[1] << " (" << binN[1] << ")"
-            << ", 2-4: " << binMax[2] << " (" << binN[2] << ")"
-            << ", >4: " << binMax[3] << " (" << binN[3] << ")]" << std::endl;
-        // Gates (ruling R18): interface voxels farther than 1 voxel from the
-        // junction axis < 0.05*dx, within 1 voxel < 0.25*dx; RMS over the
-        // whole band < 0.1*dx.
-        const double farMax = std::max({binMax[1], binMax[2], binMax[3]});
-        std::cout << "TripleJunction label " << l << ": interface max beyond 1 voxel of the axis "
-            << farMax << " dx, within 1 voxel " << binMax[0] << " dx" << std::endl;
-        EXPECT_LT(farMax, 0.05);
-        EXPECT_LT(binMax[0], 0.25);
-        EXPECT_LT(rms, 0.1);
+            // Gates (ruling R19; psi_l is not smooth at the junction line):
+            // < 0.05*dx at least 2 voxels from the line, < 0.5*dx within 2
+            // voxels, RMS over the whole band < 0.1*dx.
+            const double farMax = std::max(binMax[2], binMax[3]);
+            const double nearMax = std::max(binMax[0], binMax[1]);
+            std::cout << "TripleJunction " << n << " label " << l << ": interface max >=2 vox "
+                << farMax << " dx, <2 vox " << nearMax << " dx, RMS " << rms
+                << " dx; by line distance [<1: " << binMax[0] << " (" << binN[0] << ")"
+                << ", 1-2: " << binMax[1] << " (" << binN[1] << ")"
+                << ", 2-4: " << binMax[2] << " (" << binN[2] << ")"
+                << ", >4: " << binMax[3] << " (" << binN[3] << ")]" << std::endl;
+            EXPECT_LT(farMax, 0.05);
+            EXPECT_LT(nearMax, 0.5);
+            EXPECT_LT(rms, 0.1);
+            worstFar = std::max(worstFar, farMax);
+            worstNear = std::max(worstNear, nearMax);
+            worstRms = std::max(worstRms, rms);
 
-        // Every voxel within halfWidth of the label boundary is in the band
-        // (checked 3+ voxels away from the x/y faces of the fixture box,
-        // beyond which the boundary's nearest point may lie outside the
-        // truncated band).
-        for (auto it = g->tree().cbeginValueOn(); it; ++it) EXPECT_LT(std::abs(*it), 3.0 * dx);
-        Index64 missing = 0;
-        for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
-            const Coord c = it.getCoord();
-            if (std::max(std::abs(c[0] + 0.5), std::abs(c[1] + 0.5)) > 16.5) continue;
-            const Vec3d w = m->phi()->indexToWorld(c);
-            if (std::abs(analytic(w)) < 2.5 * dx && !g->tree().isValueOn(c)) ++missing;
-        }
-        EXPECT_EQ(missing, Index64(0));
+            // Every voxel within halfWidth of the label boundary is in the
+            // band (checked 3+ voxels inside the fixture box, beyond which
+            // the boundary's nearest point may lie outside the truncated band).
+            for (auto it = g->tree().cbeginValueOn(); it; ++it) EXPECT_LT(std::abs(*it), 3.0 * dx);
+            Index64 missing = 0;
+            for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+                const Coord c = it.getCoord();
+                if (tj.boxDepth(c) < 3.0) continue;
+                const Vec3d w = m->phi()->indexToWorld(c);
+                if (std::abs(analytic(w)) < 2.5 * dx && !g->tree().isValueOn(c)) ++missing;
+            }
+            EXPECT_EQ(missing, Index64(0));
 
-        // Regression guard (spec 5.3): raw +-phi underestimates psi_l
-        // outside l near the junction.
-        auto raw = rawSignedGrid(*m, l, [&tj, l](Vec3d w) { return tj.sector(w) != l; });
-        double maxUnder = 0.0;
-        for (auto it = raw->tree().cbeginValueOn(); it; ++it) {
-            const Vec3d w = raw->indexToWorld(it.getCoord());
-            maxUnder = std::max(maxUnder, (analytic(w) - *it) / dx);
+            // Regression guard (spec 5.3): raw +-phi underestimates psi_l
+            // outside l near the junction.
+            auto raw = rawSignedGrid(*m, l, [&tj, l](Vec3d w) { return tj.sector(w) != l; });
+            double maxUnder = 0.0;
+            for (auto it = raw->tree().cbeginValueOn(); it; ++it) {
+                const Vec3d w = raw->indexToWorld(it.getCoord());
+                maxUnder = std::max(maxUnder, (analytic(w) - *it) / dx);
+            }
+            EXPECT_GT(maxUnder, 0.2);
         }
-        std::cout << "TripleJunction label " << l << ": raw max underestimate outside "
-            << maxUnder << " dx" << std::endl;
-        EXPECT_GT(maxUnder, 0.2);
     }
+    std::cout << "TripleJunction over " << set.size() << " junctions: worst interface max >=2 vox "
+        << worstFar << " dx, <2 vox " << worstNear << " dx, worst RMS " << worstRms << " dx" << std::endl;
 }
 
 TEST_F(TestLevelSetMultiObject, ExtractMatchesRoundTrip)
