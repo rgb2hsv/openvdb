@@ -6,7 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <string>
+#include <vector>
 
 class TestLevelSetMultiObject: public ::testing::Test
 {
@@ -67,7 +70,6 @@ TEST_F(TestLevelSetMultiObject, HolderValidate)
 
 TEST_F(TestLevelSetMultiObject, HolderThrows)
 {
-    auto m = makePair();
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
     Int32Grid::Ptr lab = Int32Grid::create(0);
     phi->setTransform(math::Transform::createLinearTransform(1.0));
@@ -125,4 +127,56 @@ TEST_F(TestLevelSetMultiObject, HolderDilateErode)
     EXPECT_EQ(m->phi()->activeVoxelCount(), n0);
     EXPECT_EQ(m->phi()->activeVoxelCount(), m->labels()->activeVoxelCount());
     EXPECT_TRUE(m->validate());
+}
+
+TEST_F(TestLevelSetMultiObject, HolderDilateTieBreak)
+{
+    for (int swap = 0; swap < 2; ++swap) {
+        FloatGrid::Ptr phi = FloatGrid::create(3.0f);
+        Int32Grid::Ptr lab = Int32Grid::create(0);
+        phi->tree().setValueOn(Coord(0, 0, 0), swap ? 0.2f : 0.5f);
+        lab->tree().setValueOn(Coord(0, 0, 0), 1);
+        phi->tree().setValueOn(Coord(2, 0, 0), swap ? 0.5f : 0.2f);
+        lab->tree().setValueOn(Coord(2, 0, 0), 2);
+        MLS m(phi, lab, 3);
+        m.dilate(1);
+        EXPECT_TRUE(m.phi()->tree().isValueOn(Coord(1, 0, 0)));
+        EXPECT_EQ(m.labels()->tree().getValue(Coord(1, 0, 0)), swap ? 1 : 2);
+        EXPECT_TRUE(m.validate());
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, HolderErodePrunesInactive)
+{
+    const double dx = 0.5;
+    auto xform = math::Transform::createLinearTransform(dx);
+    FloatGrid::Ptr phi = FloatGrid::create(float(3.0 * dx));
+    Int32Grid::Ptr lab = Int32Grid::create(0);
+    phi->setTransform(xform);
+    lab->setTransform(xform->copy());
+    const CoordBBox box(Coord(3, 5, 2), Coord(13, 12, 10)); // not leaf aligned
+    auto pa = phi->getAccessor();
+    auto la = lab->getAccessor();
+    auto labelAt = [](const Coord& c) { return c[0] < 8 ? 1 : 2; };
+    for (auto it = box.begin(); it; ++it) {
+        pa.setValue(*it, 0.25f);
+        la.setValue(*it, labelAt(*it));
+    }
+    MLS m(phi, lab, 3);
+    m.erode(1);
+    EXPECT_TRUE(m.validate());
+    EXPECT_LT(m.phi()->activeVoxelCount(), Index64(box.volume()));
+    const float bg = float(3.0 * dx);
+    Index64 off = 0;
+    for (auto it = box.begin(); it; ++it) {
+        if (m.phi()->tree().isValueOn(*it)) continue;
+        ++off;
+        EXPECT_FLOAT_EQ(m.phi()->tree().getValue(*it), bg);
+        EXPECT_EQ(m.labels()->tree().getValue(*it), labelAt(*it));
+    }
+    EXPECT_GT(off, Index64(0));
+    // every inactive phi voxel in surviving leaves is background
+    for (auto leaf = m.phi()->tree().cbeginLeaf(); leaf; ++leaf) {
+        for (auto v = leaf->cbeginValueOff(); v; ++v) EXPECT_FLOAT_EQ(*v, bg);
+    }
 }

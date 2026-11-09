@@ -103,12 +103,20 @@ public:
     /// @param message if non-null, receives a description of the first failure.
     bool validate(std::string* message = nullptr) const
     {
-        if (!mPhi->tree().hasSameTopology(mLabels->tree())) {
-            if (message) *message = "phi and label trees have different active topology";
+        // Compare active voxel sets (not node structure: a uniform label leaf
+        // may legitimately be pruned to a tile while phi keeps its leaf).
+        const char* topoMsg = "phi and label trees have different active topology";
+        if (mPhi->tree().activeVoxelCount() != mLabels->tree().activeVoxelCount()) {
+            if (message) *message = topoMsg;
             return false;
         }
+        tree::ValueAccessor<const LabelTreeT> labAcc(mLabels->tree());
         for (auto it = mPhi->tree().cbeginValueOn(); it; ++it) {
             const float v = *it;
+            if (!labAcc.isValueOn(it.getCoord())) {
+                if (message) *message = topoMsg;
+                return false;
+            }
             if (!std::isfinite(v) || v < 0.0f) {
                 if (message) {
                     std::ostringstream ss;
@@ -128,7 +136,7 @@ public:
     void dilate(int iterations)
     {
         for (int n = 0; n < iterations; ++n) {
-            FloatTreeT old(mPhi->tree(), false, TopologyCopy());
+            FloatTreeT old(mPhi->tree(), mPhi->tree().background(), TopologyCopy());
             tools::dilateActiveValues(mPhi->tree(), 1, NN_FACE, IGNORE_TILES);
             tools::dilateActiveValues(mLabels->tree(), 1, NN_FACE, IGNORE_TILES);
 
@@ -158,7 +166,7 @@ public:
     }
 
     /// @brief Erode the active topology of both trees by @a iterations
-    /// face-neighbour steps.
+    /// face-neighbour steps, then call pruneInactive().
     void erode(int iterations)
     {
         tools::erodeActiveValues(mPhi->tree(), iterations, NN_FACE, IGNORE_TILES);
@@ -166,11 +174,18 @@ public:
         pruneInactive();
     }
 
-    /// @brief Replace inactive values with the background in both trees.
+    /// @brief Clean up inactive values. Every inactive phi voxel is reset to
+    /// the phi background and fully inactive phi nodes are pruned. Inactive
+    /// label voxels keep their value (it records the nearby interior label);
+    /// the label tree is only pruned where nodes are uniform.
     void pruneInactive()
     {
+        const float bg = mPhi->tree().background();
+        for (auto leaf = mPhi->tree().beginLeaf(); leaf; ++leaf) {
+            for (auto it = leaf->beginValueOff(); it; ++it) it.setValue(bg);
+        }
         tools::pruneInactive(mPhi->tree());
-        tools::pruneInactive(mLabels->tree());
+        tools::prune(mLabels->tree());
     }
 
 private:
