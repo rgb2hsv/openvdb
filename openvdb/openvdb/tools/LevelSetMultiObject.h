@@ -3,14 +3,58 @@
 
 /// @file tools/LevelSetMultiObject.h
 ///
-/// @brief Multi-object level sets: a single unsigned distance grid phi
-/// paired with an integer grid of object labels (MOGAC). This header
-/// currently provides the MultiLevelSet data holder (with its factories
-/// fromLabelGrid and fromSignedGrids and the exact per-label signed distance
-/// extractSignedDistance), the second-order label-aware redistancer
-/// MultiLevelSetRedistance, the LabelAwareStencil, the built-in speed functor
-/// MultiObjectForces and the evolver LevelSetMultiObject (with opt-in
-/// topology-preserving evolution, MultiObjectConnectivity).
+/// @brief Multi-object level sets: evolution of several disjoint objects
+/// (and their contacts) by multi-object geodesic active contours (MOGAC)
+/// on a single unsigned distance grid paired with an integer label grid.
+///
+/// @details Provides the MultiLevelSet data holder (factories fromLabelGrid
+/// and fromSignedGrids, and the second-order per-label signed distance
+/// extractSignedDistance), the label-aware redistancer MultiLevelSetRedistance,
+/// the LabelAwareStencil, the built-in speed functor MultiObjectForces
+/// (advection, curvature, ...), the evolver LevelSetMultiObject (with opt-in
+/// topology-preserving evolution, see setTopologyPreservingLabels, and
+/// MultiObjectConnectivity), and, in LevelSetMultiObjectMesh.h, the
+/// topology-constrained multi-label contouring multiObjectToMesh.
+///
+/// @par Example
+/// @code
+/// // signed distance grids (GRID_LEVEL_SET), one per non-zero label
+/// std::map<int32_t, FloatGrid::ConstPtr> grids = { {1, sphereA}, {2, sphereB} };
+/// auto mls = tools::MultiLevelSet<>::fromSignedGrids(grids);
+///
+/// // speed: advection by a velocity grid plus mean curvature smoothing
+/// using MLS = tools::MultiLevelSet<>;
+/// tools::MultiObjectForces<MLS> forces;
+/// forces.setAdvection(velocityGrid, 1.0f);
+/// forces.setCurvatureWeight(0.01f);
+///
+/// // evolve from t = 0 to t = 10
+/// tools::LevelSetMultiObject<MLS, tools::MultiObjectForces<MLS>> evolver(*mls, forces);
+/// // optional: keep these labels' digital topology (see MultiObjectConnectivity)
+/// // evolver.setTopologyPreservingLabels({1, 2});
+/// evolver.advect(0.0, 10.0);
+///
+/// // a regular signed distance grid for one label ...
+/// FloatGrid::Ptr psi1 = mls->extractSignedDistance(1);
+/// // ... or closed manifold meshes for all labels at once
+/// std::map<int32_t, tools::LabelMesh> meshes = tools::multiObjectToMesh(*mls);
+/// @endcode
+///
+/// @par References
+/// - G. Russo, P. Smereka, "A remark on computing distance functions",
+///   J. Comput. Phys. 163(1), 2000.
+/// - F. du Chene, C. Min, F. Gibou, "Second-order accurate computation of
+///   curvatures in a level set framework using novel high-order reinitialization
+///   methods", J. Sci. Comput. 35, 2008. (Higher-order reinitialization.)
+/// - D. L. Chopp, "Some improvements of the fast marching method",
+///   SIAM J. Sci. Comput. 23(1), 2001.
+/// - G. Bertrand, G. Malandain, "A new characterization of three-dimensional
+///   simple points", Pattern Recognition Letters 15(2), 1994 (topological
+///   numbers, used for topology preservation).
+/// - J.-O. Lachaud, A. Montanvert, "Continuous analogs of digital boundaries:
+///   a topological approach to iso-surfaces", Graphical Models 62(3), 2000.
+/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, MOGAC/MUSCLE: multi-object
+///   geodesic active contours (venue and year pending the author).
 
 #ifndef OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
 #define OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
@@ -144,8 +188,9 @@ public:
         return (mLabels->tree().getValue(ijk) == label) ? -d : d;
     }
 
-    /// @brief Signed distance to the boundary of @a label (spec 5.3), exact
-    /// also near junctions where the raw signedDistance() underestimates.
+    /// @brief Signed distance to the boundary of @a label (spec 5.3):
+    /// second-order away from junction lines, first-order within about two
+    /// voxels of a triple-junction line (ruling R19).
     /// @details A voxel is inside if its label (active or not, ruling R7b)
     /// equals @a label. Seeds are the active phi voxels with a face neighbour
     /// on the other side of that region. They keep phi (no 5.1 reseed),
@@ -1642,7 +1687,8 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    so an interface moves at most half a voxel per step (R24); with
 ///    setClampSpeed(true), F is clamped to [-1, 1] and
 ///    dt = min(maxDt, 0.5*dx, speed.stableDt(dx)). Since psi_l >= phi at
-///    every voxel, no voxel outside the projected set can change label.
+///    every voxel, no voxel outside the projected set can change label by projection (orphan
+///    cleanup can still relabel).
 /// -# <b>Projection.</b> v_l = psi_l + dt*F_l with psi_l = -phi for the own
 ///    label and +phi otherwise; the new label is the smallest v (ties to the
 ///    smaller label) and phi = |v_1 - v_2|/2 over the two smallest values, or

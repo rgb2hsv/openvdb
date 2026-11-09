@@ -1539,7 +1539,7 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
 {
     // Review probe: label 1 slab x < 10, label 2 block x in [10,13), y < 3,
     // in contact; label 2 is faster. Along the contact shell (10, y, 12)
-    // label 2 may advance at most cfl*dx + 0.5*dx per step (ruling R23).
+    // label 2 may advance at most half a voxel per step (ruling R24).
     Int32Grid::Ptr labels = Int32Grid::create(0);
     {
         auto acc = labels->getAccessor();

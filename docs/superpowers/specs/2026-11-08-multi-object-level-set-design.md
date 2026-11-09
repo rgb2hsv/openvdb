@@ -396,10 +396,12 @@ Cells are the 2×2×2 voxel-centre cubes of the index grid.
 5. **Output.** Thread-local per-label triangle buffers are concatenated per
    label; optional normals from the gradient of the cell's local ψ_l.
 
-Cost: one read of each interface voxel's 8-cell neighbourhood, plus work
-proportional to the number of (cell, label) pairs, which is about 2 per
-interface cell. Labels absent from a region cost nothing; no per-label grid
-is built.
+Cost: cells are enumerated per block of DIM^3 minimum corners: each label
+leaf plus its seven lower-neighbour blocks (a cell whose minimum corner is one
+voxel below a leaf has corners in it). A block reads a 9^3 label window once
+and exits early when the window is uniform; otherwise work is proportional to
+the number of (cell, label) pairs, about 2 per interface cell. Labels absent
+from a region cost nothing; no per-label grid is built.
 
 ### 6.4 Junction correction
 

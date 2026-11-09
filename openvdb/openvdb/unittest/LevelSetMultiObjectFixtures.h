@@ -13,6 +13,7 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetMultiObject.h>
+#include <openvdb/tree/LeafManager.h>
 #include <openvdb/tools/LevelSetPlatonic.h>
 #include <openvdb/tools/LevelSetSphere.h>
 #include <openvdb/tools/LevelSetTubes.h>
@@ -83,16 +84,16 @@ struct TripleJunction
     }
     Vec2d ray(int k) const
     {
-        const double t = theta0 + k * 2.0 * M_PI / 3.0;
+        const double t = theta0 + k * 2.0 * openvdb::math::pi<double>() / 3.0;
         return Vec2d(std::cos(t), std::sin(t));
     }
     int sector(const Vec3d& w) const
     {
         const Vec2d p = local(w);
         double t = std::atan2(p[1], p[0]) - theta0;
-        while (t < 0.0) t += 2.0 * M_PI;
-        while (t >= 2.0 * M_PI) t -= 2.0 * M_PI;
-        return std::min(3, int(t / (2.0 * M_PI / 3.0)) + 1);
+        while (t < 0.0) t += 2.0 * openvdb::math::pi<double>();
+        while (t >= 2.0 * openvdb::math::pi<double>()) t -= 2.0 * openvdb::math::pi<double>();
+        return std::min(3, int(t / (2.0 * openvdb::math::pi<double>() / 3.0)) + 1);
     }
     /// Distance from p to the ray {t*r, t >= 0} (index units).
     static double rayDist(const Vec2d& p, const Vec2d& r)
@@ -150,10 +151,8 @@ struct TripleJunction
 /// Seeded junction set (ruling R19): the original fixture (theta0 = 10deg,
 /// z-parallel through (0.37, -0.21)), seven z-parallel lines with random
 /// theta0 and sub-voxel offset, and four tilted lines. Uses its own
-/// generator arithmetic so the set is the same on every platform. (Moved
-/// verbatim from TestLevelSetMultiObject.cc; the Vec3d constructors draw
-/// several numbers in one call, so the set depends on the compiler's argument
-/// evaluation order -- a deferred minor of Task 4.)
+/// generator arithmetic so the set is the same on every platform; random
+/// numbers are drawn in a fixed order (theta, centre xyz, direction xy).
 inline std::vector<TripleJunction>
 junctionSet()
 {
@@ -161,17 +160,19 @@ junctionSet()
     std::mt19937 rng(20261108u);
     auto u01 = [&rng]() { return double(rng()) / 4294967296.0; };
     std::vector<TripleJunction> set;
-    set.emplace_back(10.0 * M_PI / 180.0, Vec3d(0.37, -0.21, 0.0), Vec3d(0, 0, 1));
+    set.emplace_back(10.0 * openvdb::math::pi<double>() / 180.0, Vec3d(0.37, -0.21, 0.0), Vec3d(0, 0, 1));
+    // Draw into named locals: the order of evaluation of constructor
+    // arguments is unspecified, the order of these statements is not.
     for (int n = 0; n < 7; ++n) {
-        const double th = u01() * 2.0 * M_PI;
-        const Vec3d c(u01() - 0.5, u01() - 0.5, u01() - 0.5);
-        set.emplace_back(th, c, Vec3d(0, 0, 1));
+        const double th = u01() * 2.0 * openvdb::math::pi<double>();
+        const double cx = u01() - 0.5, cy = u01() - 0.5, cz = u01() - 0.5;
+        set.emplace_back(th, Vec3d(cx, cy, cz), Vec3d(0, 0, 1));
     }
     for (int n = 0; n < 4; ++n) {
-        const double th = u01() * 2.0 * M_PI;
-        const Vec3d c(u01() - 0.5, u01() - 0.5, u01() - 0.5);
-        const Vec3d dir(u01() - 0.5, u01() - 0.5, 1.0);
-        set.emplace_back(th, c, dir);
+        const double th = u01() * 2.0 * openvdb::math::pi<double>();
+        const double cx = u01() - 0.5, cy = u01() - 0.5, cz = u01() - 0.5;
+        const double dxx = u01() - 0.5, dyy = u01() - 0.5;
+        set.emplace_back(th, Vec3d(cx, cy, cz), Vec3d(dxx, dyy, 1.0));
     }
     return set;
 }

@@ -3,6 +3,7 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetMultiObjectMesh.h>
+#include <openvdb/tools/VolumeToMesh.h>
 
 #include "LevelSetMultiObjectFixtures.h"
 #include "LevelSetMultiObjectTopology.h"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -416,8 +418,10 @@ TEST_F(TestLevelSetMultiObjectMesh, CaseTableAll)
         // tubes: exactly the four body-diagonal pairs for a 26 side
         const bool has26 = conn == Conn::FG26_BG6 || conn == Conn::FG6_BG26;
         EXPECT_EQ(tubes, has26 ? 4 : 0) << connName(conn);
-        std::cout << "[CaseTableAll] " << connName(conn) << ": max triangles/case " << maxTris
-                  << ", tube components " << tubes << std::endl;
+        if (std::getenv("OPENVDB_MOGAC_VERBOSE")) {
+            std::cout << "[CaseTableAll] " << connName(conn) << ": max triangles/case " << maxTris
+                      << ", tube components " << tubes << std::endl;
+        }
     }
 }
 
@@ -1014,10 +1018,58 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
         bool wasInterrupted(int = -1) override { return true; }
     } stop;
     EXPECT_TRUE(tools::multiObjectToMesh(*m, {}, tools::MultiObjectMeshSettings(), &stop).empty());
+    // ... also on the serial path (grainSize <= 0), where no TBB group exists
+    tools::MultiObjectMeshSettings serial;
+    serial.grainSize = 0;
+    EXPECT_TRUE(tools::multiObjectToMesh(*m, {}, serial, &stop).empty());
     // requested labels: exactly those keys (absent ones empty), label 0 ignored
     const auto some = tools::multiObjectToMesh(*m, {big, 5, 0});
     ASSERT_EQ(some.size(), size_t(2));
     EXPECT_FALSE(some.at(big).triangles.empty());
     EXPECT_TRUE(some.at(5).points.empty() && some.at(5).triangles.empty());
     EXPECT_TRUE(some.at(big).triangles == tools::multiObjectToMesh(*m).at(big).triangles);
+}
+
+
+////////////////////////////////////////
+// Spec test 14: contouring all labels at once against one extractSignedDistance
+// + volumeToMesh per label, on the tornado end state.
+TEST_F(TestLevelSetMultiObjectMesh, MeshBenchmark)
+{
+    const lsmo_test::Tornado tornado;
+    auto m = tornado.endState();
+    ASSERT_TRUE(m);
+    const std::vector<int32_t> labels = m->labelSet();
+    ASSERT_GE(labels.size(), size_t(2));
+
+    using Clock = std::chrono::steady_clock;
+    size_t multiTris = 0, perLabelPolys = 0;
+    double multiTime = 1e30, perLabelTime = 1e30;
+    for (int run = 0; run < 3; ++run) {
+        auto t0 = Clock::now();
+        const auto meshes = tools::multiObjectToMesh(*m);
+        multiTime = std::min(multiTime, std::chrono::duration<double>(Clock::now() - t0).count());
+        multiTris = 0;
+        for (const auto& kv : meshes) multiTris += kv.second.triangles.size();
+
+        t0 = Clock::now();
+        size_t polys = 0;
+        for (int32_t l : labels) {
+            FloatGrid::Ptr g = m->extractSignedDistance(l);
+            std::vector<Vec3s> points;
+            std::vector<Vec3I> tris;
+            std::vector<Vec4I> quads;
+            tools::volumeToMesh(*g, points, tris, quads, 0.0);
+            polys += tris.size() + quads.size();
+        }
+        perLabelTime = std::min(perLabelTime,
+            std::chrono::duration<double>(Clock::now() - t0).count());
+        perLabelPolys = polys;
+    }
+    std::cout << "MeshBenchmark: " << labels.size() << " labels; multiObjectToMesh "
+              << multiTime << " s (" << multiTris << " triangles); per-label extract + "
+              << "volumeToMesh " << perLabelTime << " s (" << perLabelPolys
+              << " triangles+quads); ratio " << perLabelTime / multiTime << std::endl;
+    EXPECT_GT(multiTris, size_t(0));
+    EXPECT_LE(multiTime, perLabelTime);
 }

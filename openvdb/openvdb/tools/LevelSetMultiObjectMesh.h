@@ -117,6 +117,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -161,7 +162,7 @@ namespace lsmo_internal {
 
 /// Edge e of the cell joins corners kCubeEdgeCorners[e][0] < [e][1] (see the
 /// file documentation for the numbering).
-constexpr uint8_t kCubeEdgeCorners[12][2] = {
+inline constexpr uint8_t kCubeEdgeCorners[12][2] = {
     {0, 1}, {2, 3}, {4, 5}, {6, 7},   // along x
     {0, 2}, {1, 3}, {4, 6}, {5, 7},   // along y
     {0, 4}, {1, 5}, {2, 6}, {3, 7}};  // along z
@@ -1049,20 +1050,21 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
 
     if (interrupter) interrupter->start("Contouring multi-object level set");
     std::vector<MeshBlock> results(blocks.size());
-    bool interrupted = false;
+    std::atomic<bool> interrupted(false);
+    const bool parallel = settings.grainSize > 0;
     auto body = [&](const tbb::blocked_range<size_t>& r) {
         MeshContext<FloatTreeT, LabelTreeT> ctx(phiTree, labelTree, xform, settings,
             all ? nullptr : &requested);
         for (size_t i = r.begin(); i != r.end(); ++i) {
             if (util::wasInterrupted(interrupter)) {
                 interrupted = true;
-                thread::cancelGroupExecution();
+                if (parallel) thread::cancelGroupExecution();
                 return;
             }
             contourBlock(ctx, blocks[i], dim, results[i]);
         }
     };
-    if (settings.grainSize > 0) {
+    if (parallel) {
         tbb::parallel_for(tbb::blocked_range<size_t>(0, blocks.size(), size_t(settings.grainSize)), body);
     } else {
         body(tbb::blocked_range<size_t>(0, blocks.size()));
