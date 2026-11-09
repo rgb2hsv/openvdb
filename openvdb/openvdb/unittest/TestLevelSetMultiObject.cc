@@ -196,8 +196,10 @@ namespace {
 
 // Planar interface at x = 7.3 (label 1 for x <= 7, label 2 for x >= 8),
 // active band x in [4, 11] (four voxels on each side), y, z in [0, 15].
-// The interface layers hold the exact distances; if @a exact is false the
-// outer band voxels hold garbage (alternating 0.5*dx and halfWidth*dx).
+// The two interface layers and their outer neighbours (x in [6, 9], the
+// stencil of the spec 5.1 reseed) hold the exact distances; if @a exact is
+// false the remaining band voxels hold garbage (alternating 0.5*dx and
+// halfWidth*dx).
 MLS::Ptr
 makePlanar(double dx, bool exact)
 {
@@ -214,7 +216,7 @@ makePlanar(double dx, bool exact)
             for (int k = 0; k < 16; ++k) {
                 const Coord c(i, j, k);
                 float d = float(std::abs(i - 7.3) * dx);
-                if (!exact && i != 7 && i != 8) {
+                if (!exact && (i < 6 || i > 9)) {
                     d = ((i + j + k) % 2) ? float(0.5 * dx) : float(halfWidth * dx);
                 }
                 pa.setValue(c, d);

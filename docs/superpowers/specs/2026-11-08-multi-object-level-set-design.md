@@ -211,15 +211,24 @@ keeping the interface fixed.
 ### 5.1 Interface seeding (subcell fix)
 
 Voxel p (label a) is an interface voxel if some face neighbour q has label
-b ≠ a. Along that axis the zero crossing of ψ_a lies at θ·dx from p with
-θ = φ_p / (φ_p + φ_q) (guard: if φ_p + φ_q < ε, θ = 0.5). For each axis take the
-nearest crossing in ±, giving d_x, d_y, d_z (∞ if none); set
+b ≠ a. Its value is the Russo–Smereka subcell fix (Russo & Smereka 2000,
+second order as analysed by du Chéné, Min & Gibou 2008), applied to
+ψ_a over p and its face neighbours: ψ_a = −φ at voxels of label a, +φ
+elsewhere (inactive neighbours read the φ background, signed by their label).
+Per axis i, with ψ(−1), ψ(0) = ψ_p, ψ(+1) the values along that axis,
 
-    φ_p = (Σ_i 1/d_i²)^(−1/2)
+    Δ_i = max(|ψ(+1) − ψ(−1)|/2, |ψ(+1) − ψ(0)|, |ψ(0) − ψ(−1)|, ε) / dx
+    φ_p = |ψ_p| / sqrt(Σ_i Δ_i²)
+
+with ε = 10⁻⁶·dx. (This replaces an axis-crossing formula,
+φ_p = (Σ 1/d_i²)^(−1/2), that was only first order: it has no d_i on an
+axis whose crossing lies more than one voxel away, and so overestimated
+oblique interfaces by up to ≈ 0.35·dx.) For the per-label reconstruction
+(5.3) the region "label a" is given by the isInside predicate.
 
 All seeds are computed from a read-only snapshot of φ so results are order
 independent. Seeds are frozen for 5.2. Correct at triple junctions because any
-different-label neighbour defines a crossing.
+different-label neighbour marks a seed and has the opposite sign in ψ_a.
 
 ### 5.2 Outer layers
 

@@ -85,9 +85,11 @@ public:
     /// @details The label of a voxel is @a labels' value there (active or
     /// not); label 0 is background. Interface voxels (a voxel with a face
     /// neighbour of a different label) are searched among the active voxels
-    /// of @a labels and their face neighbours, seeded with phi = 0.5*dx (the
-    /// voxel face midpoint), and the band (interface voxels dilated by
-    /// @a halfWidth over 26-neighbours) is reinitialized (spec 5); voxels
+    /// of @a labels and their face neighbours and get phi = 0.5*dx (the voxel
+    /// face midpoint), kept frozen while the rest of the band (interface
+    /// voxels dilated by @a halfWidth over 26-neighbours) is redistanced
+    /// (spec 5.2; no 5.1 reseed, whose gradient estimate needs a distance
+    /// field rather than this staircase); voxels
     /// left with phi >= halfWidth*dx are deactivated. Every inactive voxel
     /// kept in the trees holds its label from @a labels (ruling R11).
     /// @throw ValueError if @a halfWidth < 2, the voxel size is not uniform
@@ -242,7 +244,7 @@ private:
     /// Shared factory back end; see the definition.
     template<typename SamplerT>
     static Ptr build(const math::Transform& xform, typename LabelTreeT::Ptr labels,
-        const BoolTreeT& candidates, const SamplerT& sampler, int halfWidth);
+        const BoolTreeT& candidates, const SamplerT& sampler, int halfWidth, bool reseed);
 
     typename FloatGridT::Ptr mPhi;
     typename LabelGridT::Ptr mLabels;
@@ -263,13 +265,18 @@ inline const Coord* faceOffsets()
 
 /// @brief Interface seeding (spec 5.1) over the active voxels of @a out.
 /// @details A voxel p is a seed if differs(p, q) holds for some face neighbour
-/// q (active or not). Along each axis the nearest crossing lies at
-/// theta*dx with theta = phi_p / (phi_p + phi_q) (theta = 0.5 if the sum is
-/// below 1e-6*dx); the seed value is (sum_i 1/d_i^2)^(-1/2). All phi values
-/// are read from @a snapshot (inactive neighbours read as its background),
-/// so the result does not depend on evaluation order. Seed values are
-/// written to @a out and flagged as active voxels of @a seedMask; nothing
-/// else in @a out changes. Active tiles of @a out are ignored.
+/// q (active or not). Its value is the Russo-Smereka subcell fix (Russo &
+/// Smereka 2000; analysed by du Chene, Min & Gibou 2008) applied to the
+/// signed field psi of p's side: psi = -phi at p and at neighbours q with
+/// !differs(p, q), +phi at neighbours with differs(p, q). Per axis
+/// Delta_i = max(|psi(+1) - psi(-1)|/2, |psi(+1) - psi(0)|, |psi(0) - psi(-1)|,
+/// 1e-6*dx) / dx and the seed is |psi_p| / sqrt(sum_i Delta_i^2); terms that
+/// involve an inactive neighbour are left out (only band edges of finite
+/// domains have them; a seed with no active face neighbour keeps its value).
+/// All phi values are read from @a snapshot, so the result does not depend
+/// on evaluation order. Seed
+/// values are written to @a out and flagged as active voxels of @a seedMask;
+/// nothing else in @a out changes. Active tiles of @a out are ignored.
 /// @param differs  copied once per task; called as differs(p, q).
 /// @param writeValues if false, only @a seedMask is built and @a out is
 /// left untouched (used to freeze the current interface values).
@@ -296,29 +303,35 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
             auto* maskLeaf = seedMask.probeLeaf(leaf.origin());
             for (auto it = leaf.beginValueOn(); it; ++it) {
                 const Coord p = it.getCoord();
-                const double phiP = acc.getValue(p);
-                double invSum = 0.0;
-                bool seed = false, onInterface = false;
-                for (int axis = 0; axis < 3; ++axis) {
-                    double d = std::numeric_limits<double>::max();
-                    for (int side = 0; side < 2; ++side) {
-                        const Coord q = p + offs[2 * axis + side];
-                        if (!op(p, q)) continue;
-                        seed = true;
-                        if (!writeValues) break;
-                        float phiQf;
-                        if (!acc.probeValue(q, phiQf)) phiQf = bg;
-                        const double sum = phiP + double(phiQf);
-                        const double theta = (sum < eps) ? 0.5 : phiP / sum;
-                        d = std::min(d, theta * dx);
-                    }
-                    if (seed && !writeValues) break;
-                    if (d == std::numeric_limits<double>::max()) continue;
-                    if (d <= 0.0) { onInterface = true; continue; }
-                    invSum += 1.0 / (d * d);
+                // psi at the six face neighbours, signed relative to p's side;
+                // inactive neighbours are left out of the gradient.
+                double psi[6];
+                bool on[6], seed = false, anyOn = false;
+                for (int f = 0; f < 6; ++f) {
+                    const Coord q = p + offs[f];
+                    const bool other = op(p, q);
+                    seed |= other;
+                    if (!writeValues) { if (seed) break; continue; }
+                    float phiQ = bg;
+                    on[f] = acc.probeValue(q, phiQ);
+                    anyOn |= on[f];
+                    psi[f] = other ? double(phiQ) : -double(phiQ);
                 }
                 if (!seed) continue;
-                if (writeValues) it.setValue(onInterface ? 0.0f : float(1.0 / std::sqrt(invSum)));
+                if (writeValues && anyOn) {
+                    const double psiP = -double(acc.getValue(p));
+                    double sum2 = 0.0;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        const int fm = 2 * axis, fp = 2 * axis + 1;
+                        double d = eps;
+                        if (on[fm] && on[fp]) d = std::max(d, std::abs(psi[fp] - psi[fm]) * 0.5);
+                        if (on[fp]) d = std::max(d, std::abs(psi[fp] - psiP));
+                        if (on[fm]) d = std::max(d, std::abs(psiP - psi[fm]));
+                        d /= dx;
+                        sum2 += d * d;
+                    }
+                    it.setValue(float(std::abs(psiP) / std::sqrt(sum2)));
+                }
                 if (maskLeaf) maskLeaf->setValueOn(it.pos(), true);
             }
         }
@@ -356,10 +369,11 @@ struct InsideDiffers
 /// -# Interface voxels (an active voxel with a face neighbour, active or
 ///    not, of a different label) are frozen. redistance() keeps their
 ///    current values, so repeated calls never move a crossing (use it every
-///    evolution step). reinitialize() first reseeds them with the subcell
-///    distance of spec 5.1, computed from a snapshot of phi; that formula is
-///    not a fixed point of itself on curved interfaces, so reinitialize() is
-///    meant for one-shot use (factories, per-label reconstruction).
+///    evolution step). reinitialize() first reseeds them with the spec 5.1
+///    Russo-Smereka subcell distance, computed from a snapshot of phi; the
+///    reseed is not a fixed point of itself on curved interfaces, so
+///    reinitialize() is meant for one-shot use (factories, per-label
+///    reconstruction).
 /// -# All other active voxels solve |grad phi| = 1 by parallel Jacobi
 ///    iteration, using second-order one-sided upwind differences (Chopp 2001)
 ///    where two same-side upwind values are available (the outer one with
@@ -415,12 +429,14 @@ public:
     int reinitialize() { return this->run(/*reseed=*/true); }
 
     /// @brief Interface seeding only (spec 5.1), for per-label reconstruction.
-    /// @details For each active voxel p of @a out, every face neighbour q with
-    /// isInside(p) != isInside(q) defines a crossing; phi values come from
+    /// @details An active voxel p of @a out is a seed if some face neighbour
+    /// q has isInside(p) != isInside(q). Its value is the Russo-Smereka
+    /// subcell distance |psi_p| / |grad psi| (see lsmo_internal::seedInterface)
+    /// of psi = -phi where isInside, +phi elsewhere, with phi from
     /// @a phiSnapshot. Seeds are written to @a out and marked active in
     /// @a seedMask (which is overwritten); other voxels of @a out are unchanged.
     /// @param voxelSize world-space voxel size dx (trees carry no transform,
-    /// and the subcell crossing offset theta*dx needs it).
+    /// and the gradient estimate needs it).
     /// @param grainSize TBB grain size in leaves; zero or negative runs serially.
     /// @a isInside is copied once per task, so it may own value accessors.
     template<typename IsInsideOp>
@@ -681,7 +697,8 @@ private:
 ///    label leaf touched by the band or its face shell gets the sampled
 ///    label at all its voxels, active exactly on the band.
 /// -# phi mirrors the label tree's structure; band voxels get the sampled
-///    phi; reinitialize() (spec 5.1 reseed + 5.2 solve).
+///    phi; then reinitialize() (spec 5.1 reseed + 5.2 solve) if @a reseed,
+///    else redistance() (sampled interface values frozen + 5.2 solve).
 /// -# Voxels with phi >= halfWidth*dx are deactivated (labels kept), then
 ///    pruneInactive().
 template<typename FloatTreeT, typename LabelTreeT>
@@ -689,7 +706,7 @@ template<typename SamplerT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
 MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     typename LabelTreeT::Ptr labels, const BoolTreeT& candidates,
-    const SamplerT& sampler, int halfWidth)
+    const SamplerT& sampler, int halfWidth, bool reseed)
 {
     const double dx = xform.voxelSize()[0];
     const float bg = float(halfWidth * dx);
@@ -755,7 +772,8 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
     typename LabelGridT::Ptr labGrid = LabelGridT::create(labels);
     labGrid->setTransform(xform.copy());
     Ptr mls(new MultiLevelSet(phiGrid, labGrid, halfWidth));
-    MultiLevelSetRedistance<MultiLevelSet>(*mls).reinitialize();
+    MultiLevelSetRedistance<MultiLevelSet> redist(*mls);
+    if (reseed) redist.reinitialize(); else redist.redistance();
 
     // 4. trim to the band phi < halfWidth*dx
     {
@@ -802,7 +820,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, i
 
     return build(labels.transform(), lab, candidates,
         lsmo_internal::LabelGridSampler<LabelTreeT>(labels.tree(), dx, float(halfWidth * dx)),
-        halfWidth);
+        halfWidth, /*reseed=*/false);
 }
 
 
@@ -873,7 +891,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
     candidates.voxelizeActiveTiles();
     tools::dilateActiveValues(candidates, 1, NN_FACE, IGNORE_TILES);
 
-    return build(*xform, lab, candidates, sampler, halfWidth);
+    return build(*xform, lab, candidates, sampler, halfWidth, /*reseed=*/true);
 }
 
 } // namespace tools
