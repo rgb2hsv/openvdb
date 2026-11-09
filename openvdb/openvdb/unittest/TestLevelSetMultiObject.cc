@@ -1663,9 +1663,12 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
     ASSERT_EQ(y0, 2);
     std::vector<Index64> counts{count()};
     std::vector<int> extents{y0};
+    const double cfl = 0.999;
+    double t = 0.0;
     for (int s = 1; s <= 3; ++s) {
         const float dt = lsmo.step(1.0f);
-        EXPECT_FLOAT_EQ(dt, 0.999f);
+        EXPECT_FLOAT_EQ(dt, float(0.5 * cfl)); // max|F| = 1: half a voxel (R24)
+        t += dt;
         counts.push_back(count());
         extents.push_back(extent());
         std::string msg;
@@ -1674,15 +1677,17 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
     std::cout << "ContactNoCascade: extent " << extents[0] << " " << extents[1] << " "
               << extents[2] << " " << extents[3] << ", label-2 voxels " << counts[0] << " "
               << counts[1] << " " << counts[2] << " " << counts[3] << std::endl;
-    const double cfl = 0.999;
     for (int s = 1; s <= 3; ++s) {
         EXPECT_LE(extents[s] - extents[s - 1], int(std::floor(cfl + 0.5))) << "step " << s;
     }
+    // cumulative: the front (speed 1) has moved t; one voxel of slack at the
+    // junction with label 1, where psi_2 is only the pair lower bound
+    EXPECT_LE(extents[3] - extents[0], int(std::floor(t + 1.0 + 1e-6)));
     // No cascade anywhere: after 3 steps every label-2 voxel (active or not)
-    // is within 3*cfl*dx + dx of a voxel of the initial block
+    // is within t + dx of a voxel of the initial block
     // x in [10,13), y in [0,3), z in [0,24).
     Index64 far = 0;
-    const double bound = 3.0 * cfl + 1.0;
+    const double bound = t + 1.0;
     for (auto it = m->labels()->tree().cbeginValueAll(); it; ++it) {
         if (*it != 2) continue;
         CoordBBox box;
@@ -1717,11 +1722,12 @@ TEST_F(TestLevelSetMultiObject, WallRetreat)
     const Coord wallSide(7, 8, 8), retreat(8, 8, 8);
     const float wallPhi = m->phi()->tree().getValue(wallSide);
     ASSERT_EQ(m->labels()->tree().getValue(retreat), 1);
+    // two steps of dt = 0.5*cfl (R24) move the label-1 boundary ~1 voxel
+    lsmo.step(1.0f);
     lsmo.step(1.0f);
     std::string msg;
     ASSERT_TRUE(m->validate(&msg)) << msg;
     EXPECT_EQ(m->labels()->tree().getValue(retreat), 0);
     EXPECT_EQ(m->labels()->tree().getValue(wallSide), 2);
     EXPECT_EQ(m->phi()->tree().getValue(wallSide), wallPhi);
-    EXPECT_EQ(lsmo.candidateOverflows(), size_t(0));
 }

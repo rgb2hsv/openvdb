@@ -431,12 +431,18 @@ inline double solveGodunov(double* abar, double* coef, int n, double dx)
 /// otherwise. Inactive neighbours are not used. Iteration stops when
 /// max|delta phi| < @a tolerance, after @a maxIter iterations, or on
 /// interrupt; voxels left unreached get the background of @a phi.
+/// With @a signedReflection (evolver, ruling R24) a face neighbour q of p
+/// contributes +phi_q if !differs(p, q), -phi_q if differs(p, q) and q is a
+/// seed, and nothing otherwise; the second-order term then also needs q on
+/// p's side, and results are clamped to >= 0. This is exact for planar
+/// interfaces whose frozen voxels lie on either side.
 /// @param differs copied once per task; called as differs(p, q).
 /// @param grainSize TBB grain size in leaves; zero or negative runs serially.
 /// @return the number of Jacobi iterations performed.
 template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp, typename InterruptT>
 int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& differs,
-    double dx, float tolerance, int maxIter, int grainSize, InterruptT* interrupt)
+    double dx, float tolerance, int maxIter, int grainSize, InterruptT* interrupt,
+    bool signedReflection = false)
 {
     using LeafManagerT = tree::LeafManager<FloatTreeT>;
     using LeafRangeT = typename LeafManagerT::LeafRange;
@@ -468,6 +474,7 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
         auto body = [&](const LeafRangeT& range, float maxDelta) {
             DiffersOp op = differs; // per-task copy (may own value accessors)
             tree::ValueAccessor<const FloatTreeT> acc(phi);
+            tree::ValueAccessor<const BoolTreeT> seedAcc(seeds);
             for (auto leafIt = range.begin(); leafIt; ++leafIt) {
                 auto& aux = leafIt.buffer(1);
                 const auto* mask = seeds.probeConstLeaf(leafIt->origin());
@@ -482,11 +489,20 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
                         for (int side = 0; side < 2; ++side) {
                             float v;
                             const Coord q = p + offs[2 * axis + side];
-                            if (!acc.probeValue(q, v) || !(v < a)) continue;
+                            if (!acc.probeValue(q, v)) continue;
+                            bool sameSide = true;
+                            if (signedReflection && op(p, q)) {
+                                if (!seedAcc.isValueOn(q)) continue; // unknown across
+                                v = -v; // frozen voxel across the interface
+                                sameSide = false;
+                            }
+                            if (!(v < a)) continue;
                             a = v;
                             // a' must lie on p's side of the interface
                             const Coord q2 = q + offs[2 * axis + side];
-                            if (!acc.probeValue(q2, a2) || op(p, q2)) a2 = kUnknownDistance;
+                            if (!sameSide || !acc.probeValue(q2, a2) || op(p, q2)) {
+                                a2 = kUnknownDistance;
+                            }
                         }
                         if (a == kUnknownDistance) continue;
                         if (a2 < a) { // second order (Chopp 2001)
@@ -499,7 +515,8 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
                         ++n;
                     }
                     if (n == 0) { aux.setValue(it.pos(), old); continue; }
-                    const float upd = float(solveGodunov(abar, coef, n, dx));
+                    float upd = float(solveGodunov(abar, coef, n, dx));
+                    if (signedReflection) upd = std::max(upd, 0.0f);
                     const float val = std::min(old, upd);
                     aux.setValue(it.pos(), val);
                     maxDelta = std::max(maxDelta, old - val);
@@ -599,6 +616,30 @@ public:
     /// then redistance phi in place.
     /// @return the number of Jacobi iterations performed.
     int reinitialize() { return this->run(/*reseed=*/true); }
+
+    /// @brief Redistance with only the active voxels of @a freeze kept
+    /// (evolver step, ruling R24). Every other active voxel solves spec 5.2
+    /// with signed reflection: a face neighbour of the same label gives
+    /// +phi, a frozen face neighbour of a different label gives -phi, other
+    /// neighbours of a different label are ignored. Unlike redistance(),
+    /// voxels next to a label change that are not in @a freeze are solved,
+    /// not frozen.
+    /// @return the number of Jacobi iterations performed.
+    int redistance(const BoolTreeT& freeze)
+    {
+        FloatTreeT& phi = mMls.phi()->tree();
+        const double dx = mMls.voxelSize();
+        const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
+        if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
+        BoolTreeT seeds(freeze);
+        seeds.voxelizeActiveTiles();
+        seeds.topologyIntersection(phi);
+        const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
+        const int iter = lsmo_internal::solveOuterLayers(phi, seeds, differs, dx,
+            mTolerance, maxIter, mGrainSize, mInterrupter, /*signedReflection=*/true);
+        if (mInterrupter) mInterrupter->end();
+        return iter;
+    }
 
     /// @brief Interface seeding only (spec 5.1), for per-label reconstruction.
     /// @details An active voxel p of @a out is a seed if some face neighbour
@@ -1451,45 +1492,38 @@ private:
 /// @brief Multi-object level set evolver (MOGAC / MCLS, spec section 4).
 ///
 /// @details One forward Euler step of step() does:
-/// -# <b>Candidates and speeds.</b> Every active voxel that is not of a fixed
-///    label and has phi <= 0.5*dx or a face neighbour (active or not) of a
-///    different label is updated. Its candidates are its own label and the
-///    labels of its face neighbours, minus fixed labels (rulings R3, R21).
-///    Label 0 is passive: it is a candidate only if it is the voxel's or a
-///    face neighbour's label or the voxel touches a fixed label, and its
-///    value is the complement v_0 = -min v_l over the non-zero candidates,
-///    so object/background interfaces move at the object's full speed. The
-///    speed functor is called (on time-n data through a LabelAwareStencil)
-///    only for non-zero candidates; labels with isActive() false get
-///    +0.999 (R4).
-/// -# <b>Time step.</b> dt = min(maxDt, cfl*dx/max|F|, speed.stableDt(dx));
-///    with setClampSpeed(true), F is clamped to [-1, 1] and
-///    dt = min(maxDt, speed.stableDt(dx)).
+/// -# <b>Projected set and candidates.</b> Every active voxel that is not of
+///    a fixed label and has phi <= 0.5*dx or a face neighbour (active or
+///    not) of a different label is projected (ruling R24). Its candidates
+///    are its own label and the labels of its face neighbours, minus fixed
+///    labels (rulings R3, R21). Label 0 is passive: it is a candidate only
+///    if it is the voxel's or a face neighbour's label or the voxel touches a
+///    fixed label, and its value is the complement v_0 = -min v_l over the
+///    non-zero candidates, so object/background interfaces move at the
+///    object's full speed. The speed functor is called (on time-n data
+///    through a LabelAwareStencil) only for non-zero candidates; labels with
+///    isActive() false get +0.999 (R4).
+/// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx)),
+///    so an interface moves at most half a voxel per step (R24); with
+///    setClampSpeed(true), F is clamped to [-1, 1] and
+///    dt = min(maxDt, 0.5*dx, speed.stableDt(dx)). Since psi_l >= phi at
+///    every voxel, no voxel outside the projected set can change label.
 /// -# <b>Projection.</b> v_l = psi_l + dt*F_l with psi_l = -phi for the own
 ///    label and +phi otherwise; the new label is the smallest v (ties to the
 ///    smaller label) and phi = |v_1 - v_2|/2 over the two smallest values, or
 ///    |v_1| with one candidate. Results are written to copies of both trees
 ///    (time-n data stays readable until both are swapped in together).
-///    A voxel whose face neighbour changed label is (re)projected with that
-///    new label added to its candidates, repeated until no label changes:
-///    the redistancer freezes every voxel next to a label change (ruling
-///    R12), so each such voxel must carry a projected value. The time-n
-///    estimate of a label l seen only at time n+1 is (ruling R23)
-///    psi_l^n(q) = max(phi_q^n, min over face neighbours c now labelled l of
-///    psi_l^n(c) + dx), with psi_l^n(c) the value c's projection used: an
-///    upper Lipschitz bound floored by the pair lower bound, so a front
-///    cannot cascade along an interface shell within one step. Speeds first
-///    evaluated here are clamped to the max|F| that set dt.
 /// -# <b>Orphan cleanup</b> (4.5): a voxel whose label occurs nowhere in its
 ///    26-neighbourhood takes the label and phi of its smallest-phi active
-///    neighbour (fixed labels excluded).
+///    neighbour (fixed labels excluded) and is redistanced (not frozen).
 /// -# <b>Band maintenance</b> (4.6): both trees are swapped in; inactive face
 ///    neighbours of active voxels with phi < (halfWidth-1)*dx are activated
 ///    (phi = background, label of the smallest-phi active face neighbour);
-///    MultiLevelSetRedistance::redistance() (interface frozen); voxels of
-///    fixed labels get their time-n phi back; voxels with
-///    phi >= halfWidth*dx are deactivated in both trees (labels kept, R7b);
-///    pruneInactive(). Debug builds assert validate().
+///    MultiLevelSetRedistance::redistance(freeze) keeps the projected voxels
+///    and the fixed-label voxels and solves all others with signed
+///    reflection (R24); voxels with phi >= halfWidth*dx are deactivated in
+///    both trees (labels kept, R7b); pruneInactive(). Debug builds assert
+///    validate().
 ///
 /// Voxels of fixed labels never change label or phi and no label can
 /// capture them; a step with no non-zero candidate anywhere changes nothing.
@@ -1519,6 +1553,7 @@ class LevelSetMultiObject
 public:
     using FloatTreeT = typename MultiLevelSetT::FloatGridT::TreeType;
     using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
+    using BoolTreeT = typename FloatTreeT::template ValueConverter<bool>::Type;
     using LabelT = typename LabelTreeT::ValueType;
     using StencilT = LabelAwareStencil<MultiLevelSetT>;
 
@@ -1536,8 +1571,8 @@ public:
         if (!(cfl > 0.0f)) OPENVDB_THROW(ValueError, "LevelSetMultiObject: CFL must be positive");
         mCfl = cfl;
     }
-    /// @brief Clamp speeds to [-1, 1] and always take dt = maxDt (capped by
-    /// speed.stableDt), as wedge's clampSpeed.
+    /// @brief Clamp speeds to [-1, 1] and take dt = min(maxDt, 0.5*dx)
+    /// (capped by speed.stableDt), as wedge's clampSpeed.
     void setClampSpeed(bool on) { mClampSpeed = on; }
     /// @brief TBB grain size in leaves; zero or negative runs serially.
     void setGrainSize(int grainSize) { mGrainSize = grainSize; }
@@ -1548,13 +1583,10 @@ public:
     bool clampSpeed() const { return mClampSpeed; }
     int grainSize() const { return mGrainSize; }
     float redistanceTolerance() const { return mTolerance; }
-    /// @brief Number of candidate labels dropped so far because a voxel
-    /// already had kMaxCandidates (13) of them; 0 in any sane scene.
-    size_t candidateOverflows() const { return mOverflow; }
 
     /// @brief One forward Euler step of at most @a maxDt (world time).
-    /// @return the time step taken; @a maxDt (or speed.stableDt if smaller)
-    /// without changes if nothing can move, 0 if @a maxDt <= 0.
+    /// @return the time step taken; min(@a maxDt, speed.stableDt) without
+    /// changes if nothing can move, 0 if @a maxDt <= 0.
     float step(float maxDt);
 
     /// @brief Step from @a t0 to @a t1, checking the interrupter before each
@@ -1579,22 +1611,11 @@ public:
     }
 
 private:
-    /// Own label + 6 face labels at time n + 6 face labels at time n+1.
-    static constexpr int kMaxCandidates = 13;
+    /// Own label + 6 face labels.
+    static constexpr int kMaxCandidates = 7;
 
-    /// A non-zero candidate label with its speed and the time-n estimate
-    /// psi_l^n used by the projection. @c derived marks a label seen only on
-    /// a face neighbour at time n+1 (ruling R23 estimate).
-    struct Candidate
-    {
-        int32_t label;
-        float speed; // NaN until evaluated
-        float psi;
-        bool derived;
-    };
-
-    /// Candidate list of one updated voxel: non-zero labels with their
-    /// speeds and psi estimates, and whether passive label 0 participates.
+    /// Candidate list of one projected voxel: non-zero labels with their
+    /// speeds, and whether passive label 0 participates.
     struct VoxelEntry
     {
         Index offset = 0;
@@ -1602,37 +1623,14 @@ private:
         float phi = 0.0f; // time n
         int n = 0;
         bool zero = false;
-        std::array<Candidate, kMaxCandidates> cand;
-
-        int find(int32_t l) const
-        {
-            for (int i = 0; i < n; ++i) if (cand[i].label == l) return i;
-            return -1;
-        }
+        std::array<std::pair<int32_t, float>, kMaxCandidates> cand;
     };
 
     struct LeafData
     {
         std::vector<VoxelEntry> entries;
-        std::vector<int32_t> slot; // voxel offset -> entry index, or -1
-        std::vector<Coord> changed;
-        size_t overflow = 0;
         float maxSpeed = 0.0f;
         bool any = false;
-
-        VoxelEntry& add(Index offset)
-        {
-            if (slot.empty()) slot.assign(FloatTreeT::LeafNodeType::NUM_VALUES, -1);
-            slot[offset] = int32_t(entries.size());
-            entries.emplace_back();
-            entries.back().offset = offset;
-            return entries.back();
-        }
-        VoxelEntry* find(Index offset)
-        {
-            if (slot.empty() || slot[offset] < 0) return nullptr;
-            return &entries[size_t(slot[offset])];
-        }
     };
 
     template<typename BodyT>
@@ -1648,6 +1646,17 @@ private:
         }
     }
 
+    bool isFixed(int32_t l) const { return l != 0 && mSpeed.isFixed(l); }
+
+    /// Add @a l to @a e's candidates (R21): label 0 and fixed labels only
+    /// make passive label 0 participate.
+    void addCandidate(VoxelEntry& e, int32_t l) const
+    {
+        if (l == 0 || mSpeed.isFixed(l)) { e.zero = true; return; } // passive 0 / wall
+        for (int i = 0; i < e.n; ++i) if (e.cand[i].first == l) return;
+        e.cand[e.n++] = std::make_pair(l, 0.0f); // at most 7 distinct labels
+    }
+
     float evalSpeed(StencilT& s, const Coord& ijk, int32_t label) const
     {
         float f;
@@ -1659,40 +1668,6 @@ private:
         }
         if (mClampSpeed) f = std::max(-1.0f, std::min(1.0f, f));
         return f;
-    }
-
-    /// Add @a l to @a e's candidates (R21): label 0 and fixed labels only
-    /// make passive label 0 participate. A new non-zero label gets
-    /// psi_l^n = @a psi (default: the pair value, -phi for the own label and
-    /// +phi otherwise) and a NaN speed (not yet evaluated). A label that does
-    /// not fit is counted in @a overflow. Returns true if the set grew.
-    bool addCandidate(VoxelEntry& e, int32_t l, size_t& overflow,
-        float psi = std::numeric_limits<float>::quiet_NaN(), bool derived = false) const
-    {
-        if (l == 0 || mSpeed.isFixed(l)) { // label 0, or a wall: passive 0
-            const bool grew = !e.zero;
-            e.zero = true;
-            return grew;
-        }
-        if (e.find(l) >= 0) return false;
-        if (e.n >= kMaxCandidates) { ++overflow; return false; }
-        if (std::isnan(psi)) psi = (l == e.own) ? -e.phi : e.phi;
-        e.cand[e.n++] = Candidate{l, std::numeric_limits<float>::quiet_NaN(), psi, derived};
-        return true;
-    }
-
-    /// Evaluate the NaN speeds of @a e at @a ijk, clamped to
-    /// [-bound, bound]. Returns the max |speed| evaluated.
-    float evalSpeeds(StencilT& s, const Coord& ijk, VoxelEntry& e, float bound) const
-    {
-        float mx = 0.0f;
-        for (int c = 0; c < e.n; ++c) {
-            if (!std::isnan(e.cand[c].speed)) continue;
-            const float f = std::max(-bound, std::min(bound, this->evalSpeed(s, ijk, e.cand[c].label)));
-            e.cand[c].speed = f;
-            mx = std::max(mx, std::abs(f));
-        }
-        return mx;
     }
 
     /// Two-smallest projection; false if @a e has no non-zero candidate.
@@ -1712,8 +1687,9 @@ private:
             }
         };
         for (int i = 0; i < e.n; ++i) {
-            const int32_t l = e.cand[i].label;
-            const float v = e.cand[i].psi + dt * e.cand[i].speed;
+            const int32_t l = e.cand[i].first;
+            const float psi = (l == e.own) ? -e.phi : e.phi;
+            const float v = psi + dt * e.cand[i].second;
             consider(l, v);
             minV = std::min(minV, v);
         }
@@ -1730,10 +1706,8 @@ private:
         mMls.labels()->setTree(labels);
     }
 
-    size_t propagate(const tree::LeafManager<const FloatTreeT>& leafs, std::vector<LeafData>& data,
-        FloatTreeT& newPhi, LabelTreeT& newLabels, float dt, float bound);
-    void cleanOrphans(FloatTreeT& newPhi, LabelTreeT& newLabels);
-    void bandMaintenance(const FloatTreeT& oldPhi);
+    void cleanOrphans(FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze);
+    void bandMaintenance(const BoolTreeT& freeze);
 
     MultiLevelSetT& mMls;
     const SpeedT& mSpeed;
@@ -1742,7 +1716,6 @@ private:
     bool mClampSpeed = false;
     int mGrainSize = 1;
     float mTolerance;
-    size_t mOverflow = 0;
 };
 
 
@@ -1763,19 +1736,28 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         for (auto leaf = phi.cbeginLeaf(); leaf; ++leaf) acc.touchLeaf(leaf->origin());
     }
 
-    // 1-2. interface set, candidates and speeds, all on time-n data
+    // Freeze mask: projected voxels and fixed-label voxels (R24).
+    BoolTreeT freeze(phi, false, TopologyCopy());
+    freeze.voxelizeActiveTiles();
+    for (auto leaf = freeze.beginLeaf(); leaf; ++leaf) leaf->setValuesOff();
+
+    // 1-2. projected set, candidates and speeds, all on time-n data
     tree::LeafManager<const FloatTreeT> leafs(phi);
     const size_t leafCount = leafs.leafCount();
     std::vector<LeafData> data(leafCount);
     forEachIndex(leafCount, [&](size_t i) {
         const auto& leaf = leafs.leaf(i);
         LeafData& d = data[i];
+        auto* maskLeaf = freeze.probeLeaf(leaf.origin());
         StencilT stencil(mMls);
         tree::ValueAccessor<const LabelTreeT> lab(labels);
         for (auto it = leaf.cbeginValueOn(); it; ++it) {
             const Coord p = it.getCoord();
             const int32_t own = static_cast<int32_t>(lab.getValue(p));
-            if (own != 0 && mSpeed.isFixed(own)) continue; // walls are skipped
+            if (this->isFixed(own)) { // walls are skipped and stay frozen
+                if (maskLeaf) maskLeaf->setValueOn(it.pos());
+                continue;
+            }
             int32_t nb[6];
             bool seed = false;
             for (int f = 0; f < 6; ++f) {
@@ -1783,36 +1765,38 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
                 seed |= nb[f] != own;
             }
             if (!seed && *it > halfDx) continue;
-            VoxelEntry& e = d.add(it.pos());
+            if (maskLeaf) maskLeaf->setValueOn(it.pos());
+            d.entries.emplace_back();
+            VoxelEntry& e = d.entries.back();
+            e.offset = it.pos();
             e.own = own;
             e.phi = *it;
-            this->addCandidate(e, own, d.overflow);
-            for (int f = 0; f < 6; ++f) this->addCandidate(e, nb[f], d.overflow);
-            d.maxSpeed = std::max(d.maxSpeed,
-                this->evalSpeeds(stencil, p, e, std::numeric_limits<float>::infinity()));
+            this->addCandidate(e, own);
+            for (int f = 0; f < 6; ++f) this->addCandidate(e, nb[f]);
+            for (int c = 0; c < e.n; ++c) {
+                const float s = this->evalSpeed(stencil, p, e.cand[c].first);
+                e.cand[c].second = s;
+                d.maxSpeed = std::max(d.maxSpeed, std::abs(s));
+            }
             d.any |= e.n > 0;
         }
     });
 
     float maxSpeed = 0.0f;
     bool any = false;
-    size_t overflow = 0;
-    for (const LeafData& d : data) {
-        maxSpeed = std::max(maxSpeed, d.maxSpeed);
-        any |= d.any;
-        overflow += d.overflow;
-    }
+    for (const LeafData& d : data) { maxSpeed = std::max(maxSpeed, d.maxSpeed); any |= d.any; }
 
-    // 3. time step
+    // 3. time step: interfaces move at most half a voxel (R24)
     float dt = std::min(maxDt, mSpeed.stableDt(float(dx)));
     if (!any) return dt; // no non-zero candidate anywhere: nothing moves
-    if (!mClampSpeed && maxSpeed > 0.0f) dt = std::min(dt, float(mCfl * dx / maxSpeed));
+    if (mClampSpeed) dt = std::min(dt, halfDx);
+    else if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
 
     // 4. two-smallest projection, written to copies of both trees
     typename FloatTreeT::Ptr newPhi(new FloatTreeT(phi));
     typename LabelTreeT::Ptr newLabels(new LabelTreeT(labels));
     forEachIndex(leafCount, [&](size_t i) {
-        LeafData& d = data[i];
+        const LeafData& d = data[i];
         if (d.entries.empty()) return;
         const auto& leaf = leafs.leaf(i);
         auto* phiLeaf = newPhi->probeLeaf(leaf.origin());
@@ -1822,138 +1806,24 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
             if (!project(e, dt, l, v)) continue;
             phiLeaf->setValueOnly(e.offset, v);
             labLeaf->setValueOnly(e.offset, LabelT(l));
-            if (l != e.own) d.changed.push_back(leaf.offsetToGlobalCoord(e.offset));
         }
     });
-    overflow += this->propagate(leafs, data, *newPhi, *newLabels, dt,
-        mClampSpeed ? 1.0f : maxSpeed);
-    mOverflow += overflow;
-    assert(overflow == 0 && "LevelSetMultiObject: more than 13 candidate labels at a voxel");
 
     // 5. orphan cleanup
-    this->cleanOrphans(*newPhi, *newLabels);
+    this->cleanOrphans(*newPhi, *newLabels, freeze);
 
-    // 6a. swap both trees together
-    typename FloatTreeT::Ptr oldPhi = mMls.phi()->treePtr();
+    // 6a. swap both trees together; b-e. band maintenance
     this->swapBuffers(newPhi, newLabels);
-
-    // 6b-e.
-    this->bandMaintenance(*oldPhi);
+    this->bandMaintenance(freeze);
     assert(mMls.validate());
     return dt;
 }
 
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
-size_t
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::propagate(
-    const tree::LeafManager<const FloatTreeT>& leafs, std::vector<LeafData>& data,
-    FloatTreeT& newPhi, LabelTreeT& newLabels, float dt, float bound)
-{
-    using LeafT = typename FloatTreeT::LeafNodeType;
-    const Coord* offs = lsmo_internal::faceOffsets();
-    const float dx = float(mMls.voxelSize());
-    size_t overflow = 0;
-    std::vector<Coord> front;
-    for (LeafData& d : data) {
-        front.insert(front.end(), d.changed.begin(), d.changed.end());
-        d.changed.clear();
-    }
-    if (front.empty()) return overflow;
-
-    std::map<Coord, size_t> leafIndex;
-    for (size_t i = 0; i < leafs.leafCount(); ++i) leafIndex[leafs.leaf(i).origin()] = i;
-    StencilT stencil(mMls);
-    tree::ValueAccessor<const FloatTreeT> phiAcc(mMls.phi()->tree());
-    tree::ValueAccessor<const LabelTreeT> labAcc(mMls.labels()->tree());
-    tree::ValueAccessor<FloatTreeT> newPhiAcc(newPhi);
-    tree::ValueAccessor<LabelTreeT> newLabAcc(newLabels);
-
-    auto findEntry = [&](const Coord& p) -> VoxelEntry* {
-        const auto found = leafIndex.find(p & ~(LeafT::DIM - 1));
-        if (found == leafIndex.end()) return nullptr;
-        return data[found->second].find(LeafT::coordToOffset(p));
-    };
-    // psi_l^n at carrier c as c's own projection used it; otherwise the
-    // time-n pair value.
-    auto carrierPsi = [&](const Coord& c, int32_t l) -> float {
-        if (const VoxelEntry* e = findEntry(c)) {
-            const int k = e->find(l);
-            if (k >= 0) return e->cand[k].psi;
-        }
-        const float phiC = phiAcc.getValue(c);
-        return (static_cast<int32_t>(labAcc.getValue(c)) == l) ? -phiC : phiC;
-    };
-
-    while (!front.empty()) {
-        std::vector<Coord> next;
-        for (const Coord& c : front) {
-            for (int f = 0; f < 6; ++f) {
-                const Coord q = c + offs[f];
-                float phiQ;
-                if (!phiAcc.probeValue(q, phiQ)) continue; // only active voxels
-                const int32_t own = static_cast<int32_t>(labAcc.getValue(q));
-                if (own != 0 && mSpeed.isFixed(own)) continue;
-                const auto found = leafIndex.find(q & ~(LeafT::DIM - 1));
-                if (found == leafIndex.end()) continue;
-                LeafData& d = data[found->second];
-                const Index offset = LeafT::coordToOffset(q);
-                VoxelEntry* e = d.find(offset);
-                bool grew = false;
-                if (!e) {
-                    e = &d.add(offset);
-                    e->own = own;
-                    e->phi = phiQ;
-                    this->addCandidate(*e, own, overflow);
-                    for (int g = 0; g < 6; ++g) {
-                        this->addCandidate(*e,
-                            static_cast<int32_t>(labAcc.getValue(q + offs[g])), overflow);
-                    }
-                    grew = true;
-                }
-                // Labels q sees only at time n+1 (R23): psi_l^n(q) =
-                // max(phi_q^n, min over carriers c of psi_l^n(c) + |q - c|).
-                for (int g = 0; g < 6; ++g) {
-                    const int32_t l = static_cast<int32_t>(newLabAcc.getValue(q + offs[g]));
-                    if (l == 0 || mSpeed.isFixed(l)) {
-                        grew |= this->addCandidate(*e, l, overflow);
-                        continue;
-                    }
-                    const int k = e->find(l);
-                    if (k >= 0 && !e->cand[k].derived) continue; // seen at time n
-                    float best = std::numeric_limits<float>::infinity();
-                    for (int h = 0; h < 6; ++h) {
-                        const Coord cc = q + offs[h];
-                        if (static_cast<int32_t>(newLabAcc.getValue(cc)) != l) continue;
-                        best = std::min(best, carrierPsi(cc, l) + dx);
-                    }
-                    const float psi = std::max(phiQ, best);
-                    if (k >= 0) {
-                        if (psi < e->cand[k].psi) { e->cand[k].psi = psi; grew = true; }
-                    } else {
-                        grew |= this->addCandidate(*e, l, overflow, psi, /*derived=*/true);
-                    }
-                }
-                if (!grew) continue;
-                this->evalSpeeds(stencil, q, *e, bound);
-                int32_t l; float v;
-                if (!project(*e, dt, l, v)) continue;
-                const int32_t cur = static_cast<int32_t>(newLabAcc.getValue(q));
-                newPhiAcc.setValueOnly(q, v);
-                newLabAcc.setValueOnly(q, LabelT(l));
-                if (l != cur) next.push_back(q);
-            }
-        }
-        front.swap(next);
-    }
-    return overflow;
-}
-
-
-template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 void
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
-    FloatTreeT& newPhi, LabelTreeT& newLabels)
+    FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze)
 {
     struct Fix { Coord ijk; LabelT label; float phi; };
     tree::LeafManager<const FloatTreeT> leafs(newPhi);
@@ -1964,7 +1834,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
         for (auto it = leafs.leaf(i).cbeginValueOn(); it; ++it) {
             const Coord p = it.getCoord();
             const LabelT own = labAcc.getValue(p);
-            if (own != LabelT(0) && mSpeed.isFixed(static_cast<int32_t>(own))) continue;
+            if (this->isFixed(static_cast<int32_t>(own))) continue;
             bool found = false;
             float best = std::numeric_limits<float>::infinity();
             LabelT bestLabel = own;
@@ -1977,7 +1847,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
                         if (l == own) { found = true; break; }
                         float v;
                         if (!phiAcc.probeValue(q, v)) continue;
-                        if (l != LabelT(0) && mSpeed.isFixed(static_cast<int32_t>(l))) continue;
+                        if (this->isFixed(static_cast<int32_t>(l))) continue;
                         if (v < best || (v == best && l < bestLabel)) { best = v; bestLabel = l; }
                     }
                 }
@@ -1987,10 +1857,12 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
     });
     tree::ValueAccessor<FloatTreeT> phiAcc(newPhi);
     tree::ValueAccessor<LabelTreeT> labAcc(newLabels);
+    tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
     for (const auto& list : fixes) {
         for (const Fix& fx : list) {
             phiAcc.setValueOnly(fx.ijk, fx.phi);
             labAcc.setValueOnly(fx.ijk, fx.label);
+            maskAcc.setValueOff(fx.ijk); // flagged for redistancing
         }
     }
 }
@@ -1998,7 +1870,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 void
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const FloatTreeT& oldPhi)
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const BoolTreeT& freeze)
 {
     FloatTreeT& phi = mMls.phi()->tree();
     LabelTreeT& labels = mMls.labels()->tree();
@@ -2037,28 +1909,22 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const F
         }
     }
 
-    // c. redistance with the interface frozen (R12)
+    // c. redistance: projected and fixed voxels frozen, the rest solved with
+    // signed reflection (R24)
     {
         MultiLevelSetRedistance<MultiLevelSetT> redist(mMls);
         redist.setTolerance(mTolerance);
         redist.setGrainSize(mGrainSize);
-        redist.redistance();
+        redist.redistance(freeze);
     }
 
-    // Fixed-label voxels keep their time-n phi; d. deactivate
-    // phi >= halfWidth*dx in both trees (labels kept, R7b).
+    // d. deactivate phi >= halfWidth*dx in both trees (labels kept, R7b)
     {
         tree::LeafManager<FloatTreeT> leafs(phi);
         forEachIndex(leafs.leafCount(), [&](size_t i) {
             auto& leaf = leafs.leaf(i);
             auto* labLeaf = labels.probeLeaf(leaf.origin());
-            const auto* oldLeaf = oldPhi.probeConstLeaf(leaf.origin());
             for (auto it = leaf.beginValueOn(); it; ++it) {
-                const LabelT l = labLeaf ? labLeaf->getValue(it.pos()) : labels.getValue(it.getCoord());
-                if (oldLeaf && oldLeaf->isValueOn(it.pos()) && l != LabelT(0)
-                    && mSpeed.isFixed(static_cast<int32_t>(l))) {
-                    it.setValue(oldLeaf->getValue(it.pos()));
-                }
                 if (*it < bg) continue;
                 leaf.setValueOff(it.pos(), bg);
                 if (labLeaf) labLeaf->setActiveState(it.pos(), false);
