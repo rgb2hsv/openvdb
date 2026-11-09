@@ -353,6 +353,41 @@ Below, "Run `<Filter>`" means the second command with that filter.
 
 ---
 
+### Task 12: Topology-preserving evolution (§4.7, spec test 15) — run after Task 8, before Task 9
+
+**Files:**
+- Modify: `openvdb/openvdb/tools/LevelSetMultiObject.h`
+- Create: `openvdb/openvdb/unittest/LevelSetMultiObjectTopology.h` (test-only digital-topology helper, reused by Task 10)
+- Test: `openvdb/openvdb/unittest/TestLevelSetMultiObject.cc`
+
+**Interfaces:**
+- Produces:
+  ```cpp
+  enum class MultiObjectConnectivity { FG26_BG6, FG6_BG26, FG18_BG6, FG6_BG18 };
+  namespace lsmo_internal {
+  // 3x3x3 neighbourhood, bit i = (dx,dy,dz) with i = (dx+1) + 3(dy+1) + 9(dz+1), centre excluded from the test
+  bool isSimplePoint(uint32_t inMask /*27 bits*/, MultiObjectConnectivity);
+  }
+  // LevelSetMultiObject:
+  void setTopologyPreservingLabels(std::set<int32_t>);
+  void setConnectivity(MultiObjectConnectivity);   // default FG26_BG6
+  // test helper (LevelSetMultiObjectTopology.h):
+  struct DigitalTopology { int components; int cavities; int euler; };
+  DigitalTopology digitalTopology(const Int32Grid& labels, int32_t label, const CoordBBox& domain, MultiObjectConnectivity);
+  ```
+  Task 10's `MeshTopology` test reuses `digitalTopology` (Task 9/10 replace `MultiObjectMeshSettings::Connectivity` with `MultiObjectConnectivity`).
+
+- [ ] **Step 1: Write failing tests.**
+  - `SimplePointTable`: exhaustively over all 2^26 neighbourhoods is too slow — instead check hand cases per connectivity: isolated voxel (not simple), end of a line (simple), middle of a line (not simple), voxel completing a ring/tunnel (not simple), voxel filling a cavity's last hole (not simple), face of a solid block (simple); plus 10^5 random masks checked against a brute-force reference (count fg components among 26-nbrs adjacent to centre and bg 6-components 6-adjacent to centre inside the 3x3x3, i.e. the definition of T_fg/T_bg).
+  - `DigitalTopologyHelper`: solid cube (1,0,2), hollow cube (1,1,4), solid torus (1,0,0), two cubes touching at a corner (1 under 26, 2 under 6).
+  - `TopologyCubeThroughSpheres` exactly per spec §8 test 15 (gates verbatim), including the control run.
+- [ ] **Step 2: Run** `TestLevelSetMultiObject.SimplePoint*:*DigitalTopology*:*TopologyCube*` — FAIL.
+- [ ] **Step 3: Implement** per §4.7: collect proposed changes from projection (do not apply them there when any protected label is involved), apply in 27 passes with `isSimplePoint` evaluated on current labels per protected label; rejected → keep label, φ = 1e-3·dx, add to the freeze mask. Unprotected changes apply as before.
+- [ ] **Step 4: Run** `TestLevelSetMultiObject.*` — all pass (existing results unchanged when no label is protected).
+- [ ] **Step 5: Commit** — `git commit -m "Add opt-in topology-preserving evolution"`
+
+---
+
 ### Task 11: Benchmark, docs, pending changes, full run (spec test 14)
 
 **Files:**

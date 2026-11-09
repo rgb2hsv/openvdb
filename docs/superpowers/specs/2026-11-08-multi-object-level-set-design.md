@@ -43,7 +43,7 @@ the labelled regions partition space: no gaps, no overlaps.
 - Mesh adaptivity / decimation (as in `VolumeToMesh` adaptivity).
 - Non-uniform voxel sizes / non-linear transforms.
 - Higher-order temporal integration (TVD-RK). Forward Euler only.
-- Topology preservation.
+- Topology preservation by default (it is opt-in per label, §4.7).
 - NanoVDB / GPU implementation.
 
 ## 2. Reference algorithm (wedge MCLS)
@@ -206,6 +206,31 @@ Forward Euler. All reads from time-n main buffers, writes to aux buffers.
    c. Redistance (section 5).
    d. Deactivate voxels with φ > halfWidth·dx in both trees; `pruneInactive`.
    e. Debug builds: `assert(validate())`.
+
+### 4.7 Topology-preserving evolution (opt-in, per label)
+
+Added at the user's request (2026-11-09).
+
+- API: `LevelSetMultiObject::setTopologyPreservingLabels(std::set<int32_t>)`
+  (default empty) and `setConnectivity(MultiObjectConnectivity)`. The enum
+  `MultiObjectConnectivity { FG26_BG6, FG6_BG26, FG18_BG6, FG6_BG18 }` lives in
+  `LevelSetMultiObject.h` (default `FG26_BG6`) and is shared with the mesher
+  (§6.2 uses it instead of a nested enum).
+- After the two-smallest projection proposes label changes, a change a → b at
+  voxel x is accepted only if x is a *simple point* for every protected label
+  in {a, b}: removing x from region a and adding x to region b must each leave
+  the region's topology unchanged under the connectivity pair. Simplicity is
+  decided by the Bertrand–Malandain topological numbers (T_fg = 1 and
+  T_bg = 1 on the 3×3×3 neighbourhood), which preserve both the region and its
+  complement (no new components, tunnels or cavities).
+- Proposed changes are applied in 27 coloured passes (voxel coordinates mod 3),
+  so no two changes applied in the same pass share a 26-neighbourhood; each
+  pass tests simplicity against the labels as updated by earlier passes. The
+  result is independent of thread count.
+- A rejected change keeps the voxel's label; its φ is set to 1e-3·dx (a
+  barrier just inside its own region) and the voxel is frozen for this step's
+  redistancing.
+- Labels that are not protected behave exactly as before.
 
 ## 5. Second-order label-aware redistancing
 
@@ -482,6 +507,20 @@ Contouring tests (`TestLevelSetMultiObjectMesh.cc`):
 13. **Geometry.** Sphere: vertices within 0.1·dx of the analytic surface.
     Triple junction (test 3 fixture): with `junctionCorrection` the max vertex
     error drops below that of the uncorrected run.
+15. **Topology: cube through three spheres** (`TopologyCubeThroughSpheres`).
+    A cube (label 1, side 40·dx) translates along +x by advection (velocity
+    (1,0,0), weight 1) a distance of side + sphere diameter + 8·dx, so every
+    sphere passes completely through it. Three stationary spheres (labels 2–4,
+    radius 4·dx, fixed labels) lie inside the cube's swept path at distinct
+    (y, z) positions. Label 1 is topology-preserving (FG26_BG6).
+    - Every chunk: the cube region has exactly 1 component (26-adjacency), 0
+      enclosed cavities (6-adjacency) and Euler characteristic 2; sphere
+      voxels are bit-identical; `validate()` and the partition invariant hold.
+    - End: cube centroid moved by the commanded distance ± 2·dx.
+    - Control: the same run without protection must change the cube's
+      topology at some chunk (cavities > 0 or χ ≠ 2), proving the test
+      discriminates.
+
 14. **Efficiency (benchmark, non-gating).** Eight-label vortex state: time
     `multiObjectToMesh` against per-label `extractSignedDistance` +
     `volumeToMesh`. Report the speedup; the gating assertion is only
