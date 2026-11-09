@@ -19,6 +19,8 @@
 #include <openvdb/math/Transform.h>
 #include <openvdb/tree/LeafManager.h>
 #include <openvdb/tree/ValueAccessor.h>
+#include <openvdb/math/Math.h>
+#include "Interpolation.h"// for BoxSampler
 #include <openvdb/util/NullInterrupter.h>
 #include "Morphology.h"// for dilateActiveValues, erodeActiveValues
 #include "Prune.h"// for pruneLevelSet
@@ -1165,6 +1167,278 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
 
     return build(*xform, lab, candidates, sampler, halfWidth, /*reseed=*/true);
 }
+
+
+////////////////////////////////////////
+
+
+namespace lsmo_internal {
+
+/// @brief Index of offset (i,j,k) in the 19-point layout of
+/// math::CurvatureStencil (0 centre, 1-6 faces, 7-18 edges), or -1.
+constexpr int
+stencilIndex(int i, int j, int k)
+{
+    constexpr int offs[19][3] = {
+        {0,0,0}, {-1,0,0}, {1,0,0}, {0,-1,0}, {0,1,0}, {0,0,-1}, {0,0,1},
+        {-1,-1,0}, {1,-1,0}, {-1,1,0}, {1,1,0},
+        {-1,0,-1}, {1,0,-1}, {-1,0,1}, {1,0,1},
+        {0,-1,-1}, {0,1,-1}, {0,-1,1}, {0,1,1}};
+    for (int n = 0; n < 19; ++n) {
+        if (offs[n][0] == i && offs[n][1] == j && offs[n][2] == k) return n;
+    }
+    return -1;
+}
+
+} // namespace lsmo_internal
+
+
+/// @brief Read-only 19-point stencil of psi_l = (L==l ? -phi : +phi) values
+/// at time n (the main buffers).
+/// @details The layout of the values is that of math::CurvatureStencil and
+/// the curvature arithmetic is identical to
+/// math::CurvatureStencil::meanCurvatureNormGrad. Voxels outside the active
+/// band read the phi background with the sign given by their label.
+/// All derivatives are in world units. Not thread-safe; use one per thread.
+template<typename MultiLevelSetT>
+class LabelAwareStencil
+{
+public:
+    using FloatTreeT = typename MultiLevelSetT::FloatGridT::TreeType;
+    using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
+
+    explicit LabelAwareStencil(const MultiLevelSetT& mls)
+        : mTransform(mls.phi()->transform())
+        , mPhiAcc(mls.phi()->tree())
+        , mLabelAcc(mls.labels()->tree())
+        , mDx(float(mls.voxelSize()))
+        , mCenter(0, 0, 0)
+    {
+        for (float& v : mValues) v = 0.0f;
+    }
+
+    /// @brief Fill the stencil around @a ijk with psi of @a label.
+    void moveTo(const Coord& ijk, int32_t label)
+    {
+        mCenter = ijk;
+        mLabel = label;
+        static const Coord offs[19] = {
+            Coord(0,0,0), Coord(-1,0,0), Coord(1,0,0), Coord(0,-1,0), Coord(0,1,0),
+            Coord(0,0,-1), Coord(0,0,1),
+            Coord(-1,-1,0), Coord(1,-1,0), Coord(-1,1,0), Coord(1,1,0),
+            Coord(-1,0,-1), Coord(1,0,-1), Coord(-1,0,1), Coord(1,0,1),
+            Coord(0,-1,-1), Coord(0,1,-1), Coord(0,-1,1), Coord(0,1,1)};
+        for (int n = 0; n < 19; ++n) {
+            const Coord c = ijk + offs[n];
+            const float d = mPhiAcc.getValue(c);
+            mValues[n] = (static_cast<int32_t>(mLabelAcc.getValue(c)) == label) ? -d : d;
+        }
+    }
+
+    const Coord& center() const { return mCenter; }
+    int32_t label() const { return mLabel; }
+    float voxelSize() const { return mDx; }
+    const math::Transform& transform() const { return mTransform; }
+
+    /// @brief psi at offset (i,j,k) from the centre; the 19 points have at
+    /// most two non-zero offsets.
+    template<int i, int j, int k>
+    float getValue() const
+    {
+        static_assert(i >= -1 && i <= 1 && j >= -1 && j <= 1 && k >= -1 && k <= 1,
+            "offsets must be in [-1,1]");
+        constexpr int n = lsmo_internal::stencilIndex(i, j, k);
+        static_assert(n >= 0, "corner offsets are not part of the 19-point stencil");
+        return mValues[n];
+    }
+
+    /// @brief Central-difference gradient in world units.
+    Vec3f gradient() const
+    {
+        const float inv2Dx = 0.5f / mDx;
+        return Vec3f(mValues[2] - mValues[1],
+                     mValues[4] - mValues[3],
+                     mValues[6] - mValues[5]) * inv2Dx;
+    }
+
+    /// @brief One-sided differences in world units: dneg = (psi0 - psi-)/dx,
+    /// dpos = (psi+ - psi0)/dx for x, y, z.
+    void upwindDifferences(float dneg[3], float dpos[3]) const
+    {
+        const float invDx = 1.0f / mDx;
+        for (int a = 0; a < 3; ++a) {
+            dneg[a] = (mValues[0] - mValues[1 + 2 * a]) * invDx;
+            dpos[a] = (mValues[2 + 2 * a] - mValues[0]) * invDx;
+        }
+    }
+
+    /// @brief Mean curvature (k1+k2)/2 times |grad psi|, world units; 0 where
+    /// the gradient vanishes. Same arithmetic as
+    /// math::CurvatureStencil::meanCurvatureNormGrad.
+    float meanCurvatureNormGrad() const
+    {
+        const double v[19] = {
+            mValues[0], mValues[1], mValues[2], mValues[3], mValues[4], mValues[5],
+            mValues[6], mValues[7], mValues[8], mValues[9], mValues[10], mValues[11],
+            mValues[12], mValues[13], mValues[14], mValues[15], mValues[16],
+            mValues[17], mValues[18]};
+        const double Dx = 0.5 * (v[2] - v[1]), Dy = 0.5 * (v[4] - v[3]),
+                     Dz = 0.5 * (v[6] - v[5]);
+        const double Dx2 = Dx * Dx, Dy2 = Dy * Dy, Dz2 = Dz * Dz, normGrad2 = Dx2 + Dy2 + Dz2;
+        if (normGrad2 <= math::Tolerance<double>::value()) return 0.0f;
+        const double Dxx = v[2] - 2 * v[0] + v[1];
+        const double Dyy = v[4] - 2 * v[0] + v[3];
+        const double Dzz = v[6] - 2 * v[0] + v[5];
+        const double Dxy = 0.25 * (v[10] - v[8] + v[7] - v[9]);
+        const double Dxz = 0.25 * (v[14] - v[12] + v[11] - v[13]);
+        const double Dyz = 0.25 * (v[18] - v[16] + v[15] - v[17]);
+        const double alpha = Dx2 * (Dyy + Dzz) + Dy2 * (Dxx + Dzz) + Dz2 * (Dxx + Dyy)
+            - 2 * (Dx * (Dy * Dxy + Dz * Dxz) + Dy * Dz * Dyz);
+        const float inv2Dx = float(0.5 / mDx);
+        const float invDx2 = 4.0f * inv2Dx * inv2Dx;
+        return float(alpha * invDx2 / (2 * normGrad2));
+    }
+
+private:
+    const math::Transform& mTransform;
+    tree::ValueAccessor<const FloatTreeT> mPhiAcc;
+    tree::ValueAccessor<const LabelTreeT> mLabelAcc;
+    float mDx;
+    Coord mCenter;
+    int32_t mLabel = 0;
+    float mValues[19];
+};
+
+
+/// @brief Built-in speed functor reproducing wedge's multi-object force
+/// model: curvature + upwind pressure + upwind advection (spec 3.4).
+/// @details Satisfies the speed functor concept of spec 3.3. Label 0 is
+/// handled by the evolver as passive (rulings R3, R20), so isFixed(0) is
+/// false here. Speeds are world-space; with unit voxel size they equal
+/// wedge's index-space values. operator() is const and thread-safe.
+template<typename MultiLevelSetT>
+class MultiObjectForces
+{
+public:
+    /// Curvature weight w: speed w*kappa*|grad psi| (clamped).
+    void setCurvatureWeight(float w) { mCurvatureWeight = w; }
+    void setMaxCurvatureForce(float m = 10.0f) { mMaxCurvatureForce = m; }
+
+    /// @brief Pressure force field. A deep copy is rescaled once (wedge
+    /// rescale()): values are shifted by @a target and the negative and
+    /// positive parts scaled independently to [-1, 1] (scale 1 for a part
+    /// whose extreme magnitude is at most 1e-4). A NaN @a target skips the
+    /// rescale, as in wedge.
+    /// @throw ValueError if @a pressure is null.
+    void setPressure(FloatGrid::ConstPtr pressure, float weight,
+        float target = std::numeric_limits<float>::quiet_NaN())
+    {
+        if (!pressure) OPENVDB_THROW(ValueError, "MultiObjectForces: null pressure grid");
+        FloatGrid::Ptr copy = pressure->deepCopy();
+        if (!std::isnan(target)) {
+            FloatTree& tree = copy->tree();
+            float minValue = 1e30f, maxValue = -1e30f;
+            auto visit = [&](float x) {
+                const float val = x - target;
+                minValue = std::min(val, minValue);
+                maxValue = std::max(val, maxValue);
+            };
+            visit(tree.background());
+            for (auto it = tree.cbeginValueAll(); it; ++it) visit(*it);
+            const float normMin = (std::abs(minValue) > 1e-4f) ? 1.0f / std::abs(minValue) : 1.0f;
+            const float normMax = (std::abs(maxValue) > 1e-4f) ? 1.0f / std::abs(maxValue) : 1.0f;
+            auto rescale = [&](float x) {
+                const float val = x - target;
+                return (val < 0.0f) ? val * normMin : val * normMax;
+            };
+            const float bg = rescale(tree.background());
+            for (auto it = tree.beginValueAll(); it; ++it) it.setValue(rescale(*it));
+            tree.root().setBackground(bg, /*updateChildNodes=*/false);
+        }
+        mPressure = copy;
+        mPressureWeight = weight;
+    }
+
+    /// @brief Advection velocity (world units) sampled with BoxSampler.
+    /// @throw ValueError if @a velocity is null.
+    void setAdvection(Vec3SGrid::ConstPtr velocity, float weight)
+    {
+        if (!velocity) OPENVDB_THROW(ValueError, "MultiObjectForces: null advection grid");
+        mAdvection = velocity;
+        mAdvectionWeight = weight;
+    }
+
+    void setInactiveLabels(std::set<int32_t> labels) { mInactive = std::move(labels); }
+    void setFixedLabels(std::set<int32_t> labels) { mFixed = std::move(labels); }
+
+    /// The internal rescaled pressure copy (null if none was set).
+    FloatGrid::ConstPtr pressure() const { return mPressure; }
+
+    /// @brief dpsi_l/dt at @a ijk; the stencil must have been moved to
+    /// (@a ijk, @a label).
+    float operator()(const Coord& ijk, int32_t label,
+        const LabelAwareStencil<MultiLevelSetT>& s) const
+    {
+        if (!isActive(label)) return 0.999f;
+        if (mFixed.count(label)) return 0.0f;
+
+        float dneg[3], dpos[3];
+        s.upwindDifferences(dneg, dpos);
+
+        float kappa = mCurvatureWeight * s.meanCurvatureNormGrad();
+        kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
+
+        float advection = 0.0f;
+        if (mAdvection) {
+            const Vec3d w = s.transform().indexToWorld(ijk);
+            const Vec3R idx = mAdvection->transform().worldToIndex(w);
+            const Vec3f vel = tools::BoxSampler::sample(mAdvection->tree(), idx);
+            for (int a = 0; a < 3; ++a) {
+                const float f = mAdvectionWeight * vel[a];
+                if (f > 0.0f) advection += f * dneg[a];
+                else if (f < 0.0f) advection += f * dpos[a];
+            }
+        }
+
+        float pressure = 0.0f;
+        if (mPressure) {
+            const Vec3d w = s.transform().indexToWorld(ijk);
+            const Vec3R idx = mPressure->transform().worldToIndex(w);
+            const float force = mPressureWeight * tools::BoxSampler::sample(mPressure->tree(), idx);
+            float gsPos = 0.0f, gsNeg = 0.0f;
+            for (int a = 0; a < 3; ++a) {
+                const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
+                const float pMax = std::max(dpos[a], 0.0f), pMin = std::min(dpos[a], 0.0f);
+                gsPos += nMax * nMax + pMin * pMin;
+                gsNeg += pMax * pMax + nMin * nMin;
+            }
+            if (force > 0.0f) pressure = -force * std::sqrt(gsPos);
+            else if (force < 0.0f) pressure = -force * std::sqrt(gsNeg);
+        }
+        return -advection + kappa + pressure;
+    }
+
+    /// True for labels declared fixed. Label 0 is NOT fixed here: the
+    /// evolver treats it as passive and never asks the functor (R3, R20).
+    bool isFixed(int32_t label) const { return label != 0 && mFixed.count(label) != 0; }
+    bool isActive(int32_t label) const { return mInactive.count(label) == 0; }
+
+    /// dx^2/(6 w) for curvature weight w > 0, else +infinity.
+    float stableDt(float dx) const
+    {
+        return mCurvatureWeight > 0.0f ? dx * dx / (6.0f * mCurvatureWeight)
+                                       : std::numeric_limits<float>::infinity();
+    }
+
+private:
+    float mCurvatureWeight = 0.0f;
+    float mMaxCurvatureForce = 10.0f;
+    FloatGrid::ConstPtr mPressure;
+    float mPressureWeight = 0.0f;
+    Vec3SGrid::ConstPtr mAdvection;
+    float mAdvectionWeight = 0.0f;
+    std::set<int32_t> mInactive, mFixed;
+};
 
 } // namespace tools
 } // namespace OPENVDB_VERSION_NAME

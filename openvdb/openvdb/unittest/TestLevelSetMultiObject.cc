@@ -1018,3 +1018,213 @@ TEST_F(TestLevelSetMultiObject, ExtractAbsentLabel)
     EXPECT_GT(g->background(), 0.0f);
     EXPECT_GT(g->tree().getValue(Coord(-30, 0, 0)), 0.0f);
 }
+
+// ---------------------------------------------------------------------------
+// LabelAwareStencil and MultiObjectForces (Task 5)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using Stencil = tools::LabelAwareStencil<MLS>;
+using Forces = tools::MultiObjectForces<MLS>;
+
+// First active voxel of label 1 whose +x neighbour is label 2 (interface).
+Coord
+sphereInterfaceVoxel(const MLS& m)
+{
+    // Sphere 1 is centred at (-15,0,0) dx with radius 10 dx: its surface
+    // point towards -y is at (-15, -10, 0).
+    const Coord c(-15, -10, 0);
+    for (int dj = -1; dj <= 1; ++dj) {
+        const Coord p = c.offsetBy(0, dj, 0);
+        if (m.labels()->tree().getValue(p) == 1
+            && m.labels()->tree().getValue(p.offsetBy(0, -1, 0)) != 1) return p;
+    }
+    return c;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, StencilSphere)
+{
+    const double dx = 1.0, r = 10.0;
+    auto m = makeTwoSpheres(dx);
+    const Coord ijk = sphereInterfaceVoxel(*m);
+    ASSERT_EQ(m->labels()->tree().getValue(ijk), 1);
+    Stencil s(*m);
+    s.moveTo(ijk, 1);
+    const Vec3f g = s.gradient();
+    EXPECT_NEAR(g.length(), 1.0f, 0.05f);
+    // Outward normal at the -y pole of sphere 1 is -y.
+    EXPECT_LT(g[1], -0.9f);
+    // Single-voxel curvature carries second-difference noise from the
+    // redistanced phi, so check the mean over the interface layer of the
+    // sphere (voxels of label 1 with a face neighbour of another label).
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    double sum = 0.0;
+    int n = 0;
+    for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
+        if (*it != 1) continue;
+        const Coord p = it.getCoord();
+        bool iface = false;
+        for (int f = 0; f < 6 && !iface; ++f) iface = m->labels()->tree().getValue(p + offs[f]) != 1;
+        if (!iface || p[0] > -10) continue; // sphere-1 side away from the junction with sphere 2
+        s.moveTo(p, 1);
+        sum += s.meanCurvatureNormGrad();
+        ++n;
+    }
+    ASSERT_GT(n, 100);
+    EXPECT_NEAR(sum / n, 1.0 / r, 0.1 / r);
+}
+
+TEST_F(TestLevelSetMultiObject, StencilLabelSign)
+{
+    auto m = makeTwoSpheres(1.0);
+    const Coord ijk(15, 0, 0); // centre of sphere 2
+    ASSERT_EQ(m->labels()->tree().getValue(ijk), 2);
+    const float phi = m->phi()->tree().getValue(ijk);
+    ASSERT_GT(phi, 0.0f);
+    Stencil s(*m);
+    s.moveTo(ijk, 1);
+    EXPECT_EQ((s.getValue<0, 0, 0>()), phi);
+    s.moveTo(ijk, 2);
+    EXPECT_EQ((s.getValue<0, 0, 0>()), -phi);
+}
+
+TEST_F(TestLevelSetMultiObject, ForcesPressureRescale)
+{
+    FloatGrid::Ptr p = FloatGrid::create(0.0f);
+    auto a = p->getAccessor();
+    a.setValue(Coord(0, 0, 0), -2.0f);
+    a.setValue(Coord(1, 0, 0), 0.0f);
+    a.setValue(Coord(2, 0, 0), 4.0f);
+    Forces f;
+    f.setPressure(p, 1.0f, 0.0f);
+    ASSERT_TRUE(f.pressure());
+    EXPECT_FLOAT_EQ(f.pressure()->tree().getValue(Coord(0, 0, 0)), -1.0f);
+    EXPECT_FLOAT_EQ(f.pressure()->tree().getValue(Coord(1, 0, 0)), 0.0f);
+    EXPECT_FLOAT_EQ(f.pressure()->tree().getValue(Coord(2, 0, 0)), 1.0f);
+    // Input is untouched.
+    EXPECT_FLOAT_EQ(p->tree().getValue(Coord(2, 0, 0)), 4.0f);
+    // NaN target: no rescale.
+    Forces g;
+    g.setPressure(p, 1.0f);
+    EXPECT_FLOAT_EQ(g.pressure()->tree().getValue(Coord(2, 0, 0)), 4.0f);
+}
+
+TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
+{
+    // 3^3 neighbourhood, all label 1, so psi = -phi everywhere.
+    FloatGrid::Ptr phi = FloatGrid::create(3.0f);
+    Int32Grid::Ptr lab = Int32Grid::create(0);
+    auto pa = phi->getAccessor();
+    auto la = lab->getAccessor();
+    float v[3][3][3]; // v[i+1][j+1][k+1] = psi
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j)
+            for (int k = -1; k <= 1; ++k) {
+                const float d = 0.8f + 0.35f * i - 0.2f * j + 0.1f * k + 0.07f * i * i
+                    + 0.05f * j * j - 0.03f * k * k + 0.04f * i * j - 0.02f * i * k + 0.06f * j * k;
+                pa.setValue(Coord(i, j, k), d);
+                la.setValue(Coord(i, j, k), 1);
+                v[i + 1][j + 1][k + 1] = -d;
+            }
+    MLS mls(phi, lab, 3);
+
+    const Vec3f vel(0.3f, -0.4f, 0.2f);
+    Vec3SGrid::Ptr vg = Vec3SGrid::create(Vec3f(0.0f));
+    vg->tree().setValue(Coord(0, 0, 0), vel);
+    FloatGrid::Ptr pg = FloatGrid::create(0.0f);
+    pg->tree().setValue(Coord(0, 0, 0), 0.7f);
+
+    const float wc = 0.5f, wa = 1.5f, wp = 2.0f;
+    Forces f;
+    f.setCurvatureWeight(wc);
+    f.setAdvection(vg, wa);
+    f.setPressure(pg, wp); // NaN target: values used as given
+
+    Stencil s(mls);
+    s.moveTo(Coord(0, 0, 0), 1);
+    const float got = f(Coord(0, 0, 0), 1, s);
+
+    // Wedge pressureAndAdvectionMotion, evaluated by hand (dx = 1).
+    auto V = [&](int i, int j, int k) { return v[i + 1][j + 1][k + 1]; };
+    const float v111 = V(0, 0, 0);
+    const float DxNeg = v111 - V(-1, 0, 0), DxPos = V(1, 0, 0) - v111;
+    const float DyNeg = v111 - V(0, -1, 0), DyPos = V(0, 1, 0) - v111;
+    const float DzNeg = v111 - V(0, 0, -1), DzPos = V(0, 0, 1) - v111;
+    auto mn = [](float a) { return std::min(a, 0.0f); };
+    auto mx = [](float a) { return std::max(a, 0.0f); };
+    const float gsPos = mx(DxNeg) * mx(DxNeg) + mn(DxPos) * mn(DxPos) + mx(DyNeg) * mx(DyNeg)
+        + mn(DyPos) * mn(DyPos) + mx(DzNeg) * mx(DzNeg) + mn(DzPos) * mn(DzPos);
+    const float gsNeg = mx(DxPos) * mx(DxPos) + mn(DxNeg) * mn(DxNeg) + mx(DyPos) * mx(DyPos)
+        + mn(DyNeg) * mn(DyNeg) + mx(DzPos) * mx(DzPos) + mn(DzNeg) * mn(DzNeg);
+    const float Dx = 0.5f * (V(1, 0, 0) - V(-1, 0, 0));
+    const float Dy = 0.5f * (V(0, 1, 0) - V(0, -1, 0));
+    const float Dz = 0.5f * (V(0, 0, 1) - V(0, 0, -1));
+    const float Dxx = V(1, 0, 0) - 2 * v111 + V(-1, 0, 0);
+    const float Dyy = V(0, 1, 0) - 2 * v111 + V(0, -1, 0);
+    const float Dzz = V(0, 0, 1) - 2 * v111 + V(0, 0, -1);
+    const float Dxy = (V(1, 1, 0) - V(-1, 1, 0) - V(1, -1, 0) + V(-1, -1, 0)) * 0.25f;
+    const float Dxz = (V(1, 0, 1) - V(-1, 0, 1) - V(1, 0, -1) + V(-1, 0, -1)) * 0.25f;
+    const float Dyz = (V(0, 1, 1) - V(0, -1, 1) - V(0, 1, -1) + V(0, -1, -1)) * 0.25f;
+    const float numer = 0.5f * ((Dyy + Dzz) * Dx * Dx + (Dxx + Dzz) * Dy * Dy
+        + (Dxx + Dyy) * Dz * Dz - 2 * Dx * Dy * Dxy - 2 * Dx * Dz * Dxz - 2 * Dy * Dz * Dyz);
+    const float denom = Dx * Dx + Dy * Dy + Dz * Dz;
+    float kappa = wc * numer / denom;
+    kappa = std::max(-10.0f, std::min(10.0f, kappa));
+    const float fx = wa * vel[0], fy = wa * vel[1], fz = wa * vel[2];
+    float adv = 0;
+    adv += fx > 0 ? fx * DxNeg : (fx < 0 ? fx * DxPos : 0.0f);
+    adv += fy > 0 ? fy * DyNeg : (fy < 0 ? fy * DyPos : 0.0f);
+    adv += fz > 0 ? fz * DzNeg : (fz < 0 ? fz * DzPos : 0.0f);
+    const float F = wp * 0.7f;
+    float press = 0;
+    if (F > 0) press = -F * std::sqrt(gsPos);
+    else if (F < 0) press = -F * std::sqrt(gsNeg);
+    const float expected = -adv + kappa + press;
+    EXPECT_NEAR(got, expected, 1e-6f);
+    // Make sure every term is exercised.
+    EXPECT_GT(std::abs(adv), 1e-3f);
+    EXPECT_GT(std::abs(kappa), 1e-3f);
+    EXPECT_GT(std::abs(press), 1e-3f);
+
+    // Negative pressure force takes the other Godunov branch.
+    pg->tree().setValue(Coord(0, 0, 0), -0.7f);
+    Forces f2;
+    f2.setPressure(pg, wp);
+    const float got2 = f2(Coord(0, 0, 0), 1, s);
+    EXPECT_NEAR(got2, 1.4f * std::sqrt(gsNeg), 1e-6f);
+}
+
+TEST_F(TestLevelSetMultiObject, ForcesFixedAndInactive)
+{
+    Forces f;
+    // Label 0 is passive in the evolver (R3/R20), not fixed in the functor.
+    EXPECT_FALSE(f.isFixed(0));
+    EXPECT_FALSE(f.isFixed(3));
+    EXPECT_TRUE(f.isActive(3));
+    f.setFixedLabels({4});
+    f.setInactiveLabels({5});
+    EXPECT_TRUE(f.isFixed(4));
+    EXPECT_FALSE(f.isFixed(3));
+    EXPECT_FALSE(f.isActive(5));
+    EXPECT_TRUE(f.isActive(4));
+
+    auto m = makePair();
+    Stencil s(*m);
+    s.moveTo(Coord(7, 8, 8), 1);
+    EXPECT_FLOAT_EQ(f(Coord(7, 8, 8), 5, s), 0.999f);
+    EXPECT_FLOAT_EQ(f(Coord(7, 8, 8), 4, s), 0.0f);
+
+    EXPECT_TRUE(std::isinf(f.stableDt(1.0f)));
+    f.setCurvatureWeight(0.5f);
+    EXPECT_FLOAT_EQ(f.stableDt(2.0f), 4.0f / 3.0f);
+}
+
+TEST_F(TestLevelSetMultiObject, ForcesMissingGrid)
+{
+    Forces f;
+    EXPECT_THROW(f.setPressure(nullptr, 1.0f), ValueError);
+    EXPECT_THROW(f.setAdvection(nullptr, 1.0f), ValueError);
+}
