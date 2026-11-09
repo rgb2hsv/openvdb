@@ -10,6 +10,7 @@
 #include <openvdb/tools/LevelSetPlatonic.h>
 #include <openvdb/tools/LevelSetSphere.h>
 #include <openvdb/tools/LevelSetTubes.h>
+#include <openvdb/tools/MeshToVolume.h>
 #include <openvdb/tools/VelocityFields.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
@@ -2532,4 +2533,137 @@ TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
         if (lb.getValue(it.getCoord()) != *it) ++diff;
     }
     EXPECT_EQ(diff, Index64(0));
+}
+
+
+// ---------------------------------------------------------------------------
+// Accuracy of extractSignedDistance after evolution, and world units
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Self-consistency of extractSignedDistance(@a label): the extracted grid's
+// zero isosurface is meshed (volumeToMesh) and converted back to an exact
+// distance to that mesh (meshToLevelSet); @a ifaceMax is the max error over
+// the voxels within one voxel of the surface, @a rms the RMS error over the
+// extracted band, both in voxels. The metric's own floor (an analytic sphere
+// against its marching-cubes mesh) is about 0.055*dx near the surface.
+void
+extractSelfConsistency(const MLS& m, int32_t label, double& ifaceMax, double& rms)
+{
+    FloatGrid::Ptr g = m.extractSignedDistance(label);
+    std::vector<Vec3s> points;
+    std::vector<Vec3I> tris;
+    std::vector<Vec4I> quads;
+    tools::volumeToMesh(*g, points, tris, quads, 0.0);
+    FloatGrid::Ptr ref = tools::meshToLevelSet<FloatGrid>(g->transform(), points, tris, quads,
+        4.0f);
+    const double dx = m.voxelSize();
+    tree::ValueAccessor<const FloatTree> acc(ref->tree());
+    ifaceMax = 0.0;
+    double sum2 = 0.0;
+    size_t n = 0;
+    for (auto it = g->tree().cbeginValueOn(); it; ++it) {
+        float r;
+        if (!acc.probeValue(it.getCoord(), r)) continue;
+        const double err = std::abs(double(*it) - double(r)) / dx;
+        if (std::abs(r) < dx) ifaceMax = std::max(ifaceMax, err);
+        sum2 += err * err;
+        ++n;
+    }
+    rms = n ? std::sqrt(sum2 / double(n)) : 0.0;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, ExtractAccuracyAfterEvolution)
+{
+    // The signed distance stays accurate near the boundary after evolution:
+    // max error < 0.1*dx within one voxel of the surface and RMS < 0.1*dx
+    // over the band, against the distance to the extracted grid's own zero
+    // isosurface, after pressure growth, uniform advection and curvature
+    // flow of an off-grid sphere.
+    struct Case { const char* name; double t1; std::function<void(Forces&)> setup; };
+    const Case cases[] = {
+        {"pressure growth", 4.0,
+            [](Forces& f) { f.setPressure(FloatGrid::create(1.0f), 1.0f); }},
+        {"uniform advection", 10.0,
+            [](Forces& f) {
+                f.setAdvection(Vec3SGrid::create(Vec3s(0.6f, 0.3f, 0.2f)), 1.0f);
+            }},
+        {"curvature flow", 5.0, [](Forces& f) { f.setCurvatureWeight(1.0f); }}};
+    for (const Case& c : cases) {
+        auto m = makeSphere(12.3, Vec3d(0.3, 0.1, 0.2));
+        double iface0, rms0;
+        extractSelfConsistency(*m, 1, iface0, rms0);
+        Forces forces;
+        c.setup(forces);
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        const size_t steps = lsmo.advect(0.0, c.t1);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << c.name << ": " << msg;
+        double iface, rms;
+        extractSelfConsistency(*m, 1, iface, rms);
+        std::cout << "ExtractAccuracyAfterEvolution " << c.name << " (t = " << c.t1 << ", "
+                  << steps << " steps): interface max error " << iface << " dx, band RMS "
+                  << rms << " dx (initial " << iface0 << " dx, " << rms0 << " dx)"
+                  << std::endl;
+        EXPECT_LE(iface, 0.1) << c.name;
+        EXPECT_LE(rms, 0.1) << c.name;
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)
+{
+    // The PressureGrowth, UniformAdvection and CurvatureFlow scenarios with
+    // the built-in forces at dx = 0.5: speeds, time steps and results are in
+    // world units, so the same world-space gates as at dx = 1 hold.
+    const double dx = 0.5;
+    {
+        auto m = makeSphere(8.0, Vec3d(0.0), dx);
+        ASSERT_DOUBLE_EQ(m->voxelSize(), dx);
+        Forces forces;
+        forces.setPressure(FloatGrid::create(1.0f), 1.0f); // outward at unit speed
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        const size_t steps = lsmo.advect(0.0, 4.0);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
+        std::cout << "WorldUnitsHalfVoxel pressure growth: steps " << steps
+                  << " mean radius " << r << " (expected 12)" << std::endl;
+        EXPECT_GE(steps, size_t(16)); // dt <= 0.5*cfl*dx/|F|
+        EXPECT_NEAR(r, 12.0, 0.5);
+    }
+    {
+        auto m = makeSphere(8.0, Vec3d(0.0), dx);
+        Forces forces;
+        forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        const Vec3d c0 = centroid(zeroCrossings(*m->extractSignedDistance(1)));
+        const size_t steps = lsmo.advect(0.0, 5.0);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const auto pts = zeroCrossings(*m->extractSignedDistance(1));
+        const Vec3d c1 = centroid(pts);
+        std::cout << "WorldUnitsHalfVoxel uniform advection: steps " << steps << " shift "
+                  << (c1 - c0) << " mean radius " << meanRadius(pts, c1) << std::endl;
+        EXPECT_NEAR(c1[0] - c0[0], 5.0, 0.5);
+        EXPECT_NEAR(c1[1] - c0[1], 0.0, 0.5);
+        EXPECT_NEAR(c1[2] - c0[2], 0.0, 0.5);
+        EXPECT_NEAR(meanRadius(pts, c1), 8.0, 0.5);
+    }
+    {
+        auto m = makeSphere(10.0, Vec3d(0.0), dx);
+        Forces forces;
+        forces.setCurvatureWeight(1.0f);
+        EXPECT_FLOAT_EQ(forces.stableDt(float(dx)), float(dx * dx / 6.0));
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        const size_t steps = lsmo.advect(0.0, 20.0);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
+        std::cout << "WorldUnitsHalfVoxel curvature flow: steps " << steps << " r^2 " << r * r
+                  << " (expected 60)" << std::endl;
+        EXPECT_NEAR(r * r, 60.0, 2.0 * std::sqrt(60.0) * 0.5);
+    }
 }
