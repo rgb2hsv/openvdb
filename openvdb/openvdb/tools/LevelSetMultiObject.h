@@ -103,20 +103,12 @@ public:
     /// @param message if non-null, receives a description of the first failure.
     bool validate(std::string* message = nullptr) const
     {
-        // Compare active voxel sets (not node structure: a uniform label leaf
-        // may legitimately be pruned to a tile while phi keeps its leaf).
-        const char* topoMsg = "phi and label trees have different active topology";
-        if (mPhi->tree().activeVoxelCount() != mLabels->tree().activeVoxelCount()) {
-            if (message) *message = topoMsg;
+        if (!mPhi->tree().hasSameTopology(mLabels->tree())) {
+            if (message) *message = "phi and label trees have different active topology";
             return false;
         }
-        tree::ValueAccessor<const LabelTreeT> labAcc(mLabels->tree());
         for (auto it = mPhi->tree().cbeginValueOn(); it; ++it) {
             const float v = *it;
-            if (!labAcc.isValueOn(it.getCoord())) {
-                if (message) *message = topoMsg;
-                return false;
-            }
             if (!std::isfinite(v) || v < 0.0f) {
                 if (message) {
                     std::ostringstream ss;
@@ -175,17 +167,31 @@ public:
     }
 
     /// @brief Clean up inactive values. Every inactive phi voxel is reset to
-    /// the phi background and fully inactive phi nodes are pruned. Inactive
-    /// label voxels keep their value (it records the nearby interior label);
-    /// the label tree is only pruned where nodes are uniform.
+    /// the phi background. Inactive label voxels keep their value (it records
+    /// the nearby interior label). A leaf with no active voxels is replaced by
+    /// an inactive tile in both trees only if its label leaf is uniform;
+    /// all other leaves stay, so both trees keep the same leaf layout
+    /// (the label tree is never pruned where voxels are active).
     void pruneInactive()
     {
         const float bg = mPhi->tree().background();
+        std::vector<Coord> collapse;
         for (auto leaf = mPhi->tree().beginLeaf(); leaf; ++leaf) {
             for (auto it = leaf->beginValueOff(); it; ++it) it.setValue(bg);
+            if (!leaf->isEmpty()) continue;
+            const auto* lab = mLabels->tree().probeConstLeaf(leaf->origin());
+            LabelT value; bool state;
+            if (!lab || (lab->isConstant(value, state) && !state)) {
+                collapse.push_back(leaf->origin());
+            }
         }
-        tools::pruneInactive(mPhi->tree());
-        tools::prune(mLabels->tree());
+        for (const Coord& o : collapse) {
+            const auto* lab = mLabels->tree().probeConstLeaf(o);
+            LabelT value = mLabels->tree().background(); bool state;
+            if (lab) lab->isConstant(value, state);
+            mPhi->tree().addTile(1, o, bg, false);
+            mLabels->tree().addTile(1, o, value, false);
+        }
     }
 
 private:

@@ -124,6 +124,8 @@ TEST_F(TestLevelSetMultiObject, HolderDilateErode)
     EXPECT_FLOAT_EQ(m->phi()->tree().getValue(Coord(-1, 5, 5)), 3.0f);
 
     m->erode(2);
+    EXPECT_EQ(m->phi()->tree().leafCount(), m->labels()->tree().leafCount());
+    EXPECT_TRUE(m->phi()->tree().hasSameTopology(m->labels()->tree()));
     EXPECT_EQ(m->phi()->activeVoxelCount(), n0);
     EXPECT_EQ(m->phi()->activeVoxelCount(), m->labels()->activeVoxelCount());
     EXPECT_TRUE(m->validate());
@@ -164,6 +166,8 @@ TEST_F(TestLevelSetMultiObject, HolderErodePrunesInactive)
     }
     MLS m(phi, lab, 3);
     m.erode(1);
+    EXPECT_EQ(m.phi()->tree().leafCount(), m.labels()->tree().leafCount());
+    EXPECT_TRUE(m.phi()->tree().hasSameTopology(m.labels()->tree()));
     EXPECT_TRUE(m.validate());
     EXPECT_LT(m.phi()->activeVoxelCount(), Index64(box.volume()));
     const float bg = float(3.0 * dx);
