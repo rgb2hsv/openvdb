@@ -2523,13 +2523,13 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
 
 TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
 {
-    // Reference: 30 x (advection over dx^2/3, one meanCurvature iteration),
-    // total t = 10 (kept at the pre-lengthening time until advection/curvature operator splitting lands; then 15).
+    // Reference: 45 x (advection over dx^2/3, one meanCurvature iteration),
+    // total t = 15.
     Vec3SGrid::Ptr vel = makeRotation();
     FloatGrid::Ptr ref = tools::createLevelSetSphere<FloatGrid>(
         float(kEqRadius), Vec3f(kEqCenter), 1.0f);
     const double h = 1.0 / 3.0;
-    for (int n = 0; n < 30; ++n) {
+    for (int n = 0; n < 45; ++n) {
         referenceAdvect(*ref, *vel, n * h, (n + 1) * h);
         referenceCurvature(*ref);
     }
@@ -2539,16 +2539,80 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     forces.setAdvection(vel, 1.0f);
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-    const size_t steps = lsmo.advect(0.0, 10.0);
-    // exact: r^2 = r0^2 - 2t about the center rotated by 0.05*10 radians.
-    // 0.1*dx extra slack over the reference's radius error. The
-    // curvature limit stableDt = dx^2/(6w) caps every MOGAC step, which forces
-    // the advection to CFL ~0.13, where first-order upwinding is most
-    // diffusive (advection alone at that dt: radius error 0.347 dx vs 0.255 dx
-    // at MOGAC's own CFL and 0.300 dx for the reference). Operator splitting
-    // (advection at its own CFL, curvature substepped) is a known follow-up.
-    checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 10.0, nullptr,
-        std::sqrt(kEqRadius * kEqRadius - 2.0 * 10.0), 0.1 * m->voxelSize());
+    EXPECT_TRUE(lsmo.splitting()); // the default for a split speed functor
+    const size_t steps = lsmo.advect(0.0, 15.0);
+    // exact: r^2 = r0^2 - 2t about the center rotated by 0.05*15 radians.
+    // 0.1*dx extra slack over the reference's radius error. Strang splitting
+    // lets the advection run at its own CFL with the curvature substepped at
+    // its limit dx^2/(6w); unsplit, that limit caps every step and forces the
+    // advection to CFL ~0.13, where first-order upwinding is most diffusive.
+    checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 15.0, nullptr,
+        std::sqrt(kEqRadius * kEqRadius - 2.0 * 15.0), 0.1 * m->voxelSize());
+}
+
+TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
+{
+    // Constant pressure field: dpsi_1/dt = -|grad psi_1|, unit growth.
+    FloatGrid::Ptr pressure = FloatGrid::create(1.0f);
+
+    {
+        // FixedLabels with curvature + pressure, split: the fixed label's
+        // voxels are bit-identical and the moving label reaches it.
+        auto m = makeTwoSpheres(1.0);
+        std::map<Coord, float> before;
+        for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
+            if (*it == 2) before[it.getCoord()] = m->phi()->tree().getValue(it.getCoord());
+        }
+        ASSERT_FALSE(before.empty());
+        Forces forces;
+        forces.setPressure(pressure, 1.0f);
+        forces.setCurvatureWeight(0.5f);
+        forces.setFixedLabels({2});
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        ASSERT_TRUE(lsmo.splitting());
+        for (int n = 0; n < 30; ++n) {
+            ASSERT_GT(lsmo.step(0.75f), 0.0f);
+            std::string msg;
+            ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+        }
+        Index64 changed = 0;
+        for (const auto& kv : before) {
+            const float phi = m->phi()->tree().getValue(kv.first);
+            if (!m->labels()->tree().isValueOn(kv.first)
+                || m->labels()->tree().getValue(kv.first) != 2
+                || std::memcmp(&phi, &kv.second, sizeof(float)) != 0) ++changed;
+        }
+        EXPECT_EQ(changed, Index64(0));
+        const Coord* offs = tools::lsmo_internal::faceOffsets();
+        Index64 contact = 0;
+        for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
+            if (*it != 1) continue;
+            for (int f = 0; f < 6; ++f) {
+                contact += m->labels()->tree().getValue(it.getCoord() + offs[f]) == 2;
+            }
+        }
+        EXPECT_GT(contact, Index64(0));
+        EXPECT_EQ(countOrphans(*m), Index64(0));
+    }
+    {
+        // PressureGrowth with a curvature weight of 0.01, split, against
+        // passive label 0: grows within the PressureGrowth gate.
+        auto m = makeSphere(8.0);
+        const double dx = m->voxelSize();
+        Forces forces;
+        forces.setPressure(pressure, 1.0f);
+        forces.setCurvatureWeight(0.01f);
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        ASSERT_TRUE(lsmo.splitting());
+        const size_t steps = lsmo.advect(0.0, 6.0);
+        EXPECT_GE(steps, size_t(6));
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
+        std::cout << "SplittingFixedAndPassive: steps " << steps << " mean radius " << r
+                  << " (expected about 14)" << std::endl;
+        EXPECT_NEAR(r, 8.0 + 6.0, 0.5 * dx);
+    }
 }
 
 
@@ -3351,8 +3415,11 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
     // Hashes of the phi and label trees recorded with the ordered containers
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
-    // grain size. (A legitimate numerical change elsewhere re-records them.)
-    constexpr uint64_t kVortexHash = 0x91492b1ffb06703dull;
+    // grain size. (A legitimate numerical change elsewhere re-records them:
+    // the vortex, curvature weight 0.003, was re-recorded when its steps
+    // became Strang-split; with setSplitting(false) it still gives
+    // 0x91492b1ffb06703d.)
+    constexpr uint64_t kVortexHash = 0xbb2ca5ae036068fcull;
     constexpr uint64_t kCubeHash[2] = {0x8b7ce4b2a0056e19ull, 0xb246f92014f05228ull}; // FG26, FG6
     constexpr uint64_t kPartitionHash = 0x9b3bc454962e6cbeull;
     // end times of the recorded cube runs and of the serial vs parallel check

@@ -181,6 +181,9 @@ constexpr double kKinematicStepShrinkMax = 0.5;
 constexpr int kMaxKinematicShrinkIterations = 32;
 /// Relative tolerance on the end time of advect(t0, t1) (dimensionless).
 constexpr double kAdvectTimeRelativeEpsilon = 1e-6;
+/// Relative tolerance on the end time of one phase (parabolic half or
+/// hyperbolic part) of a split step (dimensionless).
+constexpr double kSplitPhaseRelativeEpsilon = 1e-6;
 /// Primes of CoordHash, one per component (the usual spatial-hash primes).
 constexpr uint64_t kCoordHashPrimeX = 73856093u;
 constexpr uint64_t kCoordHashPrimeY = 19349669u;
@@ -2124,8 +2127,8 @@ public:
     /// The internal rescaled pressure copy (null if none was set).
     FloatGrid::ConstPtr pressure() const { return mPressure; }
 
-    /// @brief dpsi_l/dt at @a ijk; the stencil must have been moved to
-    /// (@a ijk, @a label).
+    /// @brief dpsi_l/dt at @a ijk, the sum of hyperbolic() and parabolic();
+    /// the stencil must have been moved to (@a ijk, @a label).
     float operator()(const Coord& ijk, int32_t label,
         const LabelAwareStencil<MultiLevelSetT>& s) const
     {
@@ -2133,60 +2136,37 @@ public:
         (void)ijk; // fields are sampled at s.center()
         if (!isActive(label)) return lsmo_internal::kInactiveLabelSpeed;
         if (!mFixed.empty() && mFixed.count(label)) return 0.0f;
-
         float dneg[3], dpos[3];
         s.upwindDifferences(dneg, dpos);
+        const float kappa = this->curvatureTerm(s);
+        return -this->advectionTerm(label, s, dneg, dpos) + kappa
+            + this->pressureTerm(s, dneg, dpos);
+    }
 
-        float kappa = 0.0f;
-        if (mCurvatureWeight != 0.0f) {
-            // Interface curvature: the voxel's level set has mean curvature
-            // k_x; the interface, at signed distance -psi along the normal,
-            // has k = k_x / (1 - psi*k_x) for a sphere (a first-order
-            // correction otherwise). Falls back to k_x when |psi*k_x| >= 0.5.
-            float kn = s.meanCurvatureNormGrad(); // k_x * |grad psi|
-            const float g = s.gradient().length();
-            if (g > 0.0f) {
-                const float pk = s.template getValue<0, 0, 0>() * kn / g; // psi*k_x
-                if (std::abs(pk) < lsmo_internal::kCurvatureCorrectionMax) kn /= (1.0f - pk);
-            }
-            kappa = mCurvatureWeight * kn;
-            kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
-        }
+    /// @brief The first-order-in-space part of operator(): advection,
+    /// pressure and the speed of inactive labels.
+    float hyperbolic(const Coord& ijk, int32_t label,
+        const LabelAwareStencil<MultiLevelSetT>& s) const
+    {
+        OPENVDB_ASSERT(ijk == s.center());
+        (void)ijk;
+        if (!isActive(label)) return lsmo_internal::kInactiveLabelSpeed;
+        if (!mFixed.empty() && mFixed.count(label)) return 0.0f;
+        float dneg[3], dpos[3];
+        s.upwindDifferences(dneg, dpos);
+        return -this->advectionTerm(label, s, dneg, dpos) + this->pressureTerm(s, dneg, dpos);
+    }
 
-        // fields are sampled at the stencil center (== ijk), once per voxel
-        float advection = 0.0f;
-        const Vec3SGrid* advField = mAdvection.get();
-        float advWeight = mAdvectionWeight;
-        if (!mLabelAdvection.empty()) {
-            const auto it = mLabelAdvection.find(label);
-            if (it != mLabelAdvection.end()) {
-                advField = it->second.field.get();
-                advWeight = it->second.weight;
-            }
-        }
-        if (advField) {
-            const Vec3f vel = s.sampleAtCenter(*advField, mForceSampling);
-            for (int a = 0; a < 3; ++a) {
-                const float f = advWeight * vel[a];
-                if (f > 0.0f) advection += f * dneg[a];
-                else if (f < 0.0f) advection += f * dpos[a];
-            }
-        }
-
-        float pressure = 0.0f;
-        if (mPressure) {
-            const float force = mPressureWeight * s.sampleAtCenter(*mPressure, mForceSampling);
-            float gsPos = 0.0f, gsNeg = 0.0f;
-            for (int a = 0; a < 3; ++a) {
-                const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
-                const float pMax = std::max(dpos[a], 0.0f), pMin = std::min(dpos[a], 0.0f);
-                gsPos += nMax * nMax + pMin * pMin;
-                gsNeg += pMax * pMax + nMin * nMin;
-            }
-            if (force > 0.0f) pressure = -force * std::sqrt(gsPos);
-            else if (force < 0.0f) pressure = -force * std::sqrt(gsNeg);
-        }
-        return -advection + kappa + pressure;
+    /// @brief The curvature part of operator() (with its interface
+    /// correction and clamp); 0 for inactive and fixed labels.
+    float parabolic(const Coord& ijk, int32_t label,
+        const LabelAwareStencil<MultiLevelSetT>& s) const
+    {
+        OPENVDB_ASSERT(ijk == s.center());
+        (void)ijk;
+        if (!isActive(label)) return 0.0f;
+        if (!mFixed.empty() && mFixed.count(label)) return 0.0f;
+        return this->curvatureTerm(s);
     }
 
     /// True for labels declared fixed. Label 0 is NOT fixed here: the
@@ -2207,8 +2187,72 @@ public:
             ? dx * dx / (lsmo_internal::kCurvatureDtDivisor * mCurvatureWeight)
                                        : std::numeric_limits<float>::infinity();
     }
+    /// Stable time step of parabolic() alone: stableDt() (the curvature is
+    /// the only term with a stability limit).
+    float parabolicStableDt(float dx) const { return this->stableDt(dx); }
 
 private:
+    /// Clamped interface curvature speed (0 without curvature).
+    float curvatureTerm(const LabelAwareStencil<MultiLevelSetT>& s) const
+    {
+        if (mCurvatureWeight == 0.0f) return 0.0f;
+        // Interface curvature: the voxel's level set has mean curvature
+        // k_x; the interface, at signed distance -psi along the normal,
+        // has k = k_x / (1 - psi*k_x) for a sphere (a first-order
+        // correction otherwise). Falls back to k_x when |psi*k_x| >= 0.5.
+        float kn = s.meanCurvatureNormGrad(); // k_x * |grad psi|
+        const float g = s.gradient().length();
+        if (g > 0.0f) {
+            const float pk = s.template getValue<0, 0, 0>() * kn / g; // psi*k_x
+            if (std::abs(pk) < lsmo_internal::kCurvatureCorrectionMax) kn /= (1.0f - pk);
+        }
+        const float kappa = mCurvatureWeight * kn;
+        return std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
+    }
+
+    /// Upwinded advection term v.grad psi (sampled at the stencil center).
+    float advectionTerm(int32_t label, const LabelAwareStencil<MultiLevelSetT>& s,
+        const float dneg[3], const float dpos[3]) const
+    {
+        float advection = 0.0f;
+        const Vec3SGrid* advField = mAdvection.get();
+        float advWeight = mAdvectionWeight;
+        if (!mLabelAdvection.empty()) {
+            const auto it = mLabelAdvection.find(label);
+            if (it != mLabelAdvection.end()) {
+                advField = it->second.field.get();
+                advWeight = it->second.weight;
+            }
+        }
+        if (advField) {
+            const Vec3f vel = s.sampleAtCenter(*advField, mForceSampling);
+            for (int a = 0; a < 3; ++a) {
+                const float f = advWeight * vel[a];
+                if (f > 0.0f) advection += f * dneg[a];
+                else if (f < 0.0f) advection += f * dpos[a];
+            }
+        }
+        return advection;
+    }
+
+    /// Godunov-upwinded pressure term (sampled at the stencil center).
+    float pressureTerm(const LabelAwareStencil<MultiLevelSetT>& s,
+        const float dneg[3], const float dpos[3]) const
+    {
+        if (!mPressure) return 0.0f;
+        const float force = mPressureWeight * s.sampleAtCenter(*mPressure, mForceSampling);
+        float gsPos = 0.0f, gsNeg = 0.0f;
+        for (int a = 0; a < 3; ++a) {
+            const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
+            const float pMax = std::max(dpos[a], 0.0f), pMin = std::min(dpos[a], 0.0f);
+            gsPos += nMax * nMax + pMin * pMin;
+            gsNeg += pMax * pMax + nMin * nMin;
+        }
+        if (force > 0.0f) return -force * std::sqrt(gsPos);
+        if (force < 0.0f) return -force * std::sqrt(gsNeg);
+        return 0.0f;
+    }
+
     float mCurvatureWeight = 0.0f;
     float mMaxCurvatureForce = lsmo_internal::kDefaultMaxCurvatureForce;
     FloatGrid::ConstPtr mPressure;
@@ -2228,6 +2272,29 @@ private:
 
 
 ////////////////////////////////////////
+
+
+namespace lsmo_internal {
+
+/// @brief Whether a speed functor is split: it provides
+/// hyperbolic(ijk, label, stencil) and parabolic(ijk, label, stencil)
+/// besides operator().
+template<typename SpeedT, typename = void>
+struct IsSplitSpeed: std::false_type {};
+template<typename SpeedT>
+struct IsSplitSpeed<SpeedT,
+    std::void_t<decltype(&SpeedT::hyperbolic), decltype(&SpeedT::parabolic)>>
+    : std::true_type {};
+
+/// Whether a speed functor provides parabolicStableDt(dx).
+template<typename SpeedT, typename = void>
+struct HasParabolicStableDt: std::false_type {};
+template<typename SpeedT>
+struct HasParabolicStableDt<SpeedT,
+    std::void_t<decltype(std::declval<const SpeedT&>().parabolicStableDt(0.0f))>>
+    : std::true_type {};
+
+} // namespace lsmo_internal
 
 
 /// @brief Digital adjacency pair (foreground, background) used by
@@ -2358,7 +2425,8 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    called (on time-n data through a LabelAwareStencil) only for non-zero
 ///    candidates; labels with isActive() false get dpsi/dt = +0.999, so
 ///    they slowly retreat from their neighbors.
-/// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx)),
+/// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx))
+///    (see Operator splitting below for split speed functors),
 ///    so an interface moves at most half a voxel per step. The
 ///    half-voxel cap is what makes the projected set sufficient: since
 ///    psi_l >= phi at every voxel, no voxel outside it can change label by
@@ -2419,6 +2487,27 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// capture them; a step with no non-zero candidate and no kinematic label
 /// anywhere changes nothing.
 ///
+/// <b>Operator splitting.</b> With a split speed functor (one that also
+/// provides hyperbolic() and parabolic(), see SpeedT concept) and
+/// setSplitting(true) (the default), a step whose parabolicStableDt is
+/// finite is a Strang step: parabolic(dt/2), hyperbolic(dt),
+/// parabolic(dt/2). Its dt = min(maxDt, 0.5*cfl*dx/max|F_h|) (and the
+/// kinematic limit), with F_h the hyperbolic speeds on the state at the
+/// start of the step, so the hyperbolic terms (advection, pressure,
+/// inactive-label retreat) are not held to the much smaller curvature limit.
+/// Each parabolic half takes n = ceil((dt/2)/parabolicStableDt) equal
+/// substeps. Every substep and the hyperbolic part are full updates as
+/// above (steps 1-6: projection with passive label 0 and fixed walls,
+/// topology preservation, orphan cleanup, the phi floor, incremental
+/// redistance, band maintenance), each evaluated on the state the previous
+/// one left and each limited to half a voxel of motion: if its own speeds
+/// require it, an update takes a shorter time step and the part continues
+/// with more updates until its time is covered. An update whose speeds are
+/// all zero is skipped. Kinematic labels are stamped once per step, at
+/// t_{n+1}, by its last update (the earlier ones treat them as walls at
+/// their t_n position). A step with no parabolic part (parabolicStableDt
+/// +inf, e.g. curvature weight 0) is an unsplit step as above, unchanged.
+///
 /// <b>Kinematic labels</b> (setKinematicLabel()) are rigid obstacles whose
 /// region is prescribed: a signed distance grid of the object in its rest
 /// pose and a rigid motion of time. They are treated like fixed labels by
@@ -2459,8 +2548,16 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// bool  isFixed(int32_t label) const;
 /// bool  isActive(int32_t label) const;
 /// float stableDt(float dx) const; // +inf if none
+/// // optional, all three for operator splitting (operator() = their sum):
+/// float hyperbolic(const Coord& ijk, int32_t label,
+///                  const LabelAwareStencil<MultiLevelSetT>& s) const;
+/// float parabolic(const Coord& ijk, int32_t label,
+///                 const LabelAwareStencil<MultiLevelSetT>& s) const;
+/// float parabolicStableDt(float dx) const; // +inf if none (else stableDt)
 /// @endcode
-/// operator() must be thread-safe. All quantities are in world units.
+/// operator(), hyperbolic() and parabolic() must be thread-safe; parabolic()
+/// is not called for inactive labels (their retreat is hyperbolic). All
+/// quantities are in world units.
 ///
 /// @par Example
 /// @code
@@ -2506,6 +2603,13 @@ public:
     /// 1e-2*dx beyond; true makes the result exact.
     void setFullRedistance(bool on) { mFullRedistance = on; }
     bool fullRedistance() const { return mFullRedistance; }
+    /// @brief Strang splitting of a split speed functor's hyperbolic and
+    /// parabolic parts (default true; see the class documentation).
+    /// Ignored for a functor that only provides operator().
+    void setSplitting(bool on) { mSplitting = on; }
+    /// Whether steps are split: setSplitting() is on and the speed functor
+    /// is split (a step is then split if its parabolicStableDt is finite).
+    bool splitting() const { return mSplitting && kSplitSpeed; }
     /// @brief Labels whose digital topology is preserved (default
     /// none): a label change a -> b at a voxel is applied only if the voxel is
     /// a simple point of every protected label in {a, b}.
@@ -2638,7 +2742,8 @@ public:
     /// with topology-preserving or kinematic labels can reach it.
     size_t redistanceCapHits() const { return mRedistanceCapHits; }
 
-    /// @brief One forward Euler step of at most @a maxDt (world time).
+    /// @brief One forward Euler step of at most @a maxDt (world time), or
+    /// one Strang-split step (see the class documentation).
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
     /// changes if nothing can move, 0 if @a maxDt <= 0.
     float step(float maxDt);
@@ -2669,6 +2774,18 @@ public:
 private:
     /// Own label + 6 face labels.
     static constexpr int kMaxCandidates = 7;
+    static constexpr bool kSplitSpeed = lsmo_internal::IsSplitSpeed<SpeedT>::value;
+
+    /// The part of the speed a sub-update evaluates: operator(), or
+    /// hyperbolic() or parabolic() of a split functor.
+    enum class Term { Full, Hyperbolic, Parabolic };
+    /// Largest |speed| over the candidates of the last evaluate() and
+    /// whether any voxel has a non-zero candidate.
+    struct Evaluation
+    {
+        float maxSpeed = 0.0f;
+        bool any = false;
+    };
 
     /// A candidate label and its speed.
     using Candidate = std::pair<int32_t, float>;
@@ -3074,17 +3191,57 @@ private:
         c.label[c.n++] = l; // at most 7 distinct labels
     }
 
-    float evalSpeed(StencilT& s, const Coord& ijk, int32_t label) const
+    float evalSpeed(StencilT& s, const Coord& ijk, int32_t label, Term term) const
     {
-        float f;
         if (!mSpeed.isActive(label)) {
-            f = lsmo_internal::kInactiveLabelSpeed; // inactive labels retreat
-        } else {
-            s.moveTo(ijk, label);
-            f = mSpeed(ijk, label, s);
+            // inactive labels retreat (a hyperbolic term)
+            return term == Term::Parabolic ? 0.0f : lsmo_internal::kInactiveLabelSpeed;
         }
-        return f;
+        s.moveTo(ijk, label);
+        if constexpr (kSplitSpeed) {
+            if (term == Term::Hyperbolic) return mSpeed.hyperbolic(ijk, label, s);
+            if (term == Term::Parabolic) return mSpeed.parabolic(ijk, label, s);
+        }
+        return mSpeed(ijk, label, s);
     }
+
+    /// Stable time step of the parabolic part (speed.stableDt if the
+    /// functor has no parabolicStableDt).
+    float parabolicStableDt() const
+    {
+        const float dx = float(mMls.voxelSize());
+        if constexpr (lsmo_internal::HasParabolicStableDt<SpeedT>::value) {
+            return mSpeed.parabolicStableDt(dx);
+        } else {
+            return mSpeed.stableDt(dx);
+        }
+    }
+    /// Whether step() takes a split step: splitting() and a finite
+    /// parabolic stable time step (a functor without a parabolic limit has
+    /// no parabolic part to split off).
+    bool splitStepActive() const
+    {
+        return this->splitting() && std::isfinite(this->parabolicStableDt())
+            && this->parabolicStableDt() > 0.0f;
+    }
+
+    /// Steps 1-2 of the class documentation on the current state: freeze
+    /// mask, projected set, candidates and their @a term speeds (scratch).
+    Evaluation evaluate(Term term);
+    /// @a dt limited so that interfaces move at most half a voxel.
+    float motionLimit(const Evaluation& e, float dt) const;
+    /// @a dt limited so that kinematic objects move at most half a voxel.
+    float kinematicLimit(float dt) const;
+    /// Steps 4-6 with time step @a dt, on the last evaluate(); kinematic
+    /// labels are stamped at @a stampTime if @a stamp.
+    void update(float dt, bool any, bool stamp, double stampTime);
+    /// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2).
+    float splitStep(float maxDt);
+    /// Sub-updates of @a term over @a duration, each of at most @a target
+    /// (and the motion limit); the last stamps the kinematic labels at
+    /// @a stampTime if @a stampAtEnd.
+    void splitPhase(Term term, double duration, float target, bool stampAtEnd,
+        double stampTime);
 
     /// Two-smallest projection of @a e (own label @a own, time-n
     /// @a phiN) with candidates @a cand; false if @a e has no non-zero
@@ -3148,6 +3305,7 @@ private:
     int mGrainSize = 1;
     float mTolerance;
     bool mFullRedistance = false;
+    bool mSplitting = true;
     int mRedistanceIterations = 0;
     size_t mRedistanceCapHits = 0;
     /// whether the pair was last redistanced by this evolver (incremental
@@ -3163,6 +3321,33 @@ float
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 {
     if (!(maxDt > 0.0f)) return 0.0f;
+    mPeakScratchBytes = 0;
+    if (this->splitStepActive()) return this->splitStep(maxDt);
+
+    // 1-2. projected set, candidates and speeds, all on time-n data
+    const Evaluation e = this->evaluate(Term::Full);
+
+    // 3. time step: interfaces move at most half a voxel, so only projected
+    // voxels can change label
+    float dt = std::min(maxDt, mSpeed.stableDt(float(mMls.voxelSize())));
+    if (!e.any && mKinematic.empty()) {
+        mTime += dt;
+        return dt; // no non-zero candidate anywhere: nothing moves
+    }
+    dt = this->kinematicLimit(this->motionLimit(e, dt));
+
+    // 4-6. projection, deferred changes, kinematic labels at t_{n+1}, orphan
+    // cleanup, band maintenance
+    this->update(dt, e.any, /*stamp=*/true, mTime + double(dt));
+    mTime += dt;
+    return dt;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+typename LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::Evaluation
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term)
+{
     FloatTreeT& phi = mMls.phi()->tree();
     LabelTreeT& labels = mMls.labels()->tree();
     const double dx = mMls.voxelSize();
@@ -3231,7 +3416,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         for (size_t k = 0; k < numEntries; ++k) {
             const Coord p = leaf.offsetToGlobalCoord(entries[k].offset);
             for (int j = 0; j < entries[k].n; ++j, ++l) {
-                const float s = this->evalSpeed(stencil, p, *l);
+                const float s = this->evalSpeed(stencil, p, *l, term);
                 d.cand.emplace_back(*l, s);
                 d.maxSpeed = std::max(d.maxSpeed, std::abs(s));
             }
@@ -3239,41 +3424,63 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         d.any = true;
     });
 
-    float maxSpeed = 0.0f;
-    bool any = false;
+    Evaluation result;
     for (size_t i = 0; i < leafCount; ++i) {
-        maxSpeed = std::max(maxSpeed, data[i].maxSpeed);
-        any |= data[i].any;
+        result.maxSpeed = std::max(result.maxSpeed, data[i].maxSpeed);
+        result.any |= data[i].any;
     }
-    mPeakScratchBytes = scratch.memUsage();
+    mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage());
+    return result;
+}
 
-    // 3. time step: interfaces move at most half a voxel, so only projected
-    // voxels can change label
-    float dt = std::min(maxDt, mSpeed.stableDt(float(dx)));
-    if (!any && mKinematic.empty()) {
-        mTime += dt;
-        return dt; // no non-zero candidate anywhere: nothing moves
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+float
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::motionLimit(
+    const Evaluation& e, float dt) const
+{
+    if (e.any && e.maxSpeed > 0.0f) {
+        dt = std::min(dt, float(lsmo_internal::kMaxInterfaceMotionVoxels * mCfl
+            * mMls.voxelSize() / e.maxSpeed));
     }
-    if (any) {
-        if (maxSpeed > 0.0f) {
-            dt = std::min(dt,
-                float(lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * dx / maxSpeed));
-        }
+    return dt;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+float
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::kinematicLimit(float dt) const
+{
+    if (mKinematic.empty()) return dt;
+    // kinematic objects move at most kMaxInterfaceMotionVoxels*cfl*dx per step
+    const double limit = lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * mMls.voxelSize();
+    for (int iter = 0; iter < lsmo_internal::kMaxKinematicShrinkIterations; ++iter) {
+        const double d = this->kinematicDisplacement(mTime, mTime + double(dt));
+        if (d <= limit) break;
+        dt = float(double(dt) * std::min(lsmo_internal::kKinematicStepShrinkMax,
+            lsmo_internal::kKinematicStepSafety * limit / d));
     }
-    if (!mKinematic.empty()) {
-        // kinematic objects move at most kMaxInterfaceMotionVoxels*cfl*dx per step
-        const double limit = lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * dx;
-        for (int iter = 0; iter < lsmo_internal::kMaxKinematicShrinkIterations; ++iter) {
-            const double d = this->kinematicDisplacement(mTime, mTime + double(dt));
-            if (d <= limit) break;
-            dt = float(double(dt) * std::min(lsmo_internal::kKinematicStepShrinkMax,
-                lsmo_internal::kKinematicStepSafety * limit / d));
-        }
-    }
+    return dt;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
+    float dt, bool any, bool stamp, double stampTime)
+{
+    FloatTreeT& phi = mMls.phi()->tree();
+    LabelTreeT& labels = mMls.labels()->tree();
 
     // 4. two-smallest projection, written to aux buffer kNext of both
     // trees (initialized with time n) while time n stays in the leaf buffers
     constexpr size_t kNext = PairBuffers::kNext;
+    Scratch& scratch = mScratch;
+    BoolTreeT& freeze = scratch.freeze;
+    std::vector<LeafData>& data = scratch.data;
+    tree::LeafManager<const FloatTreeT> leafs(phi);
+    const size_t leafCount = leafs.leafCount();
+    OPENVDB_ASSERT(leafCount <= data.size());
     std::vector<std::vector<Deferred>>& deferred = scratch.deferred;
     Scratch::resetLists(deferred, mProtected.empty() || !any ? 0 : leafCount);
     if (any) {
@@ -3316,17 +3523,60 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     } // any
 
     // 5b. deferred (topology-preserving) changes; 5c. kinematic labels at
-    // t_{n+1}; 5d. orphan cleanup
+    // @a stampTime; 5d. orphan cleanup
     if (!mProtected.empty() && any) this->applyDeferred(deferred, phi, labels, freeze);
-    if (!mKinematic.empty()) this->stampKinematic(mTime + double(dt), freeze);
+    if (stamp && !mKinematic.empty()) this->stampKinematic(stampTime, freeze);
     this->cleanOrphans(phi, labels, freeze);
 
     // 6. band maintenance (topology changes, after the swap)
     this->bandMaintenance(freeze);
     mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage());
     OPENVDB_ASSERT(mMls.validate());
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+float
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitStep(float maxDt)
+{
+    // the time step of the hyperbolic part, on the current state
+    const Evaluation h = this->evaluate(Term::Hyperbolic);
+    const float dx = float(mMls.voxelSize());
+    if (!h.any && mKinematic.empty()) {
+        const float dt = std::min(maxDt, mSpeed.stableDt(dx));
+        mTime += dt;
+        return dt; // no non-zero candidate anywhere: nothing moves
+    }
+    const float dt = this->kinematicLimit(this->motionLimit(h, maxDt));
+    const double t1 = mTime + double(dt);
+    // parabolic halves: n equal substeps of at most the parabolic stable dt
+    const double half = 0.5 * double(dt);
+    const double n = std::max(1.0, std::ceil(half / double(this->parabolicStableDt())));
+    const float sub = float(half / n);
+    this->splitPhase(Term::Parabolic, half, sub, /*stampAtEnd=*/false, t1);
+    this->splitPhase(Term::Hyperbolic, double(dt), dt, /*stampAtEnd=*/false, t1);
+    this->splitPhase(Term::Parabolic, half, sub, /*stampAtEnd=*/true, t1);
     mTime += dt;
     return dt;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitPhase(
+    Term term, double duration, float target, bool stampAtEnd, double stampTime)
+{
+    const double eps = lsmo_internal::kSplitPhaseRelativeEpsilon * duration;
+    double remaining = duration;
+    while (remaining > eps) {
+        const Evaluation e = this->evaluate(term);
+        const float dt = this->motionLimit(e, std::min(target, float(remaining)));
+        if (!(dt > 0.0f)) break;
+        remaining -= double(dt);
+        const bool stamp = stampAtEnd && !(remaining > eps) && !mKinematic.empty();
+        // a sub-update in which nothing moves is skipped
+        if ((e.any && e.maxSpeed > 0.0f) || stamp) this->update(dt, e.any, stamp, stampTime);
+    }
 }
 
 
