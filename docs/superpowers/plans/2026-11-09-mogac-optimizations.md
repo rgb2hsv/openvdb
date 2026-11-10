@@ -125,6 +125,19 @@
 
 ---
 
+### Task 15: Hashed containers on hot paths (user request) — run after Task 14
+
+**Files:** `openvdb/openvdb/tools/LevelSetMultiObject.h`, `openvdb/openvdb/tools/LevelSetMultiObjectMesh.h`, test helper headers if they hold hot lookups.
+
+**Interfaces:** `lsmo_internal::CoordHash` (hash for `Coord`, e.g. from its three components; usable with std::unordered_map/set). Internal containers switch to hashed versions: `mInactive`, `mFixed`, `mProtected` (per-candidate lookups) → `std::unordered_set<int32_t>` (public setters keep taking `std::set<int32_t>` and convert; getters that return `const std::set&` keep an ordered copy or change to return by value — choose and document); `mLabelAdvection`, `mKinematic` → `std::unordered_map<int32_t, …>` where only looked up, keeping any order-dependent iteration deterministic; per-step `std::map<Coord, size_t>` leaf index, `claimObject`, wrap `adds`, `claimed` → `std::unordered_map/set<Coord, …, CoordHash>`. Wherever iteration order affects results (serial apply of deferred changes, wrap adds, claim order, first-object-wins), iterate over a sorted vector of keys or keep the existing ordered container — results must stay identical and thread-count independent. Public API containers (fromSignedGrids input map, multiObjectToMesh result map, label-set setters) stay ordered.
+
+- [ ] **Step 1: Write test `HashedContainersKeepResults`:** run the Tornado, TopologyCubeThroughSpheres (both rules, kinematic spheres) and PartitionInvariant scenarios and compare φ/label tree hashes against values recorded from the pre-change build (record them first, commit them as constants in the test); also grain 0 vs 64 identical.
+- [ ] **Step 2: Implement** the container changes.
+- [ ] **Step 3: Run all** `TestLevelSetMultiObject*` — pass; numeric outputs identical; report per-step timing before/after on Tornado and the cube test (keep a change only where it is not slower — revert any hashed container that measures slower and note it).
+- [ ] **Step 4: Commit** — `"MOGAC: hashed containers on hot paths"`
+
+---
+
 ### Task 4: 16-bit labels by default (M1)
 
 **Files:** Modify `LevelSetMultiObject.h` (`Int16LabelTree`, default template argument, `registerMultiLevelSetGridTypes()`, factory range checks), `LevelSetMultiObjectMesh.h` if it names `Int32Tree`; Tests in both test files and `LevelSetMultiObjectFixtures.h`.
