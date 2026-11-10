@@ -140,6 +140,19 @@
 
 ---
 
+### Task 16: Rename Tornado → Vortex; double the vortex run (user request) — run after Task 15
+
+**Files:** `openvdb/openvdb/unittest/TestLevelSetMultiObject.cc`, `TestLevelSetMultiObjectMesh.cc`, `LevelSetMultiObjectFixtures.h`, any tool-header doc that names the scenario, `docs/superpowers/specs/*.md`, `docs/superpowers/plans/*.md`.
+
+**Interfaces:** rename every "Tornado"/"tornado" identifier, test name, fixture struct, helper, scenario label and doc mention to "Vortex"/"vortex" (e.g. `TornadoEightObjects` → `VortexEightObjects`, `lsmo_test::Tornado` → `lsmo_test::Vortex`). Double the vortex simulation length: end time t = 42 → 84 (keep the chunk size; the "two chunks past first contact" rule is replaced by running to t = 84 with contacts ≥ 4 required at the end and at every chunk after first contact). All gates unchanged in form: per-chunk validate/partition/no-NaN; ≥ 4 contact pairs; every label survives; two-sided per-label volume gate vs OpenVDB LevelSetAdvection over the same (doubled) time. Scenarios that reuse the vortex at full length (IncrementalRedistanceMatchesFull's asserted runs, HashedContainersKeepResults, StepBenchmark/MeshBenchmark end state) follow the new length; re-record any committed hashes from the pre-change build at the new length and say so.
+
+- [ ] **Step 1:** Rename (verify `grep -rni tornado` over the listed files returns nothing).
+- [ ] **Step 2:** Double the vortex run and update dependents.
+- [ ] **Step 3: Run all** `TestLevelSetMultiObject*` — pass. If a vortex gate fails at t = 84 (lost contacts, a vanished label, volume gate), STOP and report the numbers per label/chunk instead of changing a gate. Report runtime before/after.
+- [ ] **Step 4: Commit** — `"MOGAC tests: rename Tornado to Vortex; run the vortex twice as long"`
+
+---
+
 ### Task 4: 16-bit labels by default (M1)
 
 **Files:** Modify `LevelSetMultiObject.h` (`Int16LabelTree`, default template argument, `registerMultiLevelSetGridTypes()`, factory range checks), `LevelSetMultiObjectMesh.h` if it names `Int32Tree`; Tests in both test files and `LevelSetMultiObjectFixtures.h`.
