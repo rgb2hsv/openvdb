@@ -97,18 +97,19 @@
 
 ---
 
-### Task 13: Remove the clamp-speed option (user request) — run after Task 3
+### Task 13: API cleanup — remove the clamp-speed option; bool-only validators (user requests) — run after Task 3
 
 **Files:** Modify `openvdb/openvdb/tools/LevelSetMultiObject.h` (evolver), `docs/superpowers/specs/2026-11-08-multi-object-level-set-design.md` (§3.5 setters, §4 step 3).
 
 **Interfaces:**
 - Removes: `LevelSetMultiObject::setClampSpeed(bool)`, `clampSpeed() const`, member `mClampSpeed`, the speed clamp to [−1, 1] and the `dt = min(dt, 0.5·dx)` clamp branch. dt is always min(maxDt, motion cap / max|F|, stableDt). Docs mentioning the option are removed. The curvature-term clamp in `MultiObjectForces` (`setMaxCurvatureForce`) is a different mechanism and stays unless the user says otherwise.
 
+- [ ] **Step 0 (user request): bool-only validators.** `MultiLevelSet::validateBackgrounds()` and `validatePhi()` take no arguments and return only `bool` (no message parameter, no message building). Callers produce the text: the constructor throws `ValueError` with a fixed message per failed check ("phi background must equal halfWidth * voxel size and the label background must be 0" / "phi must be non-negative and finite at every active voxel"); `validate(std::string* message)` keeps its signature and sets the same fixed texts (plus its existing topology-mismatch text). Update tests that asserted on detailed per-voxel message contents to assert on the fixed texts.
 - [ ] **Step 1: Write failing test `NoClampSpeedOption`:** a compile-time check (`static_assert` via a detection trait) that `LevelSetMultiObject<…>` has no `setClampSpeed` member.
 - [ ] **Step 2: Run** — FAIL (member exists).
 - [ ] **Step 3: Remove** the option, branches and docs; update the base spec text.
 - [ ] **Step 4: Run all** `TestLevelSetMultiObject*` — pass with unchanged numeric outputs (no test used the option).
-- [ ] **Step 5: Commit** — `"MOGAC evolver: remove the clamp-speed option"`
+- [ ] **Step 5: Commit** — `"MOGAC: remove clamp-speed option; bool-only validators"`
 
 ---
 
