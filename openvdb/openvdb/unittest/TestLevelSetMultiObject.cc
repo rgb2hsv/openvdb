@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -3093,6 +3094,142 @@ TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
             if (lb.getValue(it.getCoord()) != *it) ++diff;
         }
         EXPECT_EQ(diff, Index64(0));
+    }
+}
+
+
+namespace {
+
+constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
+constexpr uint64_t kFnvPrime = 1099511628211ull;
+
+template<typename T>
+void
+fnvMix(uint64_t& h, const T& v)
+{
+    unsigned char bytes[sizeof(T)];
+    std::memcpy(bytes, &v, sizeof(T));
+    for (unsigned char b : bytes) { h ^= uint64_t(b); h *= kFnvPrime; }
+}
+
+template<typename TreeT>
+void
+fnvMixTree(uint64_t& h, const TreeT& tree)
+{
+    for (auto it = tree.cbeginValueAll(); it; ++it) {
+        const Coord p = it.getCoord();
+        fnvMix(h, p.x());
+        fnvMix(h, p.y());
+        fnvMix(h, p.z());
+        fnvMix(h, *it);
+        fnvMix(h, uint8_t(it.isValueOn()));
+        fnvMix(h, it.getVoxelCount());
+    }
+}
+
+// FNV-1a hash of every value (coordinate, bits, activity, voxel count) of
+// the phi and label trees of @a m.
+uint64_t
+stateHash(const MLS& m)
+{
+    uint64_t h = kFnvOffsetBasis;
+    fnvMixTree(h, m.phi()->tree());
+    fnvMixTree(h, m.labels()->tree());
+    return h;
+}
+
+// The PartitionInvariant scenario (random constant speeds on a 4-label
+// checker, 75 steps) at grain size @a grainSize.
+MLS::Ptr
+runPartitionScenario(int grainSize)
+{
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (auto p = CoordBBox(Coord(0), Coord(31)).begin(); p; ++p) {
+            acc.setValue(*p, 1 + (((*p)[0] / 8 + (*p)[1] / 8 + (*p)[2] / 8) % 4));
+        }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    RandomSpeed speed({1, 2, 3, 4}, 20261108u);
+    tools::LevelSetMultiObject<MLS, RandomSpeed> lsmo(*m, speed);
+    lsmo.setGrainSize(grainSize);
+    for (int n = 0; n < 75; ++n) lsmo.step(1.0f);
+    return m;
+}
+
+// The protected runCubeThroughSpheres scenario under @a rule, evolution
+// only (same setup and chunks of 2, no per-chunk checks), to @a tEnd.
+MLS::Ptr
+evolveCubeThroughSpheres(Conn rule, int grainSize, double tEnd)
+{
+    const int side = 40;
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (auto p = CoordBBox(Coord(0), Coord(side - 1)).begin(); p; ++p) acc.setValue(*p, 1);
+        for (int s = 0; s < 3; ++s) {
+            const Coord& c = kOrbitSpheres[s];
+            for (auto p = CoordBBox(c - Coord(4), c + Coord(4)).begin(); p; ++p) {
+                if ((*p - c).asVec3i().lengthSqr() <= 16) acc.setValue(*p, 2 + s);
+            }
+        }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+    forces.setCurvatureWeight(0.0f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo.setGrainSize(grainSize);
+    for (int s = 0; s < 3; ++s) {
+        lsmo.setKinematicLabel(2 + s, tools::createLevelSetSphere<FloatGrid>(4.0f,
+            Vec3f(kOrbitSpheres[s].asVec3d()), float(m->voxelSize())), orbitMotion);
+    }
+    lsmo.setConnectivity(rule);
+    lsmo.setTopologyPreservingLabels({1});
+    for (double t = 0.0; t < tEnd - 1e-9;) {
+        const double t1 = std::min(tEnd, t + 2.0);
+        lsmo.advect(t, t1);
+        t = t1;
+    }
+    return m;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
+{
+    // Hashes of the phi and label trees recorded with the ordered containers
+    // (std::map/std::set) the evolver used on its hot paths before they
+    // became hashed ones: the switch must not change any result, for any
+    // grain size. (A legitimate numerical change elsewhere re-records them.)
+    constexpr uint64_t kTornadoHash = 0x2a727c01aed0a316ull;
+    constexpr uint64_t kCubeHash[2] = {0x8b7ce4b2a0056e19ull, 0xb246f92014f05228ull}; // FG26, FG6
+    constexpr uint64_t kPartitionHash = 0x9b3bc454962e6cbeull;
+    const bool record = std::getenv("LSMO_RECORD_HASHES") != nullptr;
+    auto check = [&](const char* what, uint64_t h, uint64_t expected) {
+        if (record) {
+            std::cout << "HashedContainers: " << what << " 0x" << std::hex << h << std::dec
+                      << std::endl;
+        } else {
+            EXPECT_EQ(h, expected) << what;
+        }
+    };
+
+    check("tornado", stateHash(*Tornado().endState()), kTornadoHash);
+
+    const Conn rules[2] = {Conn::FG26_BG6, Conn::FG6_BG26};
+    for (int r = 0; r < 2; ++r) {
+        // protected cube through the kinematic spheres, well past first
+        // contact; serial runs match grain 64 (TopologySerialMatchesParallel,
+        // FG26_BG6; the serial runs of both rules matched when recording)
+        check(("cube " + lsmo_test::connectivityName(rules[r])).c_str(),
+            stateHash(*evolveCubeThroughSpheres(rules[r], 64, 72.0)), kCubeHash[r]);
+    }
+
+    for (int grain : {0, 64}) {
+        check(("partition grain " + std::to_string(grain)).c_str(),
+            stateHash(*runPartitionScenario(grain)), kPartitionHash);
     }
 }
 
