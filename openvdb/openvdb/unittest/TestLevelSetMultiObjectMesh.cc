@@ -16,8 +16,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <random>
 #include <set>
@@ -96,17 +99,7 @@ cube() { static const Cube c; return c; }
 int fgOf(Conn c) { return c == Conn::FG26_BG6 ? 26 : c == Conn::FG18_BG6 ? 18 : 6; }
 int bgOf(Conn c) { return c == Conn::FG6_BG26 ? 26 : c == Conn::FG6_BG18 ? 18 : 6; }
 
-std::string
-connName(Conn c)
-{
-    switch (c) {
-        case Conn::FG26_BG6: return "FG26_BG6";
-        case Conn::FG6_BG26: return "FG6_BG26";
-        case Conn::FG18_BG6: return "FG18_BG6";
-        case Conn::FG6_BG18: return "FG6_BG18";
-    }
-    return "?";
-}
+using lsmo_test::connectivityName;
 
 // cube-restricted adjacency: 6 = cube edge, 18 = + face diagonal, 26 = all
 bool
@@ -416,14 +409,14 @@ TEST_F(TestLevelSetMultiObjectMesh, CaseTableAll)
             maxTris = std::max(maxTris, int(table[c].count));
             if (c == 0 || c == 255) { EXPECT_EQ(int(table[c].count), 0); continue; }
             const std::string e = checkCase(conn, c, table[c], tubes);
-            if (!e.empty() && ++failures <= 8) ADD_FAILURE() << connName(conn) << " case " << c << ": " << e;
+            if (!e.empty() && ++failures <= 8) ADD_FAILURE() << connectivityName(conn) << " case " << c << ": " << e;
         }
-        EXPECT_EQ(failures, 0) << connName(conn);
+        EXPECT_EQ(failures, 0) << connectivityName(conn);
         // tubes: exactly the four body-diagonal pairs for a 26 side
         const bool has26 = conn == Conn::FG26_BG6 || conn == Conn::FG6_BG26;
-        EXPECT_EQ(tubes, has26 ? 4 : 0) << connName(conn);
+        EXPECT_EQ(tubes, has26 ? 4 : 0) << connectivityName(conn);
         if (std::getenv("OPENVDB_MOGAC_VERBOSE")) {
-            std::cout << "[CaseTableAll] " << connName(conn) << ": max triangles/case " << maxTris
+            std::cout << "[CaseTableAll] " << connectivityName(conn) << ": max triangles/case " << maxTris
                       << ", tube components " << tubes << std::endl;
         }
     }
@@ -450,87 +443,16 @@ triNormal(const LabelMesh& m, const Vec3I& t)
     return (b - a).cross(c - a);
 }
 
-// Closed, consistently oriented 2-manifold: every directed edge occurs once
-// and its reverse once (each edge has exactly two triangles, wound
-// oppositely), every vertex is used and its link is a single cycle, and no
-// triangle has zero area.
-bool
-isClosedManifold(const LabelMesh& m, double dx, std::string* why = nullptr)
+// Closed 2-manifold check of lsmo_test::meshTopology, with the defect as
+// the failure message.
+::testing::AssertionResult
+closedManifold(const LabelMesh& m, double dx)
 {
-    std::ostringstream err;
-    auto fail = [&](const std::string& s) { if (why) *why = s; return false; };
-    const size_t nv = m.points.size();
-    std::map<std::pair<uint32_t, uint32_t>, int> directed;
-    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> link(nv);
-    for (size_t i = 0; i < m.triangles.size(); ++i) {
-        const Vec3I& t = m.triangles[i];
-        for (int k = 0; k < 3; ++k) {
-            if (t[k] >= nv) return fail("vertex index out of range");
-        }
-        if (t[0] == t[1] || t[1] == t[2] || t[0] == t[2]) return fail("repeated vertex in a triangle");
-        if (!(triNormal(m, t).length() > kZeroArea * dx * dx)) {
-            err << "zero-area triangle " << i;
-            return fail(err.str());
-        }
-        for (int k = 0; k < 3; ++k) {
-            ++directed[{t[k], t[(k + 1) % 3]}];
-            link[t[k]].emplace_back(t[(k + 1) % 3], t[(k + 2) % 3]);
-        }
-    }
-    for (const auto& kv : directed) {
-        if (kv.second != 1) return fail("directed edge repeated (inconsistent winding or > 2 triangles)");
-        if (!directed.count({kv.first.second, kv.first.first})) return fail("boundary edge");
-    }
-    for (size_t v = 0; v < nv; ++v) {
-        const auto& L = link[v];
-        if (L.empty()) return fail("unused vertex");
-        std::map<uint32_t, uint32_t> next;
-        for (const auto& e : L) next[e.first] = e.second;
-        size_t steps = 0;
-        uint32_t cur = L[0].first;
-        do { cur = next[cur]; ++steps; } while (cur != L[0].first && steps <= L.size());
-        if (steps != L.size()) {
-            err << "vertex " << v << " link is not one cycle";
-            return fail(err.str());
-        }
-    }
-    return true;
+    const auto t = lsmo_test::meshTopology(m, dx);
+    if (t.closed && t.manifold) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << (t.closed ? "" : "not closed ("
+        + std::to_string(t.boundaryEdgeMidpoints.size()) + " boundary edges) ") << t.defect;
 }
-
-int
-components(const LabelMesh& m)
-{
-    std::vector<uint32_t> rep(m.points.size());
-    for (size_t i = 0; i < rep.size(); ++i) rep[i] = uint32_t(i);
-    std::function<uint32_t(uint32_t)> find = [&](uint32_t x) {
-        while (rep[x] != x) x = rep[x] = rep[rep[x]];
-        return x;
-    };
-    for (const Vec3I& t : m.triangles) {
-        rep[find(t[0])] = find(t[1]);
-        rep[find(t[1])] = find(t[2]);
-    }
-    std::set<uint32_t> roots;
-    for (const Vec3I& t : m.triangles) roots.insert(find(t[0]));
-    return int(roots.size());
-}
-
-// V - E + F over the vertices used by @a tris.
-int
-eulerChar(const std::vector<Vec3I>& tris)
-{
-    std::set<std::pair<uint32_t, uint32_t>> edges;
-    std::set<uint32_t> verts;
-    for (const Vec3I& t : tris)
-        for (int k = 0; k < 3; ++k) {
-            verts.insert(t[k]);
-            edges.insert({std::min(t[k], t[(k + 1) % 3]), std::max(t[k], t[(k + 1) % 3])});
-        }
-    return int(verts.size()) - int(edges.size()) + int(tris.size());
-}
-
-int
-eulerChar(const LabelMesh& m) { return eulerChar(m.triangles); }
 
 // Folded triangles: triangles are grouped by the cell holding
 // their centroid and by connectivity within the cell into patches. A disk
@@ -572,7 +494,7 @@ countFolded(const LabelMesh& m, const MLS& mls, int32_t label, size_t* tubes = n
         for (const auto& p : patches) {
             std::vector<Vec3I> sub;
             for (size_t i : p.second) sub.push_back(m.triangles[i]);
-            const int chi = eulerChar(sub);
+            const int chi = lsmo_test::eulerCharacteristic(sub);
             Vec3d area(0.0);
             for (size_t i : p.second) area += triNormal(m, m.triangles[i]);
             int axisMask = -1;
@@ -705,9 +627,7 @@ expectManifold(const std::string& name, const MLS& m, const std::map<int32_t, La
     size_t* totalTris = nullptr)
 {
     for (const auto& kv : meshes) {
-        std::string why;
-        EXPECT_TRUE(isClosedManifold(kv.second, m.voxelSize(), &why))
-            << name << " label " << kv.first << ": " << why;
+        EXPECT_TRUE(closedManifold(kv.second, m.voxelSize())) << name << " label " << kv.first;
         EXPECT_FALSE(kv.second.triangles.empty()) << name << " label " << kv.first;
         EXPECT_EQ(countFolded(kv.second, m, kv.first), size_t(0)) << name << " label " << kv.first;
         if (totalTris) *totalTris += kv.second.triangles.size();
@@ -729,8 +649,9 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
         size_t tris = 0;
         expectManifold("two spheres", *m, meshes, &tris);
         for (const auto& kv : meshes) {
-            EXPECT_EQ(components(kv.second), 1);
-            EXPECT_EQ(eulerChar(kv.second), 2);
+            const auto t = lsmo_test::meshTopology(kv.second, m->voxelSize());
+            EXPECT_EQ(t.components, 1);
+            EXPECT_EQ(t.euler, 2);
         }
         printStats("two spheres (" + std::to_string(tris) + " triangles)", stats);
     }
@@ -765,7 +686,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
             const auto meshes = meshWithStats(*m, s, stats);
             EXPECT_EQ(meshes.size(), size_t(4));
             size_t tris = 0;
-            const std::string name = "random " + std::to_string(r) + " " + connName(conn);
+            const std::string name = "random " + std::to_string(r) + " " + connectivityName(conn);
             expectManifold(name, *m, meshes, &tris);
             printStats(name + " (" + std::to_string(tris) + " triangles)", stats);
         }
@@ -781,10 +702,9 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
             const auto meshes = meshWithStats(*m, s, stats);
             EXPECT_EQ(meshes.size(), size_t(4));
             size_t tris = 0, folded = 0;
-            const std::string name = "random-phi " + std::to_string(r) + " " + connName(conn);
+            const std::string name = "random-phi " + std::to_string(r) + " " + connectivityName(conn);
             for (const auto& kv : meshes) {
-                std::string why;
-                EXPECT_TRUE(isClosedManifold(kv.second, 1.0, &why)) << name << " label " << kv.first << ": " << why;
+                EXPECT_TRUE(closedManifold(kv.second, 1.0)) << name << " label " << kv.first;
                 tris += kv.second.triangles.size();
                 folded += countFolded(kv.second, *m, kv.first);
             }
@@ -795,8 +715,38 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
 }
 
 
+namespace {
+
+// Solid torus, R = 8, r = 3, about z (label 1), and its padded domain.
+MLS::Ptr
+torusFixture()
+{
+    return labelFixture(CoordBBox(Coord(-13), Coord(13)), [](const Coord& c) {
+        const double rho = std::sqrt(double(c[0] * c[0] + c[1] * c[1])) - 8.0;
+        return rho * rho + double(c[2] * c[2]) <= 9.0 ? 1 : 0;
+    });
+}
+const CoordBBox kTorusDomain(Coord(-14), Coord(14));
+
+// Hollow sphere: shell 5.5 <= r <= 9 (label 1) around a cavity holding
+// label 0 and a ball r <= 3 of label 2.
+MLS::Ptr
+hollowSphereFixture()
+{
+    return labelFixture(CoordBBox(Coord(-10), Coord(10)), [](const Coord& c) {
+        const double r = c.asVec3d().length();
+        return r <= 3.0 ? 2 : (r >= 5.5 && r <= 9.0 ? 1 : 0);
+    });
+}
+const CoordBBox kHollowDomain(Coord(-11), Coord(11));
+
+} // namespace
+
+
 // Mesh components == foreground components + cavities and
-// chi(M) == 2 chi(R) for every label and connectivity pair.
+// chi(M) == 2 chi(R) for every label and connectivity pair
+// (lsmo_test::verifyLabelTopology), and the explicit numbers of the
+// hand-made fixtures.
 TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
 {
     struct Fixture
@@ -806,11 +756,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
         CoordBBox domain;
     };
     std::vector<Fixture> fixtures;
-    // solid torus, R = 8, r = 3, about z
-    fixtures.push_back({"torus", labelFixture(CoordBBox(Coord(-13), Coord(13)), [](const Coord& c) {
-        const double rho = std::sqrt(double(c[0] * c[0] + c[1] * c[1])) - 8.0;
-        return rho * rho + double(c[2] * c[2]) <= 9.0 ? 1 : 0;
-    }), CoordBBox(Coord(-14), Coord(14))});
+    fixtures.push_back({"torus", torusFixture(), kTorusDomain});
     // two 4^3 cubes sharing only the z-edge line between (3,3,z) and (4,4,z)
     fixtures.push_back({"edge cubes", labelFixture(CoordBBox(Coord(0), Coord(7)), [](const Coord& c) {
         const bool a = c[0] <= 3 && c[1] <= 3 && c[2] <= 3;
@@ -823,12 +769,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
         const bool b = c[0] >= 4 && c[1] >= 4 && c[2] >= 4;
         return a || b ? 1 : 0;
     }), CoordBBox(Coord(-2), Coord(9))});
-    // hollow sphere: shell 5.5 <= r <= 9 (label 1) around a cavity holding
-    // label 0 and a ball r <= 3 of label 2
-    fixtures.push_back({"hollow sphere", labelFixture(CoordBBox(Coord(-10), Coord(10)), [](const Coord& c) {
-        const double r = c.asVec3d().length();
-        return r <= 3.0 ? 2 : (r >= 5.5 && r <= 9.0 ? 1 : 0);
-    }), CoordBBox(Coord(-11), Coord(11))});
+    fixtures.push_back({"hollow sphere", hollowSphereFixture(), kHollowDomain});
     // 2x2x2 block minus an antipodal pair (FG6_BG18 hexagon correction)
     fixtures.push_back({"antipodal hexagon", labelFixture(CoordBBox(Coord(0), Coord(1)), [](const Coord& c) {
         return c == Coord(0) || c == Coord(1) ? 0 : 1;
@@ -838,20 +779,22 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
             makeRandomLabels(kRandomSeeds[r], 24, 4, kRandomBlock[r], false), CoordBBox(Coord(-2), Coord(25))});
     }
 
-    // explicit expectations
-    auto expected = [](const std::string& name, Conn conn, int32_t label, int& comps, int& cav, int& chi) {
+    // explicit expectations (none for the random fixtures)
+    auto expected = [](const std::string& name, Conn conn, int32_t label,
+                        lsmo_test::DigitalTopology& t) {
         const int fg = fgOf(conn);
-        comps = cav = chi = -1;
-        if (name == "torus") { comps = 1; cav = 0; chi = 0; }
-        if (name == "edge cubes") { comps = fg == 6 ? 2 : 1; cav = 0; chi = fg == 6 ? 2 : 1; }
-        if (name == "corner cubes") { comps = fg == 26 ? 1 : 2; cav = 0; chi = fg == 26 ? 1 : 2; }
+        if (name == "torus") { t = {1, 0, 0}; return true; }
+        if (name == "edge cubes") { t = {fg == 6 ? 2 : 1, 0, fg == 6 ? 2 : 1}; return true; }
+        if (name == "corner cubes") { t = {fg == 26 ? 1 : 2, 0, fg == 26 ? 1 : 2}; return true; }
         if (name == "hollow sphere") {
-            if (label == 1) { comps = 1; cav = 1; chi = 2; } else { comps = 1; cav = 0; chi = 1; }
+            t = label == 1 ? lsmo_test::DigitalTopology{1, 1, 2} : lsmo_test::DigitalTopology{1, 0, 1};
+            return true;
         }
         if (name == "antipodal hexagon") {
-            comps = 1; cav = 0;
-            chi = conn == Conn::FG6_BG26 ? 0 : 1;  // FG6_BG18: filled hexagon
+            t = {1, 0, conn == Conn::FG6_BG26 ? 0 : 1};  // FG6_BG18: filled hexagon
+            return true;
         }
+        return false;
     };
 
     for (const Fixture& fx : fixtures) {
@@ -860,37 +803,119 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTopology)
             tools::MultiObjectMeshSettings s;
             s.connectivity = conn;
             const auto meshes = tools::multiObjectToMesh(*fx.mls, {}, s);
-            EXPECT_EQ(meshes.size(), present.size()) << fx.name << " " << connName(conn);
+            EXPECT_EQ(meshes.size(), present.size()) << fx.name << " " << connectivityName(conn);
             std::ostringstream row;
-            row << "[MeshTopology] " << fx.name << " " << connName(conn) << ":";
+            row << "[MeshTopology] " << fx.name << " " << connectivityName(conn) << ":";
             for (int32_t l : present) {
-                auto it = meshes.find(l);
-                ASSERT_TRUE(it != meshes.end()) << fx.name << " label " << l;
-                const LabelMesh& mesh = it->second;
-                const auto topo = lsmo_test::digitalTopology(*fx.mls->labels(), l, fx.domain, conn);
-                const int mc = components(mesh), mchi = eulerChar(mesh);
-                row << " L" << l << " comps " << mc << "=" << topo.components << "+" << topo.cavities
-                    << " chi " << mchi << "=2*" << topo.euler;
-                std::string why;
-                EXPECT_TRUE(isClosedManifold(mesh, 1.0, &why)) << fx.name << " " << connName(conn) << ": " << why;
-                EXPECT_EQ(mc, topo.components + topo.cavities)
-                    << fx.name << " " << connName(conn) << " label " << l;
-                EXPECT_EQ(mchi, 2 * topo.euler) << fx.name << " " << connName(conn) << " label " << l;
-                int comps, cav, chi;
-                expected(fx.name, conn, l, comps, cav, chi);
-                if (comps >= 0) {
-                    EXPECT_EQ(topo.components, comps) << fx.name << " " << connName(conn) << " label " << l;
-                    EXPECT_EQ(topo.cavities, cav) << fx.name << " " << connName(conn) << " label " << l;
-                    EXPECT_EQ(topo.euler, chi) << fx.name << " " << connName(conn) << " label " << l;
-                    EXPECT_EQ(mc, comps + cav) << fx.name << " " << connName(conn) << " label " << l;
-                    EXPECT_EQ(mchi, 2 * chi) << fx.name << " " << connName(conn) << " label " << l;
-                }
+                ASSERT_TRUE(meshes.count(l)) << fx.name << " label " << l;
+                lsmo_test::DigitalTopology want;
+                const bool has = expected(fx.name, conn, l, want);
+                const auto rep = lsmo_test::verifyLabelTopology(*fx.mls, l, fx.domain, conn,
+                    fx.name + "/" + connectivityName(conn) + "/label" + std::to_string(l),
+                    has ? &want : nullptr);
+                EXPECT_TOPOLOGY_CONSISTENT(rep);
+                // the label's mesh from the all-label call has the same topology
+                const auto all = lsmo_test::meshTopology(meshes.at(l));
+                EXPECT_EQ(all.components, rep.mesh.components) << fx.name << " label " << l;
+                EXPECT_EQ(all.euler, rep.mesh.euler) << fx.name << " label " << l;
+                row << " L" << l << " comps " << rep.mesh.components << "=" << rep.region.components
+                    << "+" << rep.region.cavities << " chi " << rep.mesh.euler << "=2*"
+                    << rep.region.euler;
             }
             if (fx.name.compare(0, 6, "random") != 0 || conn == Conn::FG26_BG6) {
                 std::cout << row.str() << std::endl;
             }
         }
     }
+}
+
+
+// lsmo_test::meshTopology and verifyLabelTopology themselves: a closed
+// sphere, the same mesh with one triangle removed, the torus and
+// hollow-sphere fixtures, a wrong expectation and the debug dump.
+TEST_F(TestLevelSetMultiObjectMesh, MeshTopologyUtility)
+{
+    namespace fs = std::filesystem;
+    auto spheres = lsmo_test::makeTwoSpheres(1.0);
+    const LabelMesh sphere = tools::multiObjectToMesh(*spheres, {1}).at(1);
+    const auto t = lsmo_test::meshTopology(sphere);
+    EXPECT_EQ(t.components, 1);
+    EXPECT_EQ(t.euler, 2);
+    EXPECT_TRUE(t.closed);
+    EXPECT_TRUE(t.manifold) << t.defect;
+    EXPECT_TRUE(t.boundaryEdgeMidpoints.empty());
+    EXPECT_TRUE(t.nonManifoldEdgeMidpoints.empty());
+    // one triangle removed: an open disk, its three edges on the boundary
+    LabelMesh holed = sphere;
+    const Vec3I gone = holed.triangles.back();
+    holed.triangles.pop_back();
+    const auto h = lsmo_test::meshTopology(holed);
+    EXPECT_FALSE(h.closed);
+    EXPECT_TRUE(h.manifold) << h.defect;
+    EXPECT_EQ(h.components, 1);
+    EXPECT_EQ(h.euler, 1);
+    ASSERT_EQ(h.boundaryEdgeMidpoints.size(), size_t(3));
+    for (int k = 0; k < 3; ++k) {
+        const Vec3s mid = (sphere.points[gone[k]] + sphere.points[gone[(k + 1) % 3]]) * 0.5f;
+        EXPECT_TRUE(std::find(h.boundaryEdgeMidpoints.begin(), h.boundaryEdgeMidpoints.end(), mid)
+            != h.boundaryEdgeMidpoints.end()) << "edge " << k;
+    }
+    // a triangle added twice: its edges have three triangles
+    LabelMesh doubled = sphere;
+    doubled.triangles.push_back(doubled.triangles.front());
+    const auto d = lsmo_test::meshTopology(doubled);
+    EXPECT_FALSE(d.manifold);
+    EXPECT_EQ(d.nonManifoldEdgeMidpoints.size(), size_t(3));
+
+    // the fixtures, under every rule
+    auto torus = torusFixture();
+    auto hollow = hollowSphereFixture();
+    const lsmo_test::DigitalTopology solidTorus{1, 0, 0}, shell{1, 1, 2}, ball{1, 0, 1};
+    for (Conn conn : kAllConn) {
+        const std::string rule = connectivityName(conn);
+        const auto rt = lsmo_test::verifyLabelTopology(*torus, 1, kTorusDomain, conn,
+            "torus/" + rule, &solidTorus);
+        EXPECT_TOPOLOGY_CONSISTENT(rt);
+        EXPECT_EQ(rt.mesh.components, 1);
+        EXPECT_EQ(rt.mesh.euler, 0);
+        const auto rs = lsmo_test::verifyLabelTopology(*hollow, 1, kHollowDomain, conn,
+            "hollow/" + rule, &shell);
+        EXPECT_TOPOLOGY_CONSISTENT(rs);
+        EXPECT_EQ(rs.mesh.components, 2);
+        EXPECT_EQ(rs.mesh.euler, 4);
+        EXPECT_TOPOLOGY_CONSISTENT(lsmo_test::verifyLabelTopology(*hollow, 2, kHollowDomain, conn,
+            "hollow-core/" + rule, &ball));
+    }
+
+    // a wrong expectation fails, names the mismatch and writes the dump
+    const lsmo_test::ScopedDebugDir debugDir;
+    const auto bad = lsmo_test::verifyLabelTopology(*torus, 1, kTorusDomain, Conn::FG26_BG6,
+        "wrong-expectation", &ball);
+    EXPECT_FALSE(bad.ok);
+    EXPECT_NE(bad.message.find("!= expected (components 1, cavities 0, euler 1)"),
+        std::string::npos) << bad.message;
+    EXPECT_NE(bad.message.find("FG26_BG6"), std::string::npos) << bad.message;
+    const fs::path dump = debugDir.path() / "TestLevelSetMultiObjectMesh.MeshTopologyUtility"
+        / "wrong-expectation";
+    EXPECT_NE(bad.message.find(dump.string()), std::string::npos) << bad.message;
+    for (const char* f : {"pair.vdb", "label1.ply", "report.txt"}) {
+        EXPECT_TRUE(fs::exists(dump / f)) << (dump / f).string();
+    }
+    {
+        std::ifstream is(dump / "report.txt");
+        const std::string report((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+        EXPECT_NE(report.find("component 0:"), std::string::npos) << report;
+        io::File file((dump / "pair.vdb").string());
+        file.open();
+        EXPECT_TRUE(file.hasGrid("phi"));
+        EXPECT_TRUE(file.hasGrid("labels"));
+        file.close();
+    }
+    // with OPENVDB_MOGAC_DEBUG_DIR set, a passing verification dumps too
+    EXPECT_TOPOLOGY_CONSISTENT(lsmo_test::verifyLabelTopology(*torus, 1, kTorusDomain,
+        Conn::FG26_BG6, "passing", &solidTorus));
+    EXPECT_TRUE(fs::exists(debugDir.path() / "TestLevelSetMultiObjectMesh.MeshTopologyUtility"
+        / "passing" / "report.txt"));
 }
 
 
@@ -908,9 +933,8 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshGeometrySphere)
         const auto meshes = tools::multiObjectToMesh(*m, {}, s);
         ASSERT_EQ(meshes.size(), size_t(1));
         const LabelMesh& mesh = meshes.at(1);
-        std::string why;
-        EXPECT_TRUE(isClosedManifold(mesh, dx, &why)) << why;
-        EXPECT_EQ(eulerChar(mesh), 2);
+        EXPECT_TRUE(closedManifold(mesh, dx));
+        EXPECT_EQ(lsmo_test::meshTopology(mesh, dx).euler, 2);
         double maxErr = 0.0, minDot = 1.0;
         for (size_t i = 0; i < mesh.points.size(); ++i) {
             const Vec3d d = Vec3d(mesh.points[i]) - c;
@@ -1006,14 +1030,14 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
         tools::MultiObjectMeshSettings s;
         s.connectivity = conn;
         const auto meshes = tools::multiObjectToMesh(*m, {}, s);
-        ASSERT_EQ(meshes.size(), size_t(2)) << connName(conn);
+        ASSERT_EQ(meshes.size(), size_t(2)) << connectivityName(conn);
         for (int32_t l : {-7, big}) {
             ASSERT_TRUE(meshes.count(l)) << l;
             const LabelMesh& mesh = meshes.at(l);
-            std::string why;
-            EXPECT_TRUE(isClosedManifold(mesh, 1.0, &why)) << l << ": " << why;
-            EXPECT_EQ(components(mesh), 1) << l;
-            EXPECT_EQ(eulerChar(mesh), 2) << l;
+            const auto t = lsmo_test::meshTopology(mesh, 1.0);
+            EXPECT_TRUE(closedManifold(mesh, 1.0)) << l;
+            EXPECT_EQ(t.components, 1) << l;
+            EXPECT_EQ(t.euler, 2) << l;
             EXPECT_EQ(countFolded(mesh, *m, l), size_t(0)) << l;
         }
     }

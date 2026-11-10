@@ -70,6 +70,7 @@
 #include <openvdb/tree/LeafManager.h>
 #include <openvdb/tree/ValueAccessor.h>
 #include <openvdb/math/Math.h>
+#include <openvdb/math/Mat4.h>
 #include "Interpolation.h"// for BoxSampler
 #include <openvdb/util/NodeMasks.h>// for FindLowestOn
 #include <openvdb/util/Assert.h>
@@ -81,6 +82,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1443,8 +1445,8 @@ public:
     void moveTo(const Coord& ijk, int32_t label)
     {
         if (ijk != mCenter) {
-            mScalarCache.valid = false;
-            mVectorCache.valid = false;
+            mScalarCache.invalidate();
+            mVectorCache.invalidate();
         }
         mCenter = ijk;
         mLabel = label;
@@ -1471,9 +1473,10 @@ public:
     /// index spaces coincide and the voxel value is read directly (exactly
     /// what BoxSampler returns at an integer index); otherwise, or if
     /// @a forceSampling is true, the value is BoxSampler-interpolated. The
-    /// value is cached until the stencil moves to another voxel (or another
-    /// grid is sampled), and the grid is read through a value accessor kept
-    /// by the stencil. @a grid must outlive the stencil.
+    /// value is cached per grid until the stencil moves to another voxel,
+    /// and each grid is read through a value accessor kept by the stencil
+    /// (several grids, e.g. per-label fields, are cached side by side).
+    /// @a grid must outlive the stencil.
     float sampleAtCentre(const FloatGrid& grid, bool forceSampling = false) const
     {
         return this->sample(grid, mScalarCache, forceSampling);
@@ -1544,11 +1547,11 @@ public:
     }
 
 private:
-    /// One-entry cache of a sampled grid: the grid, a value accessor to its
+    /// Cache entry of a sampled grid: the grid, a value accessor to its
     /// tree, whether the grid shares the stencil's transform, and the value
     /// at the current centre voxel.
     template<typename GridT>
-    struct FieldCache
+    struct FieldEntry
     {
         const GridT* grid = nullptr;
         bool aligned = false;
@@ -1557,16 +1560,38 @@ private:
         typename GridT::ValueType value{};
     };
 
+    /// Cache of up to kMaxFields grids keyed by grid address, so that fields
+    /// of several labels sampled at one voxel do not evict each other.
     template<typename GridT>
-    typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& cache,
+    struct FieldCache
+    {
+        static constexpr int kMaxFields = 8;
+        std::array<FieldEntry<GridT>, kMaxFields> entries;
+        int size = 0, next = 0;
+
+        void invalidate() { for (int i = 0; i < size; ++i) entries[i].valid = false; }
+
+        FieldEntry<GridT>& find(const GridT& grid, const math::Transform& xform)
+        {
+            for (int i = 0; i < size; ++i) {
+                if (entries[i].grid == &grid) return entries[i];
+            }
+            // new grid: append, or replace the oldest entry when full
+            const int i = size < kMaxFields ? size++ : (next++ % kMaxFields);
+            FieldEntry<GridT>& e = entries[i];
+            e.grid = &grid;
+            e.acc.reset(new tree::ValueAccessor<const typename GridT::TreeType>(grid.tree()));
+            e.aligned = (grid.transform() == xform);
+            e.valid = false;
+            return e;
+        }
+    };
+
+    template<typename GridT>
+    typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& caches,
         bool forceSampling) const
     {
-        if (cache.grid != &grid) {
-            cache.grid = &grid;
-            cache.acc.reset(new tree::ValueAccessor<const typename GridT::TreeType>(grid.tree()));
-            cache.aligned = (grid.transform() == mTransform);
-            cache.valid = false;
-        }
+        FieldEntry<GridT>& cache = caches.find(grid, mTransform);
         if (!cache.valid) {
             if (cache.aligned && !forceSampling) {
                 cache.value = cache.acc->getValue(mCenter);
@@ -1665,6 +1690,7 @@ public:
 
     /// @brief Advection velocity (world units), sampled with BoxSampler unless
     /// its transform equals that of the level set (then read directly).
+    /// Shared by all labels without their own field (see below).
     /// @throw ValueError if @a velocity is null.
     void setAdvection(Vec3SGrid::ConstPtr velocity, float weight)
     {
@@ -1672,6 +1698,20 @@ public:
         mAdvection = velocity;
         mAdvectionWeight = weight;
     }
+
+    /// @brief Advection velocity and weight of label @a label only,
+    /// overriding the shared field for that label; sampled exactly like the
+    /// shared field.
+    /// @throw ValueError if @a velocity is null.
+    void setAdvection(int32_t label, Vec3SGrid::ConstPtr velocity, float weight)
+    {
+        if (!velocity) OPENVDB_THROW(ValueError, "MultiObjectForces: null advection grid");
+        mLabelAdvection[label] = LabelAdvection{std::move(velocity), weight};
+    }
+
+    /// @brief Remove the advection override of @a label (it uses the shared
+    /// field again, if any).
+    void clearLabelAdvection(int32_t label) { mLabelAdvection.erase(label); }
 
     void setInactiveLabels(std::set<int32_t> labels) { mInactive = std::move(labels); }
     void setFixedLabels(std::set<int32_t> labels) { mFixed = std::move(labels); }
@@ -1710,10 +1750,19 @@ public:
 
         // fields are sampled at the stencil centre (== ijk), once per voxel
         float advection = 0.0f;
-        if (mAdvection) {
-            const Vec3f vel = s.sampleAtCentre(*mAdvection, mForceSampling);
+        const Vec3SGrid* advField = mAdvection.get();
+        float advWeight = mAdvectionWeight;
+        if (!mLabelAdvection.empty()) {
+            const auto it = mLabelAdvection.find(label);
+            if (it != mLabelAdvection.end()) {
+                advField = it->second.field.get();
+                advWeight = it->second.weight;
+            }
+        }
+        if (advField) {
+            const Vec3f vel = s.sampleAtCentre(*advField, mForceSampling);
             for (int a = 0; a < 3; ++a) {
-                const float f = mAdvectionWeight * vel[a];
+                const float f = advWeight * vel[a];
                 if (f > 0.0f) advection += f * dneg[a];
                 else if (f < 0.0f) advection += f * dpos[a];
             }
@@ -1754,6 +1803,12 @@ private:
     float mPressureWeight = 0.0f;
     Vec3SGrid::ConstPtr mAdvection;
     float mAdvectionWeight = 0.0f;
+    struct LabelAdvection
+    {
+        Vec3SGrid::ConstPtr field;
+        float weight = 0.0f;
+    };
+    std::map<int32_t, LabelAdvection> mLabelAdvection;
     bool mForceSampling = false;
     std::set<int32_t> mInactive, mFixed;
 };
@@ -1928,7 +1983,41 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    after every step.
 ///
 /// Voxels of fixed labels never change label or phi and no label can
-/// capture them; a step with no non-zero candidate anywhere changes nothing.
+/// capture them; a step with no non-zero candidate and no kinematic label
+/// anywhere changes nothing.
+///
+/// <b>Kinematic labels</b> (setKinematicLabel()) are rigid obstacles whose
+/// region is prescribed: a signed distance grid of the object in its rest
+/// pose and a rigid motion of time. They are treated like fixed labels by
+/// the steps above (never captured, frozen, no speed evaluation). After the
+/// deferred changes and before orphan cleanup, each step re-stamps them at
+/// its end time t_{n+1}: every voxel near the moved object samples the rest
+/// pose distance psi at motion(t)^-1 x; where psi < 0 it gets the kinematic
+/// label with phi = |psi| (at least 1e-3*dx; active and frozen if
+/// |psi| < halfWidth*dx); a
+/// voxel of the label with psi >= 0 (the object left it) becomes passive
+/// label 0 and is redistanced; other voxels with psi < halfWidth*dx are
+/// activated and get phi = min(phi, psi) (frozen if psi <= dx). Claims on
+/// label 0 and on unprotected labels always win; a claim on a voxel of a
+/// topology-preserving label goes through the same simple-point test (27
+/// coloured passes, setConnectivity() rule) as other protected changes,
+/// and a rejected claim leaves the voxel with the protected label (phi
+/// 1e-3*dx, frozen): the obstacle lacks that voxel this step and is
+/// re-stamped from its motion in the next. Such trapped voxels are then
+/// wrapped outward: each moves to the first voxel o along the object's
+/// outward normal with psi(o) >= 0.5*dx that is neither kinematic nor fixed
+/// (o joins the protected label if that is a simple change, as do outer
+/// shell voxels 0.5*dx <= psi < 1.5*dx within two voxels of the trapped one
+/// that touch the protected label; then the object claims the trapped
+/// voxel if that is simple), repeated up to 8 passes per
+/// step; both changes keep every protected label's topology. The wrap is
+/// not always complete: where an object exits a topology-protected label
+/// (for example through a wall the label cannot open), voxels of that label
+/// can stay inside the object, so the object is dented there (its region
+/// can lose volume, gain cavities or, under 6-adjacency, split) until the
+/// protected label lets them go. The time step
+/// is also limited so that the moved
+/// object's rest bounding box corners move at most 0.5*cfl*dx per step.
 ///
 /// @par SpeedT concept
 /// @code
@@ -1988,6 +2077,42 @@ public:
     /// @brief Adjacency pair of topology preservation (default FG26_BG6).
     void setConnectivity(MultiObjectConnectivity conn) { mConnectivity = conn; }
 
+    /// @brief Make @a label kinematic: a rigid obstacle whose region at time
+    /// t is {x : psi(motion(t)^-1 x) < 0}, with psi the level set @a sdf of
+    /// the object in its rest pose (world space, BoxSampler-interpolated,
+    /// any transform) and motion(t) a rigid transform in the row-vector
+    /// convention of math::Mat4d::transform (x_t = motion(t).transform(x)).
+    /// See the class documentation. Voxels already labelled @a label that
+    /// lie in or near the object at the first step are re-stamped by it.
+    /// @throw ValueError if @a label is 0, @a sdf is null or @a motion is empty.
+    void setKinematicLabel(int32_t label, FloatGrid::ConstPtr sdf,
+        std::function<math::Mat4d(double)> motion)
+    {
+        if (label == 0) OPENVDB_THROW(ValueError, "LevelSetMultiObject: kinematic label 0");
+        if (!sdf) OPENVDB_THROW(ValueError, "LevelSetMultiObject: null kinematic sdf");
+        if (!motion) OPENVDB_THROW(ValueError, "LevelSetMultiObject: empty kinematic motion");
+        Kinematic k;
+        k.sdf = std::move(sdf);
+        k.motion = std::move(motion);
+        const CoordBBox b = k.sdf->evalActiveVoxelBoundingBox();
+        if (!b.empty()) {
+            const Vec3d lo = k.sdf->indexToWorld(b.min()), hi = k.sdf->indexToWorld(b.max());
+            for (int c = 0; c < 8; ++c) {
+                k.corners[c] = Vec3d(c & 1 ? hi[0] : lo[0], c & 2 ? hi[1] : lo[1],
+                    c & 4 ? hi[2] : lo[2]);
+            }
+            k.hasBox = true;
+        }
+        mKinematic[label] = std::move(k);
+    }
+    /// @brief Make @a label an ordinary label again (its voxels stay).
+    void clearKinematicLabel(int32_t label) { mKinematic.erase(label); }
+    /// @brief Time of the current state (set by advect(); step() advances it
+    /// by the time step taken). Kinematic labels are stamped at this time
+    /// plus the step.
+    void setTime(double t) { mTime = t; }
+    double time() const { return mTime; }
+
     float cfl() const { return mCfl; }
     bool clampSpeed() const { return mClampSpeed; }
     int grainSize() const { return mGrainSize; }
@@ -2019,6 +2144,7 @@ public:
         const double eps = 1e-6 * std::max(1.0, std::abs(t1));
         while (t1 - t > eps) {
             if (util::wasInterrupted(mInterrupter)) break;
+            mTime = t;
             const float dt = this->step(float(t1 - t));
             if (!(dt > 0.0f)) break;
             t += dt;
@@ -2241,7 +2367,43 @@ private:
         }
     }
 
-    bool isFixed(int32_t l) const { return l != 0 && mSpeed.isFixed(l); }
+    /// Fixed labels of the speed functor and kinematic labels (walls).
+    bool isFixed(int32_t l) const
+    {
+        return l != 0 && (mSpeed.isFixed(l) || this->isKinematic(l));
+    }
+    bool isKinematic(int32_t l) const
+    {
+        return !mKinematic.empty() && mKinematic.count(l) != 0;
+    }
+
+    /// A kinematic label: rest-pose level set, motion, rest bounding box
+    /// corners (world) and the index box stamped last.
+    struct Kinematic
+    {
+        FloatGrid::ConstPtr sdf;
+        std::function<math::Mat4d(double)> motion;
+        std::array<Vec3d, 8> corners;
+        bool hasBox = false;
+        CoordBBox lastBox;
+    };
+
+    /// Largest displacement of a kinematic object's rest box between times
+    /// @a t0 and @a t1 (world units).
+    double kinematicDisplacement(double t0, double t1) const
+    {
+        double d = 0.0;
+        for (const auto& kv : mKinematic) {
+            if (!kv.second.hasBox) continue;
+            const math::Mat4d a = kv.second.motion(t0), b = kv.second.motion(t1);
+            for (const Vec3d& c : kv.second.corners) {
+                d = std::max(d, (b.transform(c) - a.transform(c)).length());
+            }
+        }
+        return d;
+    }
+
+    void stampKinematic(double t, BoolTreeT& freeze);
 
     bool isProtected(int32_t l) const { return !mProtected.empty() && mProtected.count(l) != 0; }
     /// Whether a change @a from -> @a to involves a protected label.
@@ -2270,11 +2432,18 @@ private:
     void applyDeferred(const std::vector<std::vector<Deferred>>& deferred,
         FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze);
 
+    /// The 27 coloured simple-point passes of applyDeferred(): each change
+    /// is decided on the labels as updated by the earlier passes, then
+    /// @a accept(change) or @a reject(change) is called (serially).
+    template<typename AcceptT, typename RejectT>
+    void colouredPasses(const std::vector<std::vector<Deferred>>& deferred,
+        const LabelTreeT& labels, const AcceptT& accept, const RejectT& reject) const;
+
     /// Add @a l to the candidates @a c: label 0 and fixed labels only make
     /// passive label 0 participate (a fixed label can never be captured).
     void addCandidate(CandidateSet& c, int32_t l) const
     {
-        if (l == 0 || mSpeed.isFixed(l)) { c.zero = true; return; } // passive 0 / wall
+        if (l == 0 || this->isFixed(l)) { c.zero = true; return; } // passive 0 / wall
         for (int i = 0; i < c.n; ++i) if (c.label[i] == l) return;
         c.label[c.n++] = l; // at most 7 distinct labels
     }
@@ -2331,6 +2500,8 @@ private:
     const SpeedT& mSpeed;
     InterruptT* mInterrupter;
     std::set<int32_t> mProtected;
+    std::map<int32_t, Kinematic> mKinematic;
+    double mTime = 0.0;
     MultiObjectConnectivity mConnectivity = MultiObjectConnectivity::FG26_BG6;
     float mCfl = 0.999f;
     bool mClampSpeed = false;
@@ -2430,57 +2601,303 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     // 3. time step: interfaces move at most half a voxel, so only projected
     // voxels can change label
     float dt = std::min(maxDt, mSpeed.stableDt(float(dx)));
-    if (!any) return dt; // no non-zero candidate anywhere: nothing moves
-    if (mClampSpeed) dt = std::min(dt, halfDx);
-    else if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
+    if (!any && mKinematic.empty()) {
+        mTime += dt;
+        return dt; // no non-zero candidate anywhere: nothing moves
+    }
+    if (any) {
+        if (mClampSpeed) dt = std::min(dt, halfDx);
+        else if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
+    }
+    if (!mKinematic.empty()) {
+        // kinematic objects move at most 0.5*cfl*dx per step
+        const double limit = 0.5 * mCfl * dx;
+        for (int iter = 0; iter < 32; ++iter) {
+            const double d = this->kinematicDisplacement(mTime, mTime + double(dt));
+            if (d <= limit) break;
+            dt = float(double(dt) * std::min(0.5, 0.99 * limit / d));
+        }
+    }
 
     // 4. two-smallest projection, written to aux buffer kNext of both
     // trees (initialized with time n) while time n stays in the leaf buffers
     constexpr size_t kNext = PairBuffers::kNext;
-    PairBuffers buffers(phi, labels, mGrainSize <= 0);
-    OPENVDB_ASSERT(buffers.phi.leafCount() == leafCount);
-    // changes involving a protected label are deferred (topology preservation)
     std::vector<std::vector<Deferred>>& deferred = scratch.deferred;
-    Scratch::resetLists(deferred, mProtected.empty() ? 0 : leafCount);
-    forEachIndex(leafCount, [&](size_t i) {
-        const LeafData& d = data[i];
-        if (d.entries.empty()) return;
-        const auto& leaf = leafs.leaf(i);
-        OPENVDB_ASSERT(buffers.phi.leaf(i).origin() == leaf.origin());
-        auto& phiBuf = buffers.phiBuffer(i, kNext);
-        auto& labBuf = buffers.labelBuffer(i, kNext);
-        const auto& labN = buffers.labelBuffer(i, 0); // time n until the swap
-        const Candidate* cand = d.cand.data();
-        for (const VoxelEntry& e : d.entries) {
-            const int32_t own = static_cast<int32_t>(labN.getValue(e.offset));
-            int32_t l; float v;
-            const bool moved = project(e, own, leaf.getValue(e.offset), cand, dt, l, v);
-            cand += e.n;
-            if (!moved) continue;
-            if (this->involvesProtected(own, l)) {
-                deferred[i].push_back(Deferred{leaf.offsetToGlobalCoord(e.offset), own, l, v});
-                continue;
+    Scratch::resetLists(deferred, mProtected.empty() || !any ? 0 : leafCount);
+    if (any) {
+        PairBuffers buffers(phi, labels, mGrainSize <= 0);
+        OPENVDB_ASSERT(buffers.phi.leafCount() == leafCount);
+        // changes involving a protected label are deferred (topology preservation)
+        forEachIndex(leafCount, [&](size_t i) {
+            const LeafData& d = data[i];
+            if (d.entries.empty()) return;
+            const auto& leaf = leafs.leaf(i);
+            OPENVDB_ASSERT(buffers.phi.leaf(i).origin() == leaf.origin());
+            auto& phiBuf = buffers.phiBuffer(i, kNext);
+            auto& labBuf = buffers.labelBuffer(i, kNext);
+            const auto& labN = buffers.labelBuffer(i, 0); // time n until the swap
+            const Candidate* cand = d.cand.data();
+            for (const VoxelEntry& e : d.entries) {
+                const int32_t own = static_cast<int32_t>(labN.getValue(e.offset));
+                int32_t l; float v;
+                const bool moved = project(e, own, leaf.getValue(e.offset), cand, dt, l, v);
+                cand += e.n;
+                if (!moved) continue;
+                if (this->involvesProtected(own, l)) {
+                    deferred[i].push_back(Deferred{leaf.offsetToGlobalCoord(e.offset), own, l, v});
+                    continue;
+                }
+                phiBuf.setValue(e.offset, v);
+                labBuf.setValue(e.offset, LabelT(l));
             }
-            phiBuf.setValue(e.offset, v);
-            labBuf.setValue(e.offset, LabelT(l));
-        }
-    });
-    mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage() + buffers.memUsage());
+        });
+        mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage() + buffers.memUsage());
 
-    // 5a. swap both trees together (time n+1 in the leaf buffers); time n is
-    // no longer needed
-    buffers.swap(kNext);
-    buffers.release();
+        // 5a. swap both trees together (time n+1 in the leaf buffers); time n is
+        // no longer needed
+        buffers.swap(kNext);
+        buffers.release();
+    } // any
 
-    // 5b. deferred (topology-preserving) changes; 5c. orphan cleanup
-    if (!mProtected.empty()) this->applyDeferred(deferred, phi, labels, freeze);
+    // 5b. deferred (topology-preserving) changes; 5c. kinematic labels at
+    // t_{n+1}; 5d. orphan cleanup
+    if (!mProtected.empty() && any) this->applyDeferred(deferred, phi, labels, freeze);
+    if (!mKinematic.empty()) this->stampKinematic(mTime + double(dt), freeze);
     this->cleanOrphans(phi, labels, freeze);
 
     // 6. band maintenance (topology changes, after the swap)
     this->bandMaintenance(freeze);
     mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage());
     OPENVDB_ASSERT(mMls.validate());
+    mTime += dt;
     return dt;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
+    double t, BoolTreeT& freeze)
+{
+    FloatTreeT& phi = mMls.phi()->tree();
+    LabelTreeT& labels = mMls.labels()->tree();
+    const math::Transform& xform = mMls.phi()->transform();
+    const double dx = mMls.voxelSize();
+    const float bg = phi.background();
+    // phi of stamped voxels is at least this, so that a voxel on the
+    // obstacle surface is not ambiguous (phi = 0)
+    const float minPhi = float(1e-3 * dx);
+    tree::ValueAccessor<FloatTreeT> phiAcc(phi);
+    tree::ValueAccessor<LabelTreeT> labAcc(labels);
+    tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
+    // a voxel taken by kinematic @a label with phi @a v
+    auto claim = [&](const Coord& p, int32_t label, float v) {
+        if (v < bg) {
+            phiAcc.setValueOn(p, v);
+            labAcc.setValueOn(p, LabelT(label));
+            maskAcc.setValueOn(p);
+        } else {
+            phiAcc.setValueOff(p, bg);
+            labAcc.setValueOff(p, LabelT(label));
+            maskAcc.setValueOff(p);
+        }
+    };
+    std::vector<std::vector<Deferred>> claims(1);
+    // the objects at time t, and the object of each queued claim
+    struct Object { int32_t label; math::Mat4d inv; const FloatGrid* sdf; };
+    std::vector<Object> objects;
+    std::map<Coord, size_t> claimObject;
+    for (auto& kv : mKinematic) {
+        const int32_t label = kv.first;
+        Kinematic& k = kv.second;
+        if (!k.hasBox) continue;
+        const math::Mat4d m = k.motion(t);
+        const math::Mat4d inv = m.inverse();
+        objects.push_back(Object{label, inv, k.sdf.get()});
+        // index box of the moved object, dilated by the band, plus the box
+        // stamped last (voxels the object may have left)
+        Vec3d lo(std::numeric_limits<double>::max()), hi(-std::numeric_limits<double>::max());
+        for (const Vec3d& c : k.corners) {
+            const Vec3d p = xform.worldToIndex(m.transform(c));
+            lo = math::minComponent(lo, p);
+            hi = math::maxComponent(hi, p);
+        }
+        const int pad = mMls.halfWidth() + 1;
+        CoordBBox box(Coord::floor(lo) - Coord(pad), Coord::floor(hi) + Coord(pad + 1));
+        const CoordBBox now = box;
+        if (!k.lastBox.empty()) box.expand(k.lastBox);
+        k.lastBox = now;
+        tree::ValueAccessor<const FloatTree> sdfAcc(k.sdf->tree());
+        const math::Transform& sdfXform = k.sdf->transform();
+        for (auto it = box.begin(); it; ++it) {
+            const Coord& p = *it;
+            const Vec3d rest = inv.transform(xform.indexToWorld(p));
+            const float psiRaw = tools::BoxSampler::sample(sdfAcc, sdfXform.worldToIndex(rest));
+            const float psi = psiRaw < 0.0f ? std::min(psiRaw, -minPhi) : std::max(psiRaw, minPhi);
+            const int32_t own = static_cast<int32_t>(labAcc.getValue(p));
+            if (psi < 0.0f) {
+                // inside the obstacle: claims label 0 and unprotected labels;
+                // claims on protected labels are decided below
+                phiAcc.touchLeaf(p);
+                labAcc.touchLeaf(p);
+                if (own != label && this->isProtected(own)) {
+                    claims[0].push_back(Deferred{p, own, label, -psi});
+                    claimObject[p] = objects.size() - 1;
+                } else {
+                    claim(p, label, -psi);
+                }
+            } else if (own == label) {
+                // left by the obstacle: passive label 0, redistanced
+                phiAcc.touchLeaf(p);
+                labAcc.touchLeaf(p);
+                const float v = std::min(psi, bg);
+                if (v < bg) {
+                    phiAcc.setValueOn(p, v);
+                    labAcc.setValueOn(p, LabelT(0));
+                } else {
+                    phiAcc.setValueOff(p, bg);
+                    labAcc.setValueOff(p, LabelT(0));
+                }
+                maskAcc.setValueOff(p);
+            } else if (psi < bg) {
+                // band just outside: keep the label, distance at most psi
+                float cur;
+                if (phiAcc.probeValue(p, cur)) {
+                    if (psi < cur) phiAcc.setValueOnly(p, psi);
+                } else {
+                    phiAcc.touchLeaf(p);
+                    labAcc.touchLeaf(p);
+                    phiAcc.setValueOn(p, psi);
+                    labAcc.setValueOn(p, labAcc.getValue(p));
+                }
+                if (psi <= float(dx)) maskAcc.setValueOn(p);
+            }
+        }
+    }
+    if (claims[0].empty()) return;
+    // claims on protected labels: the simple-point test of the coloured
+    // passes; a rejected voxel keeps its protected label (barrier phi)
+    phiAcc.clear();
+    labAcc.clear();
+    maskAcc.clear();
+    std::vector<Deferred> trapped;
+    this->colouredPasses(claims, labels,
+        [&](const Deferred& c) { claim(c.ijk, c.to, c.phi); },
+        [&](const Deferred& c) {
+            phiAcc.setValueOn(c.ijk, minPhi);
+            labAcc.setValueOn(c.ijk, labAcc.getValue(c.ijk));
+            maskAcc.setValueOn(c.ijk);
+            trapped.push_back(c);
+        });
+
+    // Outward wrap: a protected voxel q left inside an object (trapped) is
+    // migrated to the first voxel o outside it along the object's outward
+    // normal (psi(o) >= 0.5*dx, neither kinematic nor fixed): o joins the
+    // protected label if that is simple, then the object claims q if that
+    // is simple; repeated while anything changes, at most kMaxWrapPasses.
+    constexpr int kMaxWrapPasses = 8;
+    auto psiAt = [&](const Object& o, const Vec3d& world) {
+        tree::ValueAccessor<const FloatTree> acc(o.sdf->tree());
+        return double(tools::BoxSampler::sample(acc,
+            o.sdf->transform().worldToIndex(o.inv.transform(world))));
+    };
+    for (int pass = 0; pass < kMaxWrapPasses && !trapped.empty(); ++pass) {
+        phiAcc.clear();
+        labAcc.clear();
+        maskAcc.clear();
+        // targets o of the trapped voxels
+        std::vector<std::pair<Deferred, Coord>> moves; // claim of q, target o
+        std::map<Coord, Deferred> adds;
+        for (const Deferred& c : trapped) {
+            const Object& obj = objects[claimObject[c.ijk]];
+            const Vec3d xq = xform.indexToWorld(c.ijk);
+            Vec3d g;
+            for (int a = 0; a < 3; ++a) {
+                Vec3d e(0.0);
+                e[a] = dx;
+                g[a] = psiAt(obj, xq + e) - psiAt(obj, xq - e);
+            }
+            if (!(g.length() > 0.0)) continue;
+            g.normalize();
+            bool found = false;
+            Coord o;
+            for (int n = 1; n <= 4 * mMls.halfWidth() * 2 && !found; ++n) {
+                const Vec3d x = xq + g * (0.5 * dx * n);
+                o = Coord::round(xform.worldToIndex(x));
+                if (o == c.ijk) continue;
+                const int32_t lo = static_cast<int32_t>(labAcc.getValue(o));
+                if (this->isFixed(lo)) continue;
+                if (psiAt(obj, xform.indexToWorld(o)) < 0.5 * dx) continue;
+                if (lo != c.from && this->isProtected(lo)) continue; // another protected label
+                found = true;
+            }
+            if (found) {
+                moves.emplace_back(c, o);
+                const int32_t lo = static_cast<int32_t>(labAcc.getValue(o));
+                if (lo != c.from && !adds.count(o)) {
+                    adds[o] = Deferred{o, lo, c.from, 0.5f * float(dx)};
+                }
+            } else {
+                moves.emplace_back(c, c.ijk);
+            }
+            // the outer shell near q (0.5*dx <= psi < 1.5*dx) next to the
+            // protected label also joins it where simple, so that the label
+            // can wrap around the object rather than only reach the target o
+            for (auto it = CoordBBox(c.ijk - Coord(2), c.ijk + Coord(2)).begin(); it; ++it) {
+                const Coord& p = *it;
+                if (adds.count(p)) continue;
+                const int32_t lp = static_cast<int32_t>(labAcc.getValue(p));
+                if (lp == c.from || this->isFixed(lp) || this->isProtected(lp)) continue;
+                const double sp = psiAt(obj, xform.indexToWorld(p));
+                if (sp < 0.5 * dx || sp >= 1.5 * dx) continue;
+                bool touches = false;
+                for (int f = 0; f < 6 && !touches; ++f) {
+                    const Coord q = p + lsmo_internal::faceOffsets()[f];
+                    touches = static_cast<int32_t>(labAcc.getValue(q)) == c.from;
+                }
+                if (touches) adds[p] = Deferred{p, lp, c.from, 0.5f * float(dx)};
+            }
+        }
+        bool changed = false;
+        // 1. o joins the protected label (simple-point test)
+        if (!adds.empty()) {
+            std::vector<std::vector<Deferred>> addList(1);
+            for (const auto& kv : adds) addList[0].push_back(kv.second);
+            this->colouredPasses(addList, labels,
+                [&](const Deferred& c) {
+                    phiAcc.touchLeaf(c.ijk);
+                    labAcc.touchLeaf(c.ijk);
+                    phiAcc.setValueOn(c.ijk, c.phi);
+                    labAcc.setValueOn(c.ijk, LabelT(c.to));
+                    maskAcc.setValueOn(c.ijk); // at the interface: kept
+                    changed = true;
+                },
+                [](const Deferred&) {});
+            phiAcc.clear();
+            labAcc.clear();
+            maskAcc.clear();
+        }
+        // 2. the object claims q (simple-point test, after the adds)
+        std::vector<std::vector<Deferred>> claimList(1);
+        for (const auto& mv : moves) {
+            if (mv.second == mv.first.ijk
+                || static_cast<int32_t>(labAcc.getValue(mv.second)) == mv.first.from) {
+                claimList[0].push_back(mv.first);
+            }
+        }
+        std::set<Coord> claimed;
+        this->colouredPasses(claimList, labels,
+            [&](const Deferred& c) {
+                claim(c.ijk, c.to, c.phi);
+                claimed.insert(c.ijk);
+                changed = true;
+            },
+            [](const Deferred&) {});
+        std::vector<Deferred> left;
+        for (const Deferred& c : trapped) if (!claimed.count(c.ijk)) left.push_back(c);
+        trapped.swap(left);
+        if (!changed) break;
+    }
 }
 
 
@@ -2539,10 +2956,11 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
 
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+template<typename AcceptT, typename RejectT>
 void
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
-    const std::vector<std::vector<Deferred>>& deferred,
-    FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze)
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::colouredPasses(
+    const std::vector<std::vector<Deferred>>& deferred, const LabelTreeT& labels,
+    const AcceptT& accept, const RejectT& reject) const
 {
     // 27 coloured passes (coordinates mod 3): changes of one colour have
     // disjoint 26-neighbourhoods, so they are decided independently (in
@@ -2555,30 +2973,42 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
             byColour[mod3(c.ijk.x()) + 3 * mod3(c.ijk.y()) + 9 * mod3(c.ijk.z())].push_back(c);
         }
     }
+    for (const std::vector<Deferred>& pass : byColour) {
+        if (pass.empty()) continue;
+        std::vector<char> ok(pass.size(), 0);
+        forEachIndex(pass.size(), [&](size_t i) {
+            tree::ValueAccessor<const LabelTreeT> lab(labels);
+            const Deferred& c = pass[i];
+            ok[i] = this->topologyAllows(lab, c.ijk, c.from, c.to);
+        });
+        for (size_t i = 0; i < pass.size(); ++i) {
+            if (ok[i]) accept(pass[i]);
+            else reject(pass[i]);
+        }
+    }
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
+    const std::vector<std::vector<Deferred>>& deferred,
+    FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze)
+{
     const float barrier = float(1e-3 * mMls.voxelSize());
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
-    for (const std::vector<Deferred>& pass : byColour) {
-        if (pass.empty()) continue;
-        std::vector<char> accept(pass.size(), 0);
-        forEachIndex(pass.size(), [&](size_t i) {
-            tree::ValueAccessor<const LabelTreeT> lab(labels);
-            const Deferred& c = pass[i];
-            accept[i] = this->topologyAllows(lab, c.ijk, c.from, c.to);
+    this->colouredPasses(deferred, labels,
+        [&](const Deferred& c) {
+            phiAcc.setValueOnly(c.ijk, c.phi);
+            labAcc.setValueOnly(c.ijk, LabelT(c.to));
+        },
+        [&](const Deferred& c) {
+            // rejected: keep the label, barrier just inside its region
+            phiAcc.setValueOnly(c.ijk, barrier);
+            maskAcc.setValueOn(c.ijk);
         });
-        for (size_t i = 0; i < pass.size(); ++i) {
-            const Deferred& c = pass[i];
-            if (accept[i]) {
-                phiAcc.setValueOnly(c.ijk, c.phi);
-                labAcc.setValueOnly(c.ijk, LabelT(c.to));
-            } else {
-                // rejected: keep the label, barrier just inside its region
-                phiAcc.setValueOnly(c.ijk, barrier);
-                maskAcc.setValueOn(c.ijk);
-            }
-        }
-    }
 }
 
 
@@ -2644,7 +3074,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
             // an activated voxel keeps its inactive label when the change
             // involves a protected label (topology preservation)
             const LabelT l = labW.getValue(kv.first);
-            if (this->involvesProtected(static_cast<int32_t>(kv.second),
+            if (this->isKinematic(static_cast<int32_t>(l))
+                || this->involvesProtected(static_cast<int32_t>(kv.second),
                     static_cast<int32_t>(l))) {
                 labW.setValueOnly(kv.first, kv.second);
             }

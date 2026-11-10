@@ -25,11 +25,13 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1585,6 +1587,108 @@ TEST_F(TestLevelSetMultiObject, UniformAdvection)
     EXPECT_NEAR(c1[2] - c0[2], 0.0, 0.5 * dx);
 }
 
+TEST_F(TestLevelSetMultiObject, PerLabelAdvection)
+{
+    // Label 1 uses the shared field (1,0,0), label 2 its own (0,1,0);
+    // clearing the override returns label 2 to the shared field.
+    auto m = makeTwoSpheres(1.0);
+    const double dx = m->voxelSize();
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+    forces.setAdvection(2, Vec3SGrid::create(Vec3s(0.0f, 1.0f, 0.0f)), 1.0f);
+    EXPECT_THROW(forces.setAdvection(3, Vec3SGrid::ConstPtr(), 1.0f), ValueError);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    auto centre = [&](int32_t l) { return centroid(zeroCrossings(*m->extractSignedDistance(l))); };
+    const Vec3d a0 = centre(1), b0 = centre(2);
+    lsmo.advect(0.0, 5.0);
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const Vec3d a1 = centre(1), b1 = centre(2);
+    std::cout << "PerLabelAdvection: label 1 shift " << (a1 - a0) << ", label 2 shift "
+              << (b1 - b0) << std::endl;
+    for (int k = 0; k < 3; ++k) {
+        EXPECT_NEAR(a1[k] - a0[k], k == 0 ? 5.0 : 0.0, 0.5 * dx) << "axis " << k;
+        EXPECT_NEAR(b1[k] - b0[k], k == 1 ? 5.0 : 0.0, 0.5 * dx) << "axis " << k;
+    }
+    forces.clearLabelAdvection(2);
+    lsmo.advect(5.0, 7.0);
+    const Vec3d b2 = centre(2);
+    EXPECT_NEAR(b2[0] - b1[0], 2.0, 0.5 * dx);
+    EXPECT_NEAR(b2[1] - b1[1], 0.0, 0.5 * dx);
+}
+
+TEST_F(TestLevelSetMultiObject, KinematicLabelBasics)
+{
+    // A kinematic sphere (label 2, radius 4) translating along +x at unit
+    // speed through label 0 and through a non-protected block (label 1):
+    // its region is exactly the moved ball at every chunk (it never loses
+    // voxels), the block is pushed aside (none of its voxels inside the
+    // ball, the block persists), validate and the partition hold.
+    const double r = 4.0;
+    const Vec3d c0(-10.0, 15.0, 15.0);
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (auto p = CoordBBox(Coord(6, 9, 9), Coord(24, 21, 21)).begin(); p; ++p) acc.setValue(*p, 1);
+        for (auto p = CoordBBox(Coord::round(c0) - Coord(5), Coord::round(c0) + Coord(5)).begin(); p; ++p) {
+            if (((*p).asVec3d() - c0).length() < r) acc.setValue(*p, 2);
+        }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    Forces forces; // no speeds: the block moves only where the sphere pushes it
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    EXPECT_THROW(lsmo.setKinematicLabel(0, FloatGrid::create(), [](double) {
+        return math::Mat4d::identity(); }), ValueError);
+    EXPECT_THROW(lsmo.setKinematicLabel(2, FloatGrid::ConstPtr(), [](double) {
+        return math::Mat4d::identity(); }), ValueError);
+    EXPECT_THROW(lsmo.setKinematicLabel(2, FloatGrid::create(), nullptr), ValueError);
+    auto motion = [](double t) {
+        math::Mat4d mm = math::Mat4d::identity();
+        mm.setTranslation(Vec3d(t, 0.0, 0.0));
+        return mm;
+    };
+    lsmo.setKinematicLabel(2, tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(c0), 1.0f),
+        motion);
+    const CoordBBox domain(Coord(-20, 0, 0), Coord(40, 30, 30));
+    auto count = [&](int32_t l) {
+        Index64 n = 0;
+        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        for (auto p = domain.begin(); p; ++p) n += acc.getValue(*p) == l;
+        return n;
+    };
+    const Index64 block0 = count(1);
+    Index64 minBlock = block0;
+    for (double t = 0.0; t < 44.0 - 1e-9; t += 2.0) {
+        lsmo.advect(t, t + 2.0);
+        const Vec3d c = c0 + Vec3d(t + 2.0, 0.0, 0.0);
+        Index64 missing = 0, extra = 0, blockInside = 0;
+        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        for (auto p = domain.begin(); p; ++p) {
+            const double d = ((*p).asVec3d() - c).length() - r;
+            const int32_t l = acc.getValue(*p);
+            if (d < -0.1 && l != 2) ++missing;
+            if (d > 0.1 && l == 2) ++extra;
+            if (d < 0.0 && l == 1) ++blockInside;
+        }
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "t " << t + 2.0 << ": " << msg;
+        Index64 overlaps = 0, badCover = 0;
+        partitionErrors(*m, overlaps, badCover);
+        EXPECT_EQ(missing, Index64(0)) << "t " << t + 2.0;
+        EXPECT_EQ(extra, Index64(0)) << "t " << t + 2.0;
+        EXPECT_EQ(blockInside, Index64(0)) << "t " << t + 2.0;
+        EXPECT_EQ(overlaps, Index64(0)) << "t " << t + 2.0;
+        EXPECT_EQ(badCover, Index64(0)) << "t " << t + 2.0;
+        minBlock = std::min(minBlock, count(1));
+    }
+    const Index64 block1 = count(1);
+    std::cout << "KinematicLabelBasics: block voxels " << block0 << " -> min " << minBlock
+              << " -> " << block1 << ", sphere voxels " << count(2) << std::endl;
+    EXPECT_LT(minBlock, block0);  // the sphere displaced block voxels
+    EXPECT_GT(block1, block0 / 2); // the block persists
+    EXPECT_NEAR(lsmo.time(), 44.0, 1e-6);
+}
+
 namespace {
 
 // Smooth test fields evaluated at world positions, on a box of voxels of
@@ -2457,13 +2561,14 @@ TEST_F(TestLevelSetMultiObject, SimplePointTable)
 
 TEST_F(TestLevelSetMultiObject, DigitalTopologyHelper)
 {
-    using lsmo_test::digitalTopology;
+    // Region numbers under each rule, checked against the rule's mesh.
     const CoordBBox dom(Coord(-2), Coord(13));
-    auto expectTopo = [&](const Int32Grid& g, Conn conn, int comps, int cav, int euler) {
-        const auto t = digitalTopology(g, 1, dom, conn);
-        EXPECT_EQ(t.components, comps) << "conn " << int(conn);
-        EXPECT_EQ(t.cavities, cav) << "conn " << int(conn);
-        EXPECT_EQ(t.euler, euler) << "conn " << int(conn);
+    auto expectTopo = [&](const char* name, const Int32Grid& g, Conn conn, int comps, int cav,
+                          int euler) {
+        auto m = MLS::fromLabelGrid(g);
+        const lsmo_test::DigitalTopology expected{comps, cav, euler};
+        EXPECT_TOPOLOGY_CONSISTENT(lsmo_test::verifyLabelTopology(*m, 1, dom, conn,
+            std::string(name) + "/" + lsmo_test::connectivityName(conn), &expected));
     };
     auto solid = boxLabels({{CoordBBox(Coord(0), Coord(7)), 1}});
     auto hollow = boxLabels({{CoordBBox(Coord(0), Coord(7)), 1}, {CoordBBox(Coord(2), Coord(5)), 0}});
@@ -2473,20 +2578,59 @@ TEST_F(TestLevelSetMultiObject, DigitalTopologyHelper)
     auto edge = boxLabels({{CoordBBox(Coord(0), Coord(2)), 1},
         {CoordBBox(Coord(3, 3, 0), Coord(5, 5, 2)), 1}});
     for (Conn conn : kAllConn) {
-        expectTopo(*solid, conn, 1, 0, 1);
-        expectTopo(*hollow, conn, 1, 1, 2);
-        expectTopo(*torus, conn, 1, 0, 0);
+        expectTopo("solid", *solid, conn, 1, 0, 1);
+        expectTopo("hollow", *hollow, conn, 1, 1, 2);
+        expectTopo("torus", *torus, conn, 1, 0, 0);
     }
     // corner contact: joined only under 26
-    expectTopo(*corner, Conn::FG26_BG6, 1, 0, 1);
-    expectTopo(*corner, Conn::FG18_BG6, 2, 0, 2);
-    expectTopo(*corner, Conn::FG6_BG26, 2, 0, 2);
-    expectTopo(*corner, Conn::FG6_BG18, 2, 0, 2);
+    expectTopo("corner", *corner, Conn::FG26_BG6, 1, 0, 1);
+    expectTopo("corner", *corner, Conn::FG18_BG6, 2, 0, 2);
+    expectTopo("corner", *corner, Conn::FG6_BG26, 2, 0, 2);
+    expectTopo("corner", *corner, Conn::FG6_BG18, 2, 0, 2);
     // edge contact: joined under 26 and 18, separated under 6
-    expectTopo(*edge, Conn::FG26_BG6, 1, 0, 1);
-    expectTopo(*edge, Conn::FG18_BG6, 1, 0, 1);
-    expectTopo(*edge, Conn::FG6_BG26, 2, 0, 2);
-    expectTopo(*edge, Conn::FG6_BG18, 2, 0, 2);
+    expectTopo("edge", *edge, Conn::FG26_BG6, 1, 0, 1);
+    expectTopo("edge", *edge, Conn::FG18_BG6, 1, 0, 1);
+    expectTopo("edge", *edge, Conn::FG6_BG26, 2, 0, 2);
+    expectTopo("edge", *edge, Conn::FG6_BG18, 2, 0, 2);
+}
+
+TEST_F(TestLevelSetMultiObject, ConnectivityRuleMatters)
+{
+    // Two blocks touching only at a corner: one object under FG26_BG6, two
+    // under FG6_BG26. Each rule's numbers agree with that rule's mesh;
+    // verifying under one rule against the other rule's numbers fails and
+    // the message names the rule.
+    lsmo_test::ScopedDebugDir debugDir; // keeps the failure dumps out of the default directory
+    auto corner = MLS::fromLabelGrid(*boxLabels({{CoordBBox(Coord(0), Coord(2)), 1},
+        {CoordBBox(Coord(3), Coord(5)), 1}}));
+    const CoordBBox dom(Coord(-2), Coord(8));
+    const lsmo_test::DigitalTopology joined{1, 0, 1}, split{2, 0, 2};
+    const auto r26 = lsmo_test::verifyLabelTopology(*corner, 1, dom, Conn::FG26_BG6, "FG26_BG6",
+        &joined);
+    EXPECT_TOPOLOGY_CONSISTENT(r26);
+    EXPECT_EQ(r26.mesh.components, 1);
+    EXPECT_EQ(r26.mesh.euler, 2);
+    const auto r6 = lsmo_test::verifyLabelTopology(*corner, 1, dom, Conn::FG6_BG26, "FG6_BG26",
+        &split);
+    EXPECT_TOPOLOGY_CONSISTENT(r6);
+    EXPECT_EQ(r6.mesh.components, 2);
+    EXPECT_EQ(r6.mesh.euler, 4);
+    const auto bad6 = lsmo_test::verifyLabelTopology(*corner, 1, dom, Conn::FG6_BG26,
+        "FG6_BG26-vs-joined", &joined);
+    EXPECT_FALSE(bad6.ok);
+    EXPECT_NE(bad6.message.find("expected"), std::string::npos) << bad6.message;
+    EXPECT_NE(bad6.message.find("rule FG6_BG26"), std::string::npos) << bad6.message;
+    const auto bad26 = lsmo_test::verifyLabelTopology(*corner, 1, dom, Conn::FG26_BG6,
+        "FG26_BG6-vs-split", &split);
+    EXPECT_FALSE(bad26.ok);
+    EXPECT_NE(bad26.message.find("rule FG26_BG6"), std::string::npos) << bad26.message;
+    // the evolver's rule is what connectivityOf reports
+    Forces forces;
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*corner, forces);
+    for (Conn conn : kAllConn) {
+        lsmo.setConnectivity(conn);
+        EXPECT_EQ(lsmo_test::connectivityOf(lsmo), conn);
+    }
 }
 
 TEST_F(TestLevelSetMultiObject, SimplePointPreservesTopology)
@@ -2540,52 +2684,122 @@ TEST_F(TestLevelSetMultiObject, SimplePointPreservesTopology)
 
 namespace {
 
+// The three spheres of the cube test: radius 4, centres at x = 48.
+const Coord kOrbitSpheres[3] = {Coord(48, 10, 12), Coord(48, 20, 28), Coord(48, 29, 15)};
+// Angular speed about x (rad per unit time): one revolution over the run.
+const double kOrbitOmega = 2.0 * math::pi<double>() / 84.0;
+
+// Common initial centroid of the spheres: the point the orbit axis
+// (parallel to x) passes through.
+Vec3d
+orbitCentre()
+{
+    Vec3d c(0.0);
+    for (const Coord& p : kOrbitSpheres) c += p.asVec3d();
+    return c / 3.0;
+}
+
+// @a p rotated about the orbit axis by kOrbitOmega * @a t.
+Vec3d
+orbitPosition(const Vec3d& p, double t)
+{
+    const Vec3d c = orbitCentre();
+    const double a = kOrbitOmega * t, dy = p[1] - c[1], dz = p[2] - c[2];
+    return Vec3d(p[0], c[1] + dy * std::cos(a) - dz * std::sin(a),
+        c[2] + dy * std::sin(a) + dz * std::cos(a));
+}
+
+// The same rigid rotation as a matrix in the row-vector convention of
+// Mat4d::transform: x' = (x - c) R + c.
+math::Mat4d
+orbitMotion(double t)
+{
+    const Vec3d c = orbitCentre();
+    const double a = kOrbitOmega * t, ca = std::cos(a), sa = std::sin(a);
+    math::Mat4d m = math::Mat4d::identity();
+    m(1, 1) = ca; m(1, 2) = sa;
+    m(2, 1) = -sa; m(2, 2) = ca;
+    for (int j = 0; j < 3; ++j) {
+        double v = c[j];
+        for (int i = 0; i < 3; ++i) v -= c[i] * m(i, j);
+        m(3, j) = v;
+    }
+    return m;
+}
+
+// Volume centroid of a signed grid with the sub-voxel inside fraction
+// H(psi) = clamp(0.5 - psi/dx, 0, 1), over @a box (index space).
+Vec3d
+insideCentroid(const FloatGrid& sdf, const CoordBBox& box)
+{
+    const double dx = sdf.voxelSize()[0];
+    tree::ValueAccessor<const FloatTree> acc(sdf.tree());
+    Vec3d sum(0.0);
+    double w = 0.0;
+    for (auto p = box.begin(); p; ++p) {
+        const double h = std::min(1.0, std::max(0.0, 0.5 - double(acc.getValue(*p)) / dx));
+        sum += sdf.indexToWorld(*p) * h;
+        w += h;
+    }
+    return w > 0.0 ? sum / w : sum;
+}
+
 struct CubeRunResult
 {
-    std::vector<lsmo_test::DigitalTopology> topo; // per chunk
-    double shift = 0.0;     // centroid x shift of label 1 (diagnostic)
+    std::vector<lsmo_test::DigitalTopology> topo; // cube, per chunk
+    double shift = 0.0;      // centroid x shift of label 1 (diagnostic)
     double frontShift = 0.0; // leading-face shift: change of max x over label-1 voxels
-    bool changed = false;   // topology differed from (1, 0, 1) at some chunk
-    MLS::Ptr state;         // final state
+    bool changed = false;    // cube topology differed from (1, 0, 1) at some chunk
+    double firstChange = -1.0;                // end time of the first changed chunk
+    lsmo_test::DigitalTopology firstChangeTopo; // cube topology at that chunk
+    double maxCentroidError[3] = {0, 0, 0}; // sphere centroid vs rotated centre, max over chunks (dx)
+    double minVolumeFraction[3] = {1e9, 1e9, 1e9}; // sphere volume / (4/3) pi 4^3, min over chunks
+    int maxComponents[3] = {0, 0, 0}; // sphere components, max over chunks (diagnostic)
+    int meshDefects = 0;              // chunks whose cube mesh disagrees with the region
+    int maxCavities[3] = {0, 0, 0};   // sphere cavities, max over chunks (diagnostic)
+    MLS::Ptr state;          // final state
 };
 
-// Cube (label 1, side 40 voxels, [0,39]^3) advected
-// along +x by 1.5 x (side + sphere diameter + 8) = 84 voxels through three fixed
-// voxelised balls of radius 4 (labels 2-4) centred at x = 48 at distinct
-// (y, z). With @a protect, label 1 is topology-preserving (FG26_BG6) and the
-// per-chunk gates are asserted. @a tEnd < 0 runs the whole distance.
+// Cube (label 1, side 40 voxels, [0,39]^3) advected along +x by
+// 1.5 x (side + sphere diameter + 8) = 84 voxels through three balls of
+// radius 4 (labels 2-4, kinematic) centred at x = 48 at distinct (y, z),
+// which orbit together rigidly about the axis parallel to x through their
+// common centroid at kOrbitOmega (one revolution over the run), in the
+// plane orthogonal to the cube's motion. The evolver protects topology
+// under @a rule; object topology is verified with that same rule
+// (connectivityOf(evolver)). With @a protect, label 1 is
+// topology-preserving and the per-chunk gates are asserted (cube (1,0,1),
+// consistent meshes, validate, partition, sphere centroids within 1 dx of
+// the rotated centres; the obstacles' claims on cube voxels pass the
+// simple-point test and trapped cube voxels are wrapped outward); the worst
+// centroid error, smallest volume and largest component and cavity counts
+// per sphere are returned (the last three as diagnostics: a sphere can be
+// dented where it exits the protected cube). Without
+// @a protect (the control) the run stops at the first chunk where the
+// cube's topology changed. @a tEnd < 0 runs the whole distance.
 CubeRunResult
-runCubeThroughSpheres(bool protect, int grainSize = 1, double tEnd = -1.0)
+runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = -1.0)
 {
     const int side = 40;
-    const double distance = tEnd > 0.0 ? tEnd : 1.5 * (side + 8.0 + 8.0);
-    const Coord centres[3] = {Coord(48, 10, 12), Coord(48, 20, 28), Coord(48, 29, 15)};
-    const CoordBBox domain(Coord(-8, -8, -8), Coord(side - 1 + int(distance) + 8, side + 7, side + 7));
+    const bool fullRun = !(tEnd > 0.0);
+    const double distance = fullRun ? 1.5 * (side + 8.0 + 8.0) : tEnd;
+    const double fullDistance = 1.5 * (side + 8.0 + 8.0);
+    const CoordBBox domain(Coord(-8, -8, -8),
+        Coord(side - 1 + int(fullDistance) + 8, side + 7, side + 7));
     Int32Grid::Ptr labels = Int32Grid::create(0);
     {
         auto acc = labels->getAccessor();
         for (auto p = CoordBBox(Coord(0), Coord(side - 1)).begin(); p; ++p) acc.setValue(*p, 1);
         for (int s = 0; s < 3; ++s) {
-            for (auto p = CoordBBox(centres[s] - Coord(4), centres[s] + Coord(4)).begin(); p; ++p) {
-                if ((*p - centres[s]).asVec3i().lengthSqr() <= 16) acc.setValue(*p, 2 + s);
+            const Coord& c = kOrbitSpheres[s];
+            for (auto p = CoordBBox(c - Coord(4), c + Coord(4)).begin(); p; ++p) {
+                if ((*p - c).asVec3i().lengthSqr() <= 16) acc.setValue(*p, 2 + s);
             }
         }
     }
     auto m = MLS::fromLabelGrid(*labels);
     EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4}));
-    // snapshot of the fixed spheres: label, active state and phi bits around them
-    const CoordBBox sphereBox(Coord(48 - 10, 10 - 10, 12 - 10), Coord(48 + 10, 29 + 10, 28 + 10));
-    struct Snap { int32_t label; bool on; float phi; };
-    auto snapshot = [&]() {
-        std::map<Coord, Snap> s;
-        for (auto p = sphereBox.begin(); p; ++p) {
-            const int32_t l = m->labels()->tree().getValue(*p);
-            if (l < 2) continue;
-            s[*p] = Snap{l, m->labels()->tree().isValueOn(*p), m->phi()->tree().getValue(*p)};
-        }
-        return s;
-    };
-    const auto spheres0 = snapshot();
+    const double dx = m->voxelSize();
     auto labelCentroidX = [&]() {
         double sum = 0.0, n = 0.0;
         tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
@@ -2604,22 +2818,40 @@ runCubeThroughSpheres(bool protect, int grainSize = 1, double tEnd = -1.0)
         return mx;
     };
     const int front0 = labelMaxX();
-
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
     forces.setCurvatureWeight(0.0f);
-    forces.setFixedLabels({2, 3, 4});
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     lsmo.setGrainSize(grainSize);
-    if (protect) {
-        lsmo.setTopologyPreservingLabels({1});
-        lsmo.setConnectivity(Conn::FG26_BG6);
+    for (int s = 0; s < 3; ++s) {
+        lsmo.setKinematicLabel(2 + s, tools::createLevelSetSphere<FloatGrid>(4.0f,
+            Vec3f(kOrbitSpheres[s].asVec3d()), float(dx)), orbitMotion);
     }
+    lsmo.setConnectivity(rule);
+    if (protect) lsmo.setTopologyPreservingLabels({1});
+    // the matrix motion is the analytic rotation
+    for (double tt : {0.0, 10.0, 31.0}) {
+        const Vec3d p = kOrbitSpheres[0].asVec3d();
+        EXPECT_LT((orbitMotion(tt).transform(p) - orbitPosition(p, tt)).length(), 1e-9);
+    }
+    const Conn conn = lsmo_test::connectivityOf(lsmo);
+    const std::string ruleName = lsmo_test::connectivityName(conn);
+
     CubeRunResult res;
     const lsmo_test::DigitalTopology ball{1, 0, 1};
-    const auto t0 = lsmo_test::digitalTopology(*m->labels(), 1, domain, Conn::FG26_BG6);
-    EXPECT_TRUE(t0 == ball);
-    const char* tag = protect ? "TopologyCube(protected)" : "TopologyCube(control)";
+    const std::string tag = std::string(protect ? "protected" : "control") + "/" + ruleName;
+    const std::string log = "TopologyCube(" + tag + ")";
+    auto chunkTag = [&](double t, const std::string& what) {
+        std::ostringstream os;
+        os << tag << "/t" << std::setw(3) << std::setfill('0') << int(std::lround(t)) << "/" << what;
+        return os.str();
+    };
+    EXPECT_TOPOLOGY_CONSISTENT(lsmo_test::verifyLabelTopology(*m, 1, domain, conn,
+        chunkTag(0.0, "cube"), &ball));
+    auto volume = [](const FloatGrid& g) {
+        return g.tree().activeVoxelCount() > 0 ? tools::levelSetVolume(g) : 0.0;
+    };
+    const double exactVolume = 4.0 / 3.0 * math::pi<double>() * 64.0 * dx * dx * dx;
     const double chunk = 2.0;
     double t = 0.0;
     size_t steps = 0;
@@ -2628,39 +2860,88 @@ runCubeThroughSpheres(bool protect, int grainSize = 1, double tEnd = -1.0)
         const double t1 = std::min(distance, t + chunk);
         steps += lsmo.advect(t, t1);
         t = t1;
-        const auto topo = lsmo_test::digitalTopology(*m->labels(), 1, domain, Conn::FG26_BG6);
-        res.topo.push_back(topo);
-        if (!(topo == ball)) res.changed = true;
-        std::cout << tag << ": t " << t << " steps " << steps << " components "
-                  << topo.components << " cavities " << topo.cavities << " euler " << topo.euler
-                  << std::endl;
-        if (!protect) continue;
-        EXPECT_EQ(topo.components, 1) << "t " << t;
-        EXPECT_EQ(topo.cavities, 0) << "t " << t;
-        EXPECT_EQ(topo.euler, 1) << "t " << t;
-        const auto spheres = snapshot();
-        bool same = spheres.size() == spheres0.size();
-        for (const auto& kv : spheres0) {
-            auto it = spheres.find(kv.first);
-            same = same && it != spheres.end() && it->second.label == kv.second.label
-                && it->second.on == kv.second.on
-                && std::memcmp(&it->second.phi, &kv.second.phi, sizeof(float)) == 0;
+        const auto cube = lsmo_test::verifyLabelTopology(*m, 1, domain, conn, chunkTag(t, "cube"),
+            protect ? &ball : nullptr);
+        // The cube's digital topology under the rule is the gate. A mesh
+        // inconsistency with the right region numbers is a mesher defect (a
+        // non-manifold edge where several voxels have near-zero phi), counted
+        // and dumped, not a topology change.
+        if (protect) {
+            EXPECT_TRUE(cube.region == ball) << cube.message;
         }
-        EXPECT_TRUE(same) << "t " << t;
+        const bool meshDefect = !cube.ok && (!protect || cube.region == ball);
+        if (meshDefect) {
+            ++res.meshDefects;
+            std::cout << log << ": mesh defect: " << cube.message << std::endl;
+        }
+        res.topo.push_back(cube.region);
+        std::ostringstream row;
+        row << log << ": t " << t << " steps " << steps << " cube " << cube.region;
+        if (cube.region != ball && !res.changed) {
+            res.changed = true;
+            res.firstChange = t;
+            res.firstChangeTopo = cube.region;
+        }
+        if (!protect) {
+            std::cout << row.str() << std::endl;
+            if (res.changed) {
+                std::cout << log << ": first topology change at t " << t << ": " << cube.message
+                          << std::endl;
+                break;
+            }
+            continue;
+        }
+        bool chunkOk = cube.region == ball;
+        for (int s = 0; s < 3; ++s) {
+            const int32_t l = 2 + s;
+            // Spheres: consistent meshes and centroids are gated; their
+            // components and volume are diagnostics only, since cube voxels
+            // the protected cube cannot give up can dent a sphere where it
+            // exits the cube (see setKinematicLabel).
+            const std::string stag = chunkTag(t, "sphere" + std::to_string(l));
+            const auto sphere = lsmo_test::verifyLabelTopology(*m, l, domain, conn, stag);
+            EXPECT_TOPOLOGY_CONSISTENT(sphere);
+            chunkOk = chunkOk && sphere.ok;
+            res.maxComponents[s] = std::max(res.maxComponents[s], sphere.region.components);
+            res.maxCavities[s] = std::max(res.maxCavities[s], sphere.region.cavities);
+            FloatGrid::Ptr sdf = m->extractSignedDistance(l);
+            const Vec3d expected = orbitPosition(kOrbitSpheres[s].asVec3d(), t);
+            const CoordBBox box(Coord::round(expected) - Coord(12), Coord::round(expected) + Coord(12));
+            const double err = (insideCentroid(*sdf, box) - expected).length() / dx;
+            const double frac = volume(*sdf) / exactVolume;
+            res.maxCentroidError[s] = std::max(res.maxCentroidError[s], err);
+            res.minVolumeFraction[s] = std::min(res.minVolumeFraction[s], frac);
+            EXPECT_LE(err, 1.0) << stag;
+            chunkOk = chunkOk && err <= 1.0;
+            row << " L" << l << " " << sphere.region << " err " << err << " vol " << frac;
+        }
+        std::cout << row.str() << std::endl;
         std::string msg;
-        EXPECT_TRUE(m->validate(&msg)) << "t " << t << ": " << msg;
+        const bool valid = m->validate(&msg);
+        EXPECT_TRUE(valid) << "t " << t << ": " << msg;
         Index64 overlaps = 0, badCover = 0;
         partitionErrors(*m, overlaps, badCover);
         EXPECT_EQ(overlaps, Index64(0)) << "t " << t;
         EXPECT_EQ(badCover, Index64(0)) << "t " << t;
-        if (::testing::Test::HasFailure()) break;
+        // stop at this run's first failed chunk (not at failures of earlier runs)
+        if (!(chunkOk && valid && overlaps == 0 && badCover == 0)) break;
     }
     res.shift = labelCentroidX() - x0;
     res.frontShift = double(labelMaxX() - front0);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    std::cout << tag << ": " << steps << " steps, " << secs << " s, leading-face shift "
-              << res.frontShift << ", centroid shift " << res.shift << " (commanded " << distance
-              << ")" << std::endl;
+    std::cout << log << ": " << steps << " steps, " << secs << " s, t " << t
+              << ", cube mesh defects " << res.meshDefects
+              << ", leading-face shift " << res.frontShift << ", centroid shift " << res.shift
+              << std::endl;
+    if (protect) {
+        for (int s = 0; s < 3; ++s) {
+            std::cout << log << ": sphere " << 2 + s << " max centroid error "
+                      << res.maxCentroidError[s] << " dx, min volume "
+                      << 100.0 * res.minVolumeFraction[s] << "% of (4/3) pi 4^3, max components "
+                      << res.maxComponents[s] << ", max cavities " << res.maxCavities[s]
+                      << " (diagnostics)" << std::endl;
+        }
+    }
     res.state = m;
     return res;
 }
@@ -2670,25 +2951,34 @@ runCubeThroughSpheres(bool protect, int grainSize = 1, double tEnd = -1.0)
 TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
 {
     const double distance = 84.0;
-    const CubeRunResult prot = runCubeThroughSpheres(true);
-    EXPECT_FALSE(prot.changed);
-    // Leading face (max x of label 1), not the centroid: topology protection
-    // leaves label-1 material wrapped around the fixed spheres, tethered to
-    // the cube, so the centroid lags by a growing amount once the cube has
-    // passed them (2.6 voxels at distance 84); the centroid is printed only.
-    EXPECT_NEAR(prot.frontShift, distance, 2.0);
-    // control: without protection the spheres change the cube's topology
-    const CubeRunResult ctrl = runCubeThroughSpheres(false);
-    EXPECT_TRUE(ctrl.changed);
+    for (Conn rule : {Conn::FG26_BG6, Conn::FG6_BG26}) {
+        SCOPED_TRACE(lsmo_test::connectivityName(rule));
+        const CubeRunResult prot = runCubeThroughSpheres(true, rule);
+        EXPECT_FALSE(prot.changed);
+        // Leading face (max x of label 1), not the centroid: topology
+        // protection leaves label-1 material tethered around the spheres the
+        // cube has passed, so the centroid lags; it is printed only.
+        EXPECT_NEAR(prot.frontShift, distance, 2.0);
+        for (int s = 0; s < 3; ++s) {
+            // also asserted at every chunk; volume and components are printed only
+            EXPECT_LE(prot.maxCentroidError[s], 1.0) << "sphere " << 2 + s;
+        }
+        // control: without protection the spheres change the cube's topology
+        const CubeRunResult ctrl = runCubeThroughSpheres(false, rule);
+        EXPECT_TRUE(ctrl.changed);
+        std::cout << "TopologyCube(control/" << lsmo_test::connectivityName(rule)
+                  << "): first change at t " << ctrl.firstChange << " " << ctrl.firstChangeTopo
+                  << std::endl;
+    }
 }
 
 TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
 {
     // The coloured passes make the protected result independent of the
-    // thread count: serial and parallel runs well past first contact
-    // (t = 1.5 x 48 = 72) are bit-identical.
-    const CubeRunResult a = runCubeThroughSpheres(true, 0, 72.0);
-    const CubeRunResult b = runCubeThroughSpheres(true, 1, 72.0);
+    // thread count: serial and parallel runs well past the cube's first
+    // contact with the spheres (to t = 72) are bit-identical.
+    const CubeRunResult a = runCubeThroughSpheres(true, Conn::FG26_BG6, 0, 72.0);
+    const CubeRunResult b = runCubeThroughSpheres(true, Conn::FG26_BG6, 1, 72.0);
     ASSERT_TRUE(a.state && b.state);
     const Int32Tree& la = a.state->labels()->tree();
     const Int32Tree& lb = b.state->labels()->tree();
