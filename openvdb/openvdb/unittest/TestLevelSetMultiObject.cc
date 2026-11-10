@@ -2460,18 +2460,19 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
     //   rs = 38.5 with zone width 1, updraft 0.1; dense over [-80, 80]^3
     //   (the larger shapes reach r ~ 68); advection weight 1, curvature
     //   weight 0.003.
-    // - Why these values: running twice as long (to t = 84) with the
-    //   original sizes (scale 1, inflow and updraft 0.2, curvature 0.01)
-    //   lost the capsule by t = 58. Every object keeps translating towards
+    // - Why these values: with the original sizes (scale 1, inflow and
+    //   updraft 0.2, curvature 0.01) the capsule vanished by t = 58, before
+    //   any longer run could end. Every object keeps translating towards
     //   the ring at the far-field inflow speed while its face at the ring
     //   cannot move, so the flow itself flattens it by inflow * (time in
     //   contact); halving the inflow and updraft, and starting the pairs
     //   closer, cuts that squeeze while the larger shapes make its relative
     //   effect smaller (curvature was not the main loss: the loss matches
     //   the reference's). Contact then comes at t = 36 and the smallest
-    //   label keeps about 1050 voxels at t = 84.
+    //   label keeps 1203 voxels at t = 60 (tetrahedron, label 3); the
+    //   tightest volume-gate margin is 3.4 points (label 8, upper bound).
     // - Advect in chunks of 2 until >= 4 contact pairs (capped at t = 70),
-    //   then on to t = 84; contacts must stay >= 4 at every chunk after
+    //   then on to t = 60 (Vortex::kEndTime); contacts must stay >= 4 at every chunk after
     //   first contact.
     // Volume gate (two-sided): with refLoss the loss of the same
     // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
@@ -3213,10 +3214,14 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
     // grain size. (A legitimate numerical change elsewhere re-records them.)
-    constexpr uint64_t kVortexHash = 0xbb16401453a4e6d7ull;
+    constexpr uint64_t kVortexHash = 0x91492b1ffb06703dull;
     constexpr uint64_t kCubeHash[2] = {0x8b7ce4b2a0056e19ull, 0xb246f92014f05228ull}; // FG26, FG6
     constexpr uint64_t kPartitionHash = 0x9b3bc454962e6cbeull;
     // end times of the recorded cube runs and of the serial vs parallel check
+    // (the control cube, unprotected, first changes topology at t = 32 for
+    // FG26_BG6 and t = 34 for FG6_BG26 in TopologyCubeThroughSpheres; the
+    // spheres enter the cube from about t = 5, so 40 is well past contact,
+    // with the protected claim and wrap passes active)
     constexpr double kCubeHashEnd = 72.0, kSerialCheckEnd = 40.0;
     const bool record = std::getenv("LSMO_RECORD_HASHES") != nullptr;
     auto check = [&](const char* what, uint64_t h, uint64_t expected) {

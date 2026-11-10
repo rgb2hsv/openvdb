@@ -246,7 +246,7 @@ contactPairs(const MLS& m)
 struct Vortex
 {
     /// Schedule: chunk length, cap on the time to first contact, end time.
-    static constexpr double kChunk = 2.0, kContactCap = 70.0, kEndTime = 84.0;
+    static constexpr double kChunk = 2.0, kContactCap = 70.0, kEndTime = 60.0;
 
     /// Parameters (see VortexEightObjects for why they were chosen).
     static constexpr double kShapeScale = 1.4;   ///< factor on every shape dimension
@@ -278,12 +278,12 @@ struct Vortex
             *this);
     }
 
-    /// Shape of label @a l (1..8) centered at @a c, dx = 1, half-width 3:
-    /// sphere r = 10; cube side 12; tetrahedron, octahedron, dodecahedron,
-    /// icosahedron with factory scale (circumradius) 10; capsule along z with
-    /// radius 5 and axis endpoints +-5; closed ring = 8-segment polygon of
-    /// radius 7 in the xy plane with tube radius 3; every length times
-    /// kShapeScale. No rotations.
+    /// Shape of label @a l (1..8) centered at @a c, dx = 1, half-width 3.
+    /// Base (pre-scale) sizes: sphere r = 10; cube side 12; tetrahedron,
+    /// octahedron, dodecahedron, icosahedron with factory scale (circumradius)
+    /// 10; capsule along z with radius 5 and axis endpoints +-5; closed ring
+    /// = 8-segment polygon of radius 7 in the xy plane with tube radius 3.
+    /// Every length is multiplied by kShapeScale. No rotations.
     openvdb::FloatGrid::Ptr shape(int32_t l, const openvdb::Vec3f& c) const
     {
         using namespace openvdb;
@@ -342,7 +342,7 @@ struct Vortex
     }
 
     /// @brief Run the vortex schedule on @a m: advection weight 1, curvature
-    /// weight 0.01, chunks of kChunk until >= 4 contact pairs (capped at
+    /// weight kCurvatureWeight, chunks of kChunk until >= 4 contact pairs (capped at
     /// t = kContactCap), then on in chunks to the end time kEndTime.
     /// @details perChunk(t, steps, pairs, afterContact) runs after every
     /// chunk (afterContact: chunks completed after the first chunk with

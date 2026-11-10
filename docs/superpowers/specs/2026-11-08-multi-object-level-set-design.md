@@ -499,14 +499,15 @@ Required integration tests:
    from pairs pressed together in the convergence zone until their gap is
    below a voxel.) Advection weight 1, curvature weight 0.003; advect in
    chunks of 2 until ≥ 4 contact pairs (capped at t = 70), then on to
-   t = 84 with the contacts required to persist at every chunk (rulings R31
+   t = 60 with the contacts required to persist at every chunk (rulings R31
    and O18). The run is long, so the field is weak: every object keeps
    translating towards the ring at the far-field inflow speed while its face
    at the ring cannot move, so the flow flattens it by inflow × (time in
    contact), and the original strength (inflow and updraft 0.2, circumradius
    10) lost the capsule by t = 58; halving the inflow and updraft, starting
-   the pairs closer and enlarging the shapes keeps every label alive (smallest
-   about 1050 voxels at t = 84).
+   the pairs closer and enlarging the shapes keeps every label alive (first contact at t = 36;
+   smallest label 1203 voxels at t = 60; tightest volume-gate margin 3.4 points,
+   label 8 upper bound). The run was first t = 84, then shortened to t = 60.
    - Every chunk: `validate()`, partition invariant, no NaN.
    - At end: ≥ 4 distinct label pairs sharing a face; every label still owns
      at least one voxel; with refLoss the volume loss of the same shape
