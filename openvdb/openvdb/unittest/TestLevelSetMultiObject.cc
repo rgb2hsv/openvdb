@@ -1585,6 +1585,106 @@ TEST_F(TestLevelSetMultiObject, UniformAdvection)
     EXPECT_NEAR(c1[2] - c0[2], 0.0, 0.5 * dx);
 }
 
+namespace {
+
+// Smooth test fields evaluated at world positions, on a box of voxels of
+// @a xform (index range [-26, 26]^3, background zero).
+FloatGrid::Ptr
+makePressureField(const math::Transform::Ptr& xform)
+{
+    FloatGrid::Ptr g = FloatGrid::create(0.0f);
+    g->setTransform(xform);
+    auto acc = g->getAccessor();
+    for (int i = -26; i <= 26; ++i)
+        for (int j = -26; j <= 26; ++j)
+            for (int k = -26; k <= 26; ++k) {
+                const Vec3d w = xform->indexToWorld(Coord(i, j, k));
+                acc.setValue(Coord(i, j, k),
+                    float(0.8 + 0.5 * std::sin(0.3 * w.x()) + 0.3 * std::cos(0.2 * w.y())
+                          - 0.1 * w.z() / 26.0));
+            }
+    return g;
+}
+
+Vec3SGrid::Ptr
+makeVelocityField(const math::Transform::Ptr& xform)
+{
+    Vec3SGrid::Ptr g = Vec3SGrid::create(Vec3f(0.0f));
+    g->setTransform(xform);
+    auto acc = g->getAccessor();
+    for (int i = -26; i <= 26; ++i)
+        for (int j = -26; j <= 26; ++j)
+            for (int k = -26; k <= 26; ++k) {
+                const Vec3d w = xform->indexToWorld(Coord(i, j, k));
+                acc.setValue(Coord(i, j, k),
+                    Vec3f(float(0.8 + 0.2 * std::sin(0.2 * w.y())),
+                          float(0.3 * std::cos(0.15 * w.x())),
+                          float(0.1 + 0.05 * std::sin(0.1 * w.z()))));
+            }
+    return g;
+}
+
+// Evolve a sphere under pressure + advection fields living on a transform
+// translated by @a shift voxels from the pair's; @a force selects the
+// BoxSampler path.
+MLS::Ptr
+runFieldScenario(const Vec3d& shift, bool force)
+{
+    auto m = makeSphere(8.0);
+    math::Transform::Ptr xf = m->phi()->transform().copy();
+    xf->postTranslate(shift * m->voxelSize());
+    Forces forces;
+    forces.setForceSampling(force);
+    forces.setPressure(makePressureField(xf), 1.0f);
+    forces.setAdvection(makeVelocityField(xf), 1.0f);
+    forces.setCurvatureWeight(0.1f);
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo.advect(0.0, 3.0);
+    return m;
+}
+
+Index64
+bitDifferences(const MLS& a, const MLS& b)
+{
+    Index64 diff = 0;
+    const FloatTree& pa = a.phi()->tree();
+    const FloatTree& pb = b.phi()->tree();
+    if (!a.labels()->tree().hasSameTopology(b.labels()->tree())) ++diff;
+    for (auto it = pa.cbeginValueOn(); it; ++it) {
+        const float v = pb.getValue(it.getCoord());
+        if (std::memcmp(&v, &*it, sizeof(float)) != 0) ++diff;
+    }
+    for (auto it = a.labels()->tree().cbeginValueAll(); it; ++it) {
+        if (b.labels()->tree().getValue(it.getCoord()) != *it) ++diff;
+    }
+    return diff;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, FieldDirectReadMatchesSampler)
+{
+    // Fields on the pair's transform are read directly; the result is
+    // bit-identical to the BoxSampler path. Fields on a translated transform
+    // keep using the sampler.
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    auto direct = runFieldScenario(Vec3d(0.0), false);
+    const auto t1 = Clock::now();
+    auto sampled = runFieldScenario(Vec3d(0.0), true);
+    const auto t2 = Clock::now();
+    std::cout << "FieldDirectReadMatchesSampler: direct "
+              << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms, sampled "
+              << std::chrono::duration<double, std::milli>(t2 - t1).count() << " ms" << std::endl;
+    ASSERT_FALSE(direct->phi()->tree().empty());
+    EXPECT_EQ(bitDifferences(*direct, *sampled), Index64(0));
+
+    const Vec3d shift(0.5, 0.25, 0.0);
+    auto mis = runFieldScenario(shift, false);
+    auto misSampled = runFieldScenario(shift, true);
+    EXPECT_EQ(bitDifferences(*mis, *misSampled), Index64(0));
+}
+
 TEST_F(TestLevelSetMultiObject, FixedLabels)
 {
     auto m = makeTwoSpheres(1.0);

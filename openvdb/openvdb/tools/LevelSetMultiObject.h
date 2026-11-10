@@ -1466,18 +1466,22 @@ public:
     float voxelSize() const { return mDx; }
     const math::Transform& transform() const { return mTransform; }
 
-    /// @brief BoxSampler value of @a grid at the world position of the
-    /// centre voxel. The value is cached until the stencil moves to another
-    /// voxel (or another grid is sampled), and the grid is read through a
-    /// value accessor kept by the stencil. @a grid must outlive the stencil.
-    float sampleAtCentre(const FloatGrid& grid) const
+    /// @brief Value of @a grid at the world position of the centre voxel.
+    /// If the transform of @a grid equals that of the stencil's grids, the
+    /// index spaces coincide and the voxel value is read directly (exactly
+    /// what BoxSampler returns at an integer index); otherwise, or if
+    /// @a forceSampling is true, the value is BoxSampler-interpolated. The
+    /// value is cached until the stencil moves to another voxel (or another
+    /// grid is sampled), and the grid is read through a value accessor kept
+    /// by the stencil. @a grid must outlive the stencil.
+    float sampleAtCentre(const FloatGrid& grid, bool forceSampling = false) const
     {
-        return this->sample(grid, mScalarCache);
+        return this->sample(grid, mScalarCache, forceSampling);
     }
     /// @brief Vector-valued version of sampleAtCentre().
-    Vec3f sampleAtCentre(const Vec3SGrid& grid) const
+    Vec3f sampleAtCentre(const Vec3SGrid& grid, bool forceSampling = false) const
     {
-        return this->sample(grid, mVectorCache);
+        return this->sample(grid, mVectorCache, forceSampling);
     }
 
     /// @brief psi at offset (i,j,k) from the centre; the 19 points have at
@@ -1541,28 +1545,36 @@ public:
 
 private:
     /// One-entry cache of a sampled grid: the grid, a value accessor to its
-    /// tree, and the value at the current centre voxel.
+    /// tree, whether the grid shares the stencil's transform, and the value
+    /// at the current centre voxel.
     template<typename GridT>
     struct FieldCache
     {
         const GridT* grid = nullptr;
+        bool aligned = false;
         std::unique_ptr<tree::ValueAccessor<const typename GridT::TreeType>> acc;
         bool valid = false;
         typename GridT::ValueType value{};
     };
 
     template<typename GridT>
-    typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& cache) const
+    typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& cache,
+        bool forceSampling) const
     {
         if (cache.grid != &grid) {
             cache.grid = &grid;
             cache.acc.reset(new tree::ValueAccessor<const typename GridT::TreeType>(grid.tree()));
+            cache.aligned = (grid.transform() == mTransform);
             cache.valid = false;
         }
         if (!cache.valid) {
-            const Vec3d w = mTransform.indexToWorld(mCenter);
-            const Vec3R idx = grid.transform().worldToIndex(w);
-            cache.value = tools::BoxSampler::sample(*cache.acc, idx);
+            if (cache.aligned && !forceSampling) {
+                cache.value = cache.acc->getValue(mCenter);
+            } else {
+                const Vec3d w = mTransform.indexToWorld(mCenter);
+                const Vec3R idx = grid.transform().worldToIndex(w);
+                cache.value = tools::BoxSampler::sample(*cache.acc, idx);
+            }
             cache.valid = true;
         }
         return cache.value;
@@ -1646,7 +1658,13 @@ public:
         mPressureWeight = weight;
     }
 
-    /// @brief Advection velocity (world units) sampled with BoxSampler.
+    /// @brief Test hook: when true, fields are always BoxSampler-interpolated,
+    /// even if their transform equals that of the level set (default false:
+    /// such fields are read directly, with identical results).
+    void setForceSampling(bool force) { mForceSampling = force; }
+
+    /// @brief Advection velocity (world units), sampled with BoxSampler unless
+    /// its transform equals that of the level set (then read directly).
     /// @throw ValueError if @a velocity is null.
     void setAdvection(Vec3SGrid::ConstPtr velocity, float weight)
     {
@@ -1693,7 +1711,7 @@ public:
         // fields are sampled at the stencil centre (== ijk), once per voxel
         float advection = 0.0f;
         if (mAdvection) {
-            const Vec3f vel = s.sampleAtCentre(*mAdvection);
+            const Vec3f vel = s.sampleAtCentre(*mAdvection, mForceSampling);
             for (int a = 0; a < 3; ++a) {
                 const float f = mAdvectionWeight * vel[a];
                 if (f > 0.0f) advection += f * dneg[a];
@@ -1703,7 +1721,7 @@ public:
 
         float pressure = 0.0f;
         if (mPressure) {
-            const float force = mPressureWeight * s.sampleAtCentre(*mPressure);
+            const float force = mPressureWeight * s.sampleAtCentre(*mPressure, mForceSampling);
             float gsPos = 0.0f, gsNeg = 0.0f;
             for (int a = 0; a < 3; ++a) {
                 const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
@@ -1736,6 +1754,7 @@ private:
     float mPressureWeight = 0.0f;
     Vec3SGrid::ConstPtr mAdvection;
     float mAdvectionWeight = 0.0f;
+    bool mForceSampling = false;
     std::set<int32_t> mInactive, mFixed;
 };
 
