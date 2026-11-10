@@ -630,11 +630,13 @@ inline float jacobiUpdate(const Coord& p, float old, FloatAccT& acc, SeedAccT& s
 /// interfaces whose frozen voxels lie on either side.
 /// @param differs copied once per task; called as differs(p, q).
 /// @param grainSize TBB grain size in leaves; zero or negative runs serially.
+/// @param converged if non-null, set to whether max|delta phi| fell below
+/// @a tolerance (rather than the iteration or the interrupt ending the solve).
 /// @return the number of Jacobi iterations performed.
 template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp, typename InterruptT>
 int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& differs,
     double dx, float tolerance, int maxIter, int grainSize, InterruptT* interrupt,
-    bool signedReflection = false)
+    bool signedReflection = false, bool* converged = nullptr)
 {
     static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
         "the distance tree must have float values");
@@ -690,13 +692,15 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
     };
 
     int iter = 0;
+    bool done = false;
     while (iter < maxIter) {
         if (util::wasInterrupted(interrupt)) break;
         ++iter;
         const float maxDelta = sweep();
         leafs.swapLeafBuffer(1, serial);
-        if (maxDelta < tolerance) break;
+        if (maxDelta < tolerance) { done = true; break; }
     }
+    if (converged) *converged = done;
 
     // Unreached voxels (no seed nearby, or interrupted) get the background.
     forEachLeaf(leafs, [&](typename LeafRangeT::Iterator& leafIt) {
@@ -707,49 +711,32 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
     return iter;
 }
 
-/// @brief solveOuterLayers() restricted to the voxels of @a solve that are
-/// active in @a phi and not in @a seeds (both masks may hold active tiles).
+/// @brief solveOuterLayers() restricted to the voxels @a masks[i] of the
+/// leaves @a leaves[i] of @a phi (active, and not in @a seeds).
 /// @details Those voxels are reset and updated by the same Jacobi iteration
 /// (and the same signed reflection) as in solveOuterLayers(); every other
 /// active voxel keeps its value and acts as Dirichlet data, but only
 /// voxels of @a seeds count as frozen across a label change. Iteration
 /// stops when max|delta phi| over the solved voxels falls below
 /// @a tolerance, after @a maxIter iterations, or on interrupt; unreached
-/// voxels get the background. Only the leaves holding solved voxels are
-/// visited.
+/// voxels get the background. Only the given leaves are visited.
+/// @param converged as in solveOuterLayers() (true if nothing is solved).
 /// @return the number of Jacobi iterations performed (0 if none is solved).
-template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp, typename InterruptT>
-int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTreeT& solve,
-    const DiffersOp& differs, double dx, float tolerance, int maxIter, int grainSize,
-    InterruptT* interrupt, bool signedReflection)
+template<typename FloatTreeT, typename BoolTreeT, typename MaskT, typename DiffersOp,
+    typename InterruptT>
+int solveOuterLayerLeaves(FloatTreeT& phi, const BoolTreeT& seeds,
+    const std::vector<typename FloatTreeT::LeafNodeType*>& leaves,
+    const std::vector<MaskT>& masks, const DiffersOp& differs, double dx, float tolerance,
+    int maxIter, int grainSize, InterruptT* interrupt, bool signedReflection,
+    bool* converged = nullptr)
 {
     static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
         "the distance tree must have float values");
     using LeafT = typename FloatTreeT::LeafNodeType;
-    using MaskLeafT = typename BoolTreeT::LeafNodeType;
     constexpr Index kSize = LeafT::SIZE;
     const float bg = phi.background();
-
-    using MaskT = typename MaskLeafT::NodeMaskType;
-    std::vector<LeafT*> leaves;
-    std::vector<MaskT> masks;
-    {
-        // the voxels of a leaf in a mask: its leaf's, all (active tile) or none
-        auto maskOf = [](tree::ValueAccessor<const BoolTreeT>& acc, const Coord& o) {
-            if (const MaskLeafT* l = acc.probeConstLeaf(o)) return l->getValueMask();
-            return MaskT(acc.isValueOn(o));
-        };
-        tree::ValueAccessor<const BoolTreeT> solveAcc(solve), seedAcc(seeds);
-        for (auto it = phi.beginLeaf(); it; ++it) {
-            MaskT m = maskOf(solveAcc, it->origin());
-            if (m.isOff()) continue;
-            m &= it->getValueMask();
-            m -= maskOf(seedAcc, it->origin());
-            if (m.isOff()) continue;
-            leaves.push_back(&*it);
-            masks.push_back(m);
-        }
-    }
+    OPENVDB_ASSERT(leaves.size() == masks.size());
+    if (converged) *converged = true;
     if (leaves.empty()) return 0;
 
     auto forEach = [&](const auto& op) {
@@ -802,6 +789,7 @@ int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTr
     };
 
     int iter = 0;
+    bool done = false;
     while (iter < maxIter) {
         if (util::wasInterrupted(interrupt)) break;
         ++iter;
@@ -812,8 +800,9 @@ int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTr
                 leaves[i]->setValueOnly(it.pos(), in[it.pos()]);
             }
         });
-        if (maxDelta < tolerance) break;
+        if (maxDelta < tolerance) { done = true; break; }
     }
+    if (converged) *converged = done;
 
     // Unreached voxels (no seed or kept voxel nearby, or interrupted) get the
     // background.
@@ -825,6 +814,37 @@ int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTr
         }
     });
     return iter;
+}
+
+/// @brief solveOuterLayerLeaves() on the voxels of the mask @a solve that are
+/// active in @a phi and not in @a seeds (both masks may hold active tiles).
+template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp, typename InterruptT>
+int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTreeT& solve,
+    const DiffersOp& differs, double dx, float tolerance, int maxIter, int grainSize,
+    InterruptT* interrupt, bool signedReflection, bool* converged = nullptr)
+{
+    using LeafT = typename FloatTreeT::LeafNodeType;
+    using MaskLeafT = typename BoolTreeT::LeafNodeType;
+    using MaskT = typename MaskLeafT::NodeMaskType;
+    std::vector<LeafT*> leaves;
+    std::vector<MaskT> masks;
+    // the voxels of a leaf in a mask: its leaf's, all (active tile) or none
+    auto maskOf = [](tree::ValueAccessor<const BoolTreeT>& acc, const Coord& o) {
+        if (const MaskLeafT* l = acc.probeConstLeaf(o)) return l->getValueMask();
+        return MaskT(acc.isValueOn(o));
+    };
+    tree::ValueAccessor<const BoolTreeT> solveAcc(solve), seedAcc(seeds);
+    for (auto it = phi.beginLeaf(); it; ++it) {
+        MaskT m = maskOf(solveAcc, it->origin());
+        if (m.isOff()) continue;
+        m &= it->getValueMask();
+        m -= maskOf(seedAcc, it->origin());
+        if (m.isOff()) continue;
+        leaves.push_back(&*it);
+        masks.push_back(m);
+    }
+    return solveOuterLayerLeaves(phi, seeds, leaves, masks, differs, dx, tolerance, maxIter,
+        grainSize, interrupt, signedReflection, converged);
 }
 
 } // namespace lsmo_internal
@@ -903,44 +923,79 @@ public:
     /// +phi, a frozen face neighbour of a different label gives -phi, other
     /// neighbours of a different label are ignored. Unlike redistance(),
     /// voxels next to a label change that are not in @a freeze are solved,
-    /// not frozen.
+    /// not frozen. Unlike redistance(), the iteration runs until
+    /// max|delta phi| falls below the tolerance (capped at iterationCap()
+    /// iterations; see converged()), so the result is the converged solution
+    /// of its Dirichlet data rather than a fixed number of sweeps.
     /// @return the number of Jacobi iterations performed.
     int redistance(const BoolTreeT& freeze)
     {
         FloatTreeT& phi = mMls.phi()->tree();
         const double dx = mMls.voxelSize();
-        const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
         if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
         BoolTreeT seeds(freeze);
         seeds.voxelizeActiveTiles();
         seeds.topologyIntersection(phi);
         const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
         const int iter = lsmo_internal::solveOuterLayers(phi, seeds, differs, dx,
-            mTolerance, maxIter, mGrainSize, mInterrupter, /*signedReflection=*/true);
+            mTolerance, iterationCap(mMls.halfWidth()), mGrainSize, mInterrupter,
+            /*signedReflection=*/true, &mConverged);
         if (mInterrupter) mInterrupter->end();
         return iter;
     }
 
     /// @brief Incremental form of redistance(freeze): only the active voxels
     /// of @a dirty that are not active in @a freeze are reset and solved
-    /// (same scheme, same signed reflection across frozen voxels); every
-    /// other active voxel keeps its value and acts as Dirichlet data. It
-    /// matches redistance(freeze) where @a dirty covers every voxel whose
-    /// result can differ from its current value.
+    /// (same scheme, same signed reflection across frozen voxels, same
+    /// convergence test); every other active voxel keeps its value and acts
+    /// as Dirichlet data. Both solves converge to the solution of their
+    /// Dirichlet data, so where @a dirty holds every active voxel within
+    /// halfWidth + 1 voxels of each voxel whose phi, label, activity or
+    /// freeze state changed since phi was last redistanced (the domain of
+    /// dependence of a band value below halfWidth*dx), the two agree to
+    /// within the tolerance.
     /// @return the number of Jacobi iterations performed (0 if nothing is
     /// solved).
     int redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)
     {
         FloatTreeT& phi = mMls.phi()->tree();
         const double dx = mMls.voxelSize();
-        const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
         if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
         const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
         const int iter = lsmo_internal::solveOuterLayersMasked(phi, freeze, dirty, differs,
-            dx, mTolerance, maxIter, mGrainSize, mInterrupter, /*signedReflection=*/true);
+            dx, mTolerance, iterationCap(mMls.halfWidth()), mGrainSize, mInterrupter,
+            /*signedReflection=*/true, &mConverged);
         if (mInterrupter) mInterrupter->end();
         return iter;
     }
+
+    /// @brief redistance(freeze, dirty) with the voxels to solve given per
+    /// leaf: @a masks[i] (active voxels of @a leaves[i], none in @a freeze).
+    template<typename MaskT>
+    int redistance(const BoolTreeT& freeze,
+        const std::vector<typename FloatTreeT::LeafNodeType*>& leaves,
+        const std::vector<MaskT>& masks)
+    {
+        FloatTreeT& phi = mMls.phi()->tree();
+        if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
+        const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
+        const int iter = lsmo_internal::solveOuterLayerLeaves(phi, freeze, leaves, masks,
+            differs, mMls.voxelSize(), mTolerance, iterationCap(mMls.halfWidth()), mGrainSize,
+            mInterrupter, /*signedReflection=*/true, &mConverged);
+        if (mInterrupter) mInterrupter->end();
+        return iter;
+    }
+
+    /// @brief Iteration cap of redistance(freeze) and its incremental forms:
+    /// 4*(ceil(halfWidth*sqrt(3)) + 2), a safety limit (they normally stop
+    /// at the tolerance well before it).
+    static int iterationCap(int halfWidth)
+    {
+        return 4 * (int(std::ceil(halfWidth * std::sqrt(3.0))) + 2);
+    }
+    /// @brief Whether the last redistance(freeze) (or incremental form)
+    /// reached the tolerance before iterationCap() or an interrupt.
+    bool converged() const { return mConverged; }
 
     /// @brief Interface seeding only, for per-label reconstruction.
     /// @details An active voxel p of @a out is a seed if some face neighbour
@@ -995,6 +1050,7 @@ private:
     InterruptT* mInterrupter;
     float mTolerance;
     int mGrainSize = 1;
+    bool mConverged = true;
 };
 
 
@@ -2132,17 +2188,28 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    both trees (labels kept, so the interior label stays known);
 ///    pruneInactive(). Builds with OPENVDB_ENABLE_ASSERTS check validate()
 ///    after every step.
-///    By default the redistance is incremental: only the leaves within
-///    ceil(halfWidth*sqrt(3)) + 2 voxels (the Jacobi iteration limit) of a
-///    voxel whose phi, label, activity or freeze state changed since the
-///    last redistance are re-solved, the others keep their values as
-///    Dirichlet data; every write of the step (projection, deferred
-///    changes, kinematic stamps, orphan fixes, band activation and
-///    deactivation, the phi floor) records its changed voxels. This assumes
-///    that only the evolver changes the pair between steps; the first
-///    step, and the first after a change of the topology-preserving or
-///    kinematic labels, the phi floor or the tolerance, re-solve the whole
-///    band, as does every step with setFullRedistance(true).
+///    The redistance iterates to the tolerance (see
+///    MultiLevelSetRedistance::iterationCap), so its result is the converged
+///    solution of the frozen values. By default it is incremental: every
+///    write of the step (projection, deferred changes, kinematic stamps,
+///    orphan fixes, band activation and deactivation, the phi floor) and
+///    every change of the frozen set records its voxels, and only the
+///    leaves within halfWidth + 1 voxels of a recorded voxel are re-solved;
+///    the others keep their values as Dirichlet data. A band value (below
+///    halfWidth*dx) depends only on the data within that distance, so the
+///    kept values are those the full solve would produce, and the two
+///    agree to within the tolerance. This assumes that only the evolver
+///    changes the pair between steps; the first step, and the first after
+///    a change of the topology-preserving or kinematic labels, the phi
+///    floor or the tolerance, re-solve the whole band, as does every step
+///    with setFullRedistance(true).
+///    Agreement with the full solve to within the tolerance is verified for
+///    halfWidth <= 3. Wider bands can differ by up to about 1e-2*dx in some
+///    scenes: the Jacobi update only lowers values while its second-order
+///    upwind term can raise a value when a neighbour drops, so a converged
+///    result also depends on the order in which voxels are reached, and the
+///    kept values change that order. setFullRedistance(true) is the exact
+///    alternative.
 ///
 /// Voxels of fixed labels never change label or phi and no label can
 /// capture them; a step with no non-zero candidate and no kinematic label
@@ -2234,7 +2301,8 @@ public:
     void setRedistanceTolerance(float tolWorld) { mTolerance = tolWorld; mPrimed = false; }
     /// @brief Re-solve the whole band at every step (default false: only the
     /// leaves near the voxels the step changed are re-solved; see the class
-    /// documentation). The results agree to within the redistance tolerance.
+    /// documentation). The results agree to within the redistance tolerance
+    /// for halfWidth <= 3 and can differ by up to about 1e-2*dx beyond.
     void setFullRedistance(bool on) { mFullRedistance = on; }
     bool fullRedistance() const { return mFullRedistance; }
     /// @brief Labels whose digital topology is preserved (default
@@ -2284,7 +2352,6 @@ public:
     }
     /// @brief Whether the phi floor holds (see setMinimumPhi()); true if no
     /// label is topology-preserving.
-    /// @param message if non-null, receives the first violation.
     bool validateTopologyFloor() const;
     /// @brief Adjacency pair of topology preservation (default FG26_BG6).
     void setConnectivity(MultiObjectConnectivity conn) { mConnectivity = conn; }
@@ -2350,6 +2417,13 @@ public:
     /// Temporaries of the redistance pass are not included. 0 before the
     /// first step.
     size_t scratchMemUsage() const { return mPeakScratchBytes; }
+    /// @brief Jacobi iterations of the last step's redistance (0 before the
+    /// first step or if nothing was re-solved).
+    int redistanceIterations() const { return mRedistanceIterations; }
+    /// @brief Redistances since construction that stopped at the iteration
+    /// cap (MultiLevelSetRedistance::iterationCap) before reaching the
+    /// tolerance; normally 0.
+    size_t redistanceCapHits() const { return mRedistanceCapHits; }
 
     /// @brief One forward Euler step of at most @a maxDt (world time).
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
@@ -2832,8 +2906,16 @@ private:
     void cleanOrphans(FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze);
     void bandMaintenance(const BoolTreeT& freeze);
     /// Redistance only near the changes recorded since the last redistance.
-    void incrementalRedistance(MultiLevelSetRedistance<MultiLevelSetT>& redist,
+    /// @return the number of Jacobi iterations.
+    int incrementalRedistance(MultiLevelSetRedistance<MultiLevelSetT>& redist,
         const BoolTreeT& freeze);
+#ifdef OPENVDB_ENABLE_ASSERTS
+    /// Debug check: every voxel whose phi (while active), label or activity
+    /// differs from the state after the last redistance is marked dirty.
+    void checkChangesRecorded() const;
+    std::unique_ptr<FloatTreeT> mCheckPhi;
+    std::unique_ptr<LabelTreeT> mCheckLabels;
+#endif
     /// Keep the frozen active voxels of this redistance (Scratch::prevSeeds).
     void rememberSeeds(const BoolTreeT& freeze);
 
@@ -2850,6 +2932,8 @@ private:
     int mGrainSize = 1;
     float mTolerance;
     bool mFullRedistance = false;
+    int mRedistanceIterations = 0;
+    size_t mRedistanceCapHits = 0;
     /// whether the pair was last redistanced by this evolver (incremental
     /// redistancing needs a redistanced state outside the dirty region)
     bool mPrimed = false;
@@ -3504,9 +3588,9 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
     }
 
     // c. redistance: projected and fixed voxels frozen, the rest solved with
-    // signed reflection (the phi floor of protected interfaces holds for
-    // its input and its output). Incrementally, only the leaves near a
-    // change since the last redistance are re-solved.
+    // signed reflection to the tolerance (the phi floor of protected
+    // interfaces holds for its input and its output). Incrementally, only
+    // the leaves near a change since the last redistance are re-solved.
     Scratch& sc = mScratch;
     sc.dirty.touch(phi);
     this->enforcePhiFloor();
@@ -3515,14 +3599,24 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
         redist.setTolerance(mTolerance);
         redist.setGrainSize(mGrainSize);
         if (mFullRedistance || !mPrimed) {
-            redist.redistance(freeze);
+            mRedistanceIterations = redist.redistance(freeze);
         } else {
-            this->incrementalRedistance(redist, freeze);
+#ifdef OPENVDB_ENABLE_ASSERTS
+            this->checkChangesRecorded();
+#endif
+            mRedistanceIterations = this->incrementalRedistance(redist, freeze);
         }
+        if (!redist.converged()) ++mRedistanceCapHits;
         this->rememberSeeds(freeze);
         mPrimed = true;
     }
-    // changes from here on are re-solved at the next step
+#ifdef OPENVDB_ENABLE_ASSERTS
+    mCheckPhi.reset(new FloatTreeT(phi));
+    mCheckLabels.reset(new LabelTreeT(labels));
+#endif
+    // Changes from here on are re-solved at the next step. The values the
+    // redistance just wrote are its output, not changes: they are left
+    // unmarked (marking them would make the whole band dirty every step).
     sc.dirty.reset(phi);
     this->enforcePhiFloor();
 
@@ -3547,16 +3641,16 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
 
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
-void
+int
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::incrementalRedistance(
     MultiLevelSetRedistance<MultiLevelSetT>& redist, const BoolTreeT& freeze)
 {
     using PhiLeafT = typename FloatTreeT::LeafNodeType;
     using MaskT = typename BoolLeafT::NodeMaskType;
     constexpr int kDim = int(PhiLeafT::DIM);
-    const FloatTreeT& phi = mMls.phi()->tree();
+    FloatTreeT& phi = mMls.phi()->tree();
     Scratch& sc = mScratch;
-    tree::LeafManager<const FloatTreeT> leafs(phi);
+    tree::LeafManager<FloatTreeT> leafs(phi);
     const size_t n = leafs.leafCount();
 
     // 1. Voxels that became or stopped being frozen since the last
@@ -3572,13 +3666,18 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::incrementalRedistance(
         *dirtyLeaf |= prev ? now ^ *prev : now;
     });
 
-    // 2. Solve every leaf within maxIter voxels of a dirty voxel (taken at
-    // leaf granularity), the farthest a Jacobi solve carries a change: with
-    // the second-order upwind choice and the monotone update, values depend
-    // on the order in which voxels are reached, not only on the data within
-    // their distance.
-    const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
-    const int reach = (maxIter + kDim - 1) / kDim; // in leaves
+    // 2. Solve every active, non-frozen voxel of the leaves within
+    // halfWidth + 1 voxels of a dirty voxel (taken at leaf granularity, a
+    // superset). Both this solve and the full one iterate to the tolerance,
+    // so each converges to the solution of its Dirichlet data; a band value
+    // (below halfWidth*dx) is a distance along upwind paths that stay within
+    // halfWidth voxels of it, plus one voxel for the second-order stencil.
+    // Outside this region nothing within that distance changed, so the kept
+    // values are already the full solve's. (The monotone second-order update
+    // makes converged values depend on the order voxels are reached as well;
+    // agreement within the tolerance is verified for halfWidth <= 3 only,
+    // see the class documentation.)
+    const int reach = (mMls.halfWidth() + 1 + kDim - 1) / kDim; // in leaves
     std::vector<char> solveLeaf(n, 0);
     forEachIndex(n, [&](size_t i) {
         const Coord o = leafs.leaf(i).origin();
@@ -3594,18 +3693,59 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::incrementalRedistance(
         }
         solveLeaf[i] = dirty;
     });
-    BoolTreeT solve(false);
+    std::vector<PhiLeafT*> leaves;
+    std::vector<MaskT> masks;
     {
-        tree::ValueAccessor<BoolTreeT> solveAcc(solve);
+        tree::ValueAccessor<const BoolTreeT> freezeAcc(freeze);
         for (size_t i = 0; i < n; ++i) {
             if (!solveLeaf[i]) continue;
-            BoolLeafT* m = new BoolLeafT(leafs.leaf(i).origin(), false, false);
-            m->setValueMask(leafs.leaf(i).getValueMask());
-            solveAcc.addLeaf(m);
+            PhiLeafT& leaf = leafs.leaf(i);
+            MaskT m = leaf.getValueMask();
+            if (const BoolLeafT* f = freezeAcc.probeConstLeaf(leaf.origin())) {
+                m -= f->getValueMask();
+            } else if (freezeAcc.isValueOn(leaf.origin())) {
+                continue; // frozen tile
+            }
+            if (m.isOff()) continue;
+            leaves.push_back(&leaf);
+            masks.push_back(m);
         }
     }
-    redist.redistance(freeze, solve);
+    mPeakScratchBytes = std::max(mPeakScratchBytes, sc.memUsage()
+        + vectorBytes(solveLeaf) + vectorBytes(leaves) + vectorBytes(masks));
+    return redist.redistance(freeze, leaves, masks);
 }
+
+
+#ifdef OPENVDB_ENABLE_ASSERTS
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::checkChangesRecorded() const
+{
+    if (!mCheckPhi || !mCheckLabels) return;
+    const FloatTreeT& phi = mMls.phi()->tree();
+    const LabelTreeT& labels = mMls.labels()->tree();
+    tree::ValueAccessor<const FloatTreeT> phiNow(phi), phiThen(*mCheckPhi);
+    tree::ValueAccessor<const LabelTreeT> labNow(labels), labThen(*mCheckLabels);
+    auto check = [&](const Coord& p) {
+        float a = 0.0f, b = 0.0f;
+        const bool onA = phiThen.probeValue(p, a), onB = phiNow.probeValue(p, b);
+        if (onA == onB && (!onA || a == b) && labThen.getValue(p) == labNow.getValue(p)) return;
+        const auto* m = mScratch.dirty.probe(LeafMasks::originOf(p));
+        OPENVDB_ASSERT_MESSAGE(m && m->isOn(BoolLeafT::coordToOffset(p)),
+            "incremental redistance: a changed voxel is not marked dirty");
+    };
+    auto visit = [&](const auto& t) {
+        for (auto leaf = t.cbeginLeaf(); leaf; ++leaf) {
+            for (Index n = 0; n < BoolLeafT::SIZE; ++n) check(leaf->offsetToGlobalCoord(n));
+        }
+    };
+    visit(phi);
+    visit(*mCheckPhi);
+    visit(labels);
+    visit(*mCheckLabels);
+}
+#endif
 
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
