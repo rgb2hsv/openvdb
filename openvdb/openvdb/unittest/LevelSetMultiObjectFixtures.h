@@ -328,7 +328,8 @@ struct Tornado
 
     /// @brief Run the tornado schedule on @a m: advection weight 1, curvature
     /// weight 0.01, chunks of 2 until >= 4 contact pairs (capped at t = 40),
-    /// then two more chunks.
+    /// then two more chunks to t2, then further chunks to 1.5 * t2 (first
+    /// contact at t = 24: t2 = 28, end t = 42).
     /// @details perChunk(t, steps, pairs, afterContact) runs after every
     /// chunk (afterContact: chunks completed after the first chunk with
     /// >= 4 pairs, -1 before); returning false stops the run.
@@ -347,13 +348,15 @@ struct Tornado
         steps = 0;
         tContact = -1.0;
         int after = -1;
-        while (after < 2) {
+        double tEnd = -1.0; // 1.5 x the time two chunks after first contact
+        while (after < 2 || t < tEnd - 1e-9) {
             if (after < 0 && t >= tCap - 1e-9) break;
-            steps += lsmo.advect(t, t + chunk);
-            t += chunk;
+            const double t1 = tEnd > 0.0 ? std::min(t + chunk, tEnd) : t + chunk;
+            steps += lsmo.advect(t, t1);
+            t = t1;
             const auto pairs = contactPairs(m);
             if (after >= 0) {
-                ++after;
+                if (++after == 2) tEnd = 1.5 * t;
             } else if (pairs.size() >= 4) {
                 after = 0;
                 tContact = t;
