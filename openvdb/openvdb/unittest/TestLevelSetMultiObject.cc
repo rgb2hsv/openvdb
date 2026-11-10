@@ -1590,7 +1590,7 @@ namespace {
 // Smooth test fields evaluated at world positions, on a box of voxels of
 // @a xform (index range [-26, 26]^3, background zero).
 FloatGrid::Ptr
-makePressureField(const math::Transform::Ptr& xform)
+makePressureField(const math::Transform::Ptr& xform, double dx)
 {
     FloatGrid::Ptr g = FloatGrid::create(0.0f);
     g->setTransform(xform);
@@ -1598,7 +1598,7 @@ makePressureField(const math::Transform::Ptr& xform)
     for (int i = -26; i <= 26; ++i)
         for (int j = -26; j <= 26; ++j)
             for (int k = -26; k <= 26; ++k) {
-                const Vec3d w = xform->indexToWorld(Coord(i, j, k));
+                const Vec3d w = xform->indexToWorld(Coord(i, j, k)) / dx;
                 acc.setValue(Coord(i, j, k),
                     float(0.8 + 0.5 * std::sin(0.3 * w.x()) + 0.3 * std::cos(0.2 * w.y())
                           - 0.1 * w.z() / 26.0));
@@ -1607,7 +1607,7 @@ makePressureField(const math::Transform::Ptr& xform)
 }
 
 Vec3SGrid::Ptr
-makeVelocityField(const math::Transform::Ptr& xform)
+makeVelocityField(const math::Transform::Ptr& xform, double dx)
 {
     Vec3SGrid::Ptr g = Vec3SGrid::create(Vec3f(0.0f));
     g->setTransform(xform);
@@ -1615,7 +1615,7 @@ makeVelocityField(const math::Transform::Ptr& xform)
     for (int i = -26; i <= 26; ++i)
         for (int j = -26; j <= 26; ++j)
             for (int k = -26; k <= 26; ++k) {
-                const Vec3d w = xform->indexToWorld(Coord(i, j, k));
+                const Vec3d w = xform->indexToWorld(Coord(i, j, k)) / dx;
                 acc.setValue(Coord(i, j, k),
                     Vec3f(float(0.8 + 0.2 * std::sin(0.2 * w.y())),
                           float(0.3 * std::cos(0.15 * w.x())),
@@ -1628,18 +1628,18 @@ makeVelocityField(const math::Transform::Ptr& xform)
 // translated by @a shift voxels from the pair's; @a force selects the
 // BoxSampler path.
 MLS::Ptr
-runFieldScenario(const Vec3d& shift, bool force)
+runFieldScenario(const Vec3d& shift, bool force, double dx = 1.0)
 {
-    auto m = makeSphere(8.0);
+    auto m = makeSphere(8.0 * dx, Vec3d(0.0), dx);
     math::Transform::Ptr xf = m->phi()->transform().copy();
     xf->postTranslate(shift * m->voxelSize());
     Forces forces;
     forces.setForceSampling(force);
-    forces.setPressure(makePressureField(xf), 1.0f);
-    forces.setAdvection(makeVelocityField(xf), 1.0f);
+    forces.setPressure(makePressureField(xf, dx), 1.0f);
+    forces.setAdvection(makeVelocityField(xf, dx), 1.0f);
     forces.setCurvatureWeight(0.1f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-    lsmo.advect(0.0, 3.0);
+    lsmo.advect(0.0, 3.0 * dx);
     return m;
 }
 
@@ -1683,6 +1683,15 @@ TEST_F(TestLevelSetMultiObject, FieldDirectReadMatchesSampler)
     auto mis = runFieldScenario(shift, false);
     auto misSampled = runFieldScenario(shift, true);
     EXPECT_EQ(bitDifferences(*mis, *misSampled), Index64(0));
+    // the translated field really takes the sampler path: it differs from
+    // the aligned (direct) result
+    EXPECT_GT(bitDifferences(*mis, *direct), Index64(0));
+
+    // non-unit voxel size: worldToIndex(indexToWorld(c)) must round-trip
+    auto direct1 = runFieldScenario(Vec3d(0.0), false, 0.1);
+    auto sampled1 = runFieldScenario(Vec3d(0.0), true, 0.1);
+    ASSERT_FALSE(direct1->phi()->tree().empty());
+    EXPECT_EQ(bitDifferences(*direct1, *sampled1), Index64(0));
 }
 
 TEST_F(TestLevelSetMultiObject, FixedLabels)
