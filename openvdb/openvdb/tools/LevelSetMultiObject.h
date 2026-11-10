@@ -5,7 +5,8 @@
 ///
 /// @brief Multi-object level sets: evolution of several disjoint objects
 /// (and their contacts) by multi-object geodesic active contours (MOGAC)
-/// on a single unsigned distance grid paired with an integer label grid.
+/// on a single unsigned distance grid paired with an integer label grid,
+/// following Lucas, Kazhdan and Taylor, MICCAI 2012 (see References below).
 ///
 /// @details Provides the MultiLevelSet data holder (factories fromLabelGrid
 /// and fromSignedGrids, and the second-order per-label signed distance
@@ -53,10 +54,11 @@
 ///   numbers, used for topology preservation).
 /// - J.-O. Lachaud, A. Montanvert, "Continuous analogs of digital boundaries:
 ///   a topological approach to iso-surfaces", Graphical Models 62(3), 2000.
-/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, "Multi-object geodesic active
-///   contours (MOGAC)".
-/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, "Multi-object spring level sets
-///   (MUSCLE)".
+/// - B. C. Lucas, M. Kazhdan, R. H. Taylor, "Multi-Object Geodesic Active
+///   Contours (MOGAC): How to Represent and Manipulate Multiple Level Sets
+///   with only a Label Mask and Distance Field", Medical Image Computing and
+///   Computer Assisted Intervention (MICCAI), 2012. This tool implements the
+///   representation and evolution described in this paper.
 
 #ifndef OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED
 #define OPENVDB_TOOLS_LEVEL_SET_MULTI_OBJECT_HAS_BEEN_INCLUDED

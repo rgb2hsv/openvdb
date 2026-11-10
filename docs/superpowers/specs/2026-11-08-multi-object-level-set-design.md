@@ -564,9 +564,10 @@ Contouring tests (`TestLevelSetMultiObjectMesh.cc`):
 
 ## 10. References
 
-- B. C. Lucas, M. Kazhdan, R. H. Taylor: the MOGAC (multi-object geodesic
-  active contours) and MUSCLE (multi-object spring level sets) papers.
-  Exact venue/year to be filled in by the author before upstreaming.
+- B. C. Lucas, M. Kazhdan, R. H. Taylor, "Multi-Object Geodesic Active
+  Contours (MOGAC): How to Represent and Manipulate Multiple Level Sets with
+  only a Label Mask and Distance Field," Medical Image Computing and Computer
+  Assisted Intervention (MICCAI), 2012. This feature implements that paper.
 - G. Russo, P. Smereka, "A remark on computing distance functions," JCP 2000.
 - D. Chopp, "Some improvements of the fast marching method," SIAM J. Sci.
   Comput. 2001.
