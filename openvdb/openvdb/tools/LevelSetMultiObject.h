@@ -166,10 +166,10 @@ public:
     /// @brief Build a multi-object level set from a grid of labels.
     /// @details The label of a voxel is @a labels' value there (active or
     /// not); label 0 is background. Interface voxels (a voxel with a face
-    /// neighbour of a different label) are searched among the active voxels
-    /// of @a labels and their face neighbours and get phi = 0.5*dx (the voxel
+    /// neighbor of a different label) are searched among the active voxels
+    /// of @a labels and their face neighbors and get phi = 0.5*dx (the voxel
     /// face midpoint). They are kept frozen while the rest of the band
-    /// (interface voxels dilated by @a halfWidth over 26-neighbours) is
+    /// (interface voxels dilated by @a halfWidth over 26-neighbors) is
     /// redistanced; the interface values are not re-estimated with a subcell
     /// fix, because that gradient estimate needs a distance field, not this
     /// voxel staircase. Voxels left with phi >= halfWidth*dx are deactivated.
@@ -189,17 +189,17 @@ public:
     /// outside every object. At each voxel the label is argmin psi (ties to
     /// the smaller label) and phi = (v_b - v_a)/2 for the two smallest values
     /// v_a <= v_b, so phi = |psi_l| near an isolated object. Candidates are
-    /// the union of the input active topologies and their face neighbours;
+    /// the union of the input active topologies and their face neighbors;
     /// the band is the interface voxels dilated by @a halfWidth
-    /// (26-neighbours), then reinitialized (interface voxels re-estimated
+    /// (26-neighbors), then reinitialized (interface voxels re-estimated
     /// with the Russo-Smereka subcell fix, the rest of the band solved from
     /// them; see MultiLevelSetRedistance::reinitialize) and trimmed to
     /// phi < halfWidth*dx. Inactive tiles and voxels kept in the label tree
     /// hold the label of the region they lie in, so the label of a region's
-    /// interior is known just outside the band. Inactive tiles are labelled
+    /// interior is known just outside the band. Inactive tiles are labeled
     /// by the argmin at the tile origin, which is exact for disjoint inputs;
     /// where inputs overlap inside a tile, only voxels in leaves (of the
-    /// band, its face shell or an input) are labelled per voxel.
+    /// band, its face shell or an input) are labeled per voxel.
     /// @param grainSize TBB grain size in leaves; zero or negative runs
     /// serially. The result does not depend on it.
     /// @throw ValueError if the map is empty, a grid is null or not a
@@ -232,7 +232,7 @@ public:
     /// where the distance field itself is not smooth.
     /// @details A voxel is inside if its label (active or not; inactive
     /// voxels keep the label of the region they lie in) equals @a label.
-    /// Seeds are the active phi voxels with a face neighbour on the other
+    /// Seeds are the active phi voxels with a face neighbor on the other
     /// side of that region; they keep their phi, which is already the
     /// distance to the region's boundary (re-estimating it with a subcell
     /// fix would move the interface, since that fix is not a fixed point of
@@ -301,8 +301,8 @@ public:
     }
 
     /// @brief Dilate the active topology of both trees by @a iterations
-    /// face-neighbour steps. New phi voxels get the background value; new
-    /// label voxels copy the label of the active face neighbour with the
+    /// face-neighbor steps. New phi voxels get the background value; new
+    /// label voxels copy the label of the active face neighbor with the
     /// smallest phi.
     void dilate(int iterations)
     {
@@ -337,7 +337,7 @@ public:
     }
 
     /// @brief Erode the active topology of both trees by @a iterations
-    /// face-neighbour steps, then call pruneInactive().
+    /// face-neighbor steps, then call pruneInactive().
     void erode(int iterations)
     {
         tools::erodeActiveValues(mPhi->tree(), iterations, NN_FACE, IGNORE_TILES);
@@ -414,7 +414,7 @@ private:
 
 namespace lsmo_internal {
 
-/// Face-neighbour offsets, ordered (-x, +x, -y, +y, -z, +z).
+/// Face-neighbor offsets, ordered (-x, +x, -y, +y, -z, +z).
 inline const Coord* faceOffsets()
 {
     static const Coord offs[6] = {
@@ -433,15 +433,15 @@ void forEachLeafRange(LeafManagerT& leafs, int grainSize, const BodyT& body)
 }
 
 /// @brief Interface seeding over the active voxels of @a out.
-/// @details A voxel p is a seed if differs(p, q) holds for some face neighbour
+/// @details A voxel p is a seed if differs(p, q) holds for some face neighbor
 /// q (active or not). Its value is the Russo-Smereka subcell fix (Russo &
-/// Smereka 2000; analysed by du Chene, Min & Gibou 2008) applied to the
-/// signed field psi of p's side: psi = -phi at p and at neighbours q with
-/// !differs(p, q), +phi at neighbours with differs(p, q). Per axis
+/// Smereka 2000; analyzed by du Chene, Min & Gibou 2008) applied to the
+/// signed field psi of p's side: psi = -phi at p and at neighbors q with
+/// !differs(p, q), +phi at neighbors with differs(p, q). Per axis
 /// Delta_i = max(|psi(+1) - psi(-1)|/2, |psi(+1) - psi(0)|, |psi(0) - psi(-1)|,
 /// 1e-6*dx) / dx and the seed is |psi_p| / sqrt(sum_i Delta_i^2); terms that
-/// involve an inactive neighbour are left out (only band edges of finite
-/// domains have them). A seed with no active face neighbour q with
+/// involve an inactive neighbor are left out (only band edges of finite
+/// domains have them). A seed with no active face neighbor q with
 /// differs(p, q) keeps its value (Delta could collapse to epsilon), and seed
 /// values are clamped to the snapshot background.
 /// All phi values are read from @a snapshot, so the result does not depend
@@ -476,8 +476,8 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
             auto* maskLeaf = seedMask.probeLeaf(leaf.origin());
             for (auto it = leaf.beginValueOn(); it; ++it) {
                 const Coord p = it.getCoord();
-                // psi at the six face neighbours, signed relative to p's side;
-                // inactive neighbours are left out of the gradient.
+                // psi at the six face neighbors, signed relative to p's side;
+                // inactive neighbors are left out of the gradient.
                 double psi[6];
                 bool on[6], seed = false, otherOn = false;
                 for (int f = 0; f < 6; ++f) {
@@ -563,7 +563,7 @@ inline double solveGodunov(double* abar, double* coef, int n, double dx)
 }
 
 /// One Jacobi update of the outer-layer solver at @a p (current value
-/// @a old) from its active face neighbours; see solveOuterLayers().
+/// @a old) from its active face neighbors; see solveOuterLayers().
 template<typename FloatAccT, typename SeedAccT, typename DiffersOp>
 inline float jacobiUpdate(const Coord& p, float old, FloatAccT& acc, SeedAccT& seedAcc,
     DiffersOp& op, double dx, bool signedReflection)
@@ -613,12 +613,12 @@ inline float jacobiUpdate(const Coord& p, float old, FloatAccT& acc, SeedAccT& s
 /// Dirichlet data: second-order one-sided upwind differences (Chopp 2001)
 /// where two same-side upwind values are available (the outer one, q2, with
 /// !differs(p, q2) and strictly smaller than the inner one) and first order
-/// otherwise. Inactive neighbours are not used. Iteration stops when
+/// otherwise. Inactive neighbors are not used. Iteration stops when
 /// max|delta phi| < @a tolerance, after @a maxIter iterations, or on
 /// interrupt; voxels left unreached get the background of @a phi.
 /// With @a signedReflection (used by the evolver, which freezes only the
-/// voxels it just projected and must re-solve their other neighbours on both
-/// sides of a moving interface) a face neighbour q of p
+/// voxels it just projected and must re-solve their other neighbors on both
+/// sides of a moving interface) a face neighbor q of p
 /// contributes +phi_q if !differs(p, q), -phi_q if differs(p, q) and q is a
 /// seed, and nothing otherwise; the second-order term then also needs q on
 /// p's side, and results are clamped to >= 0. This is exact for planar
@@ -849,7 +849,7 @@ int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTr
 ///
 /// @details Restores phi = distance to the voxel's own label boundary over
 /// the active band while keeping the interface fixed:
-/// -# Interface voxels (an active voxel with a face neighbour, active or
+/// -# Interface voxels (an active voxel with a face neighbor, active or
 ///    not, of a different label) are frozen. redistance() keeps their
 ///    current values, so repeated calls never move a crossing (use it every
 ///    evolution step). reinitialize() first reseeds them with the
@@ -861,7 +861,7 @@ int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTr
 ///    iteration, using second-order one-sided upwind differences (Chopp 2001)
 ///    where two same-side upwind values are available (the outer one with
 ///    p's label and strictly smaller than the inner one) and first order
-///    otherwise. Inactive neighbours are not used. Iteration stops when
+///    otherwise. Inactive neighbors are not used. Iteration stops when
 ///    max|delta phi| falls below the tolerance or after
 ///    ceil(halfWidth*sqrt(3)) + 2 iterations.
 ///
@@ -871,15 +871,15 @@ int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTr
 /// (halfWidth*dx); deactivating such voxels is left to band maintenance.
 ///
 /// @pre The label tree holds the correct (deep-interior) label at the
-/// inactive face neighbours of the band (inactive label voxels keep the
+/// inactive face neighbors of the band (inactive label voxels keep the
 /// label of the region they lie in, see MultiLevelSet). A band-edge voxel
-/// whose inactive neighbour reads the label background instead becomes a
+/// whose inactive neighbor reads the label background instead becomes a
 /// spurious interface voxel.
 ///
 /// @note FastSweeping.h was evaluated for reuse and rejected: its
 /// update is first-order Godunov only, it sweeps in place (Gauss-Seidel), and
 /// its boundary voxels are found from sign changes of the input field (or a
-/// mask) through private initialisers, so an all-positive field with
+/// mask) through private initializers, so an all-positive field with
 /// externally frozen seeds and a second-order stencil cannot be expressed
 /// without modifying that header. A dedicated band Jacobi kernel is used.
 template<typename MultiLevelSetT, typename InterruptT = util::NullInterrupter>
@@ -914,9 +914,9 @@ public:
     /// @brief Redistance with only the active voxels of @a freeze kept
     /// (used by the evolver after each step, with the voxels it projected
     /// frozen). Every other active voxel solves |grad phi| = 1 as above,
-    /// with signed reflection: a face neighbour of the same label gives
-    /// +phi, a frozen face neighbour of a different label gives -phi, other
-    /// neighbours of a different label are ignored. Unlike redistance(),
+    /// with signed reflection: a face neighbor of the same label gives
+    /// +phi, a frozen face neighbor of a different label gives -phi, other
+    /// neighbors of a different label are ignored. Unlike redistance(),
     /// voxels next to a label change that are not in @a freeze are solved,
     /// not frozen. Unlike redistance(), the iteration runs until
     /// max|delta phi| falls below the tolerance (capped at iterationCap()
@@ -1000,7 +1000,7 @@ public:
     bool converged() const { return mConverged; }
 
     /// @brief Interface seeding only, for per-label reconstruction.
-    /// @details An active voxel p of @a out is a seed if some face neighbour
+    /// @details An active voxel p of @a out is a seed if some face neighbor
     /// q has isInside(p) != isInside(q). Its value is the Russo-Smereka
     /// subcell distance |psi_p| / |grad psi| (see lsmo_internal::seedInterface)
     /// of psi = -phi where isInside, +phi elsewhere, with phi from
@@ -1099,15 +1099,15 @@ struct LabelRegionDiffers
 ///   of the boundary of L(q)'s region;
 /// - upper: psi(q) <= |q - p| - phi_p for every region voxel p, since the
 ///   ball of radius phi_p about p lies inside the region.
-/// Every outside seed with a face neighbour (active or not) of a third label
+/// Every outside seed with a face neighbor (active or not) of a third label
 /// (neither @a label nor L(q)) is rebuilt by a local Godunov extension of
-/// psi: per axis the smallest known psi among the two face neighbours
+/// psi: per axis the smallest known psi among the two face neighbors
 /// (-phi at region seeds, +value at other outside seeds and at rebuilt seeds
 /// once solved), then sum_i (psi - a_i)^2 = dx^2, clamped to
 /// [phi_q, min(B, background)] with B the upper bound over the active region
-/// voxels p within the 5x5x5 neighbourhood of q. Jacobi sweeps over just
+/// voxels p within the 5x5x5 neighborhood of q. Jacobi sweeps over just
 /// these seeds until no value changes by more than 1e-4*dx (at most 8). A
-/// seed with no known neighbour keeps phi_q. psi is not smooth at junction
+/// seed with no known neighbor keeps phi_q. psi is not smooth at junction
 /// lines, so the rebuilt values are only first-order accurate there; seeds
 /// whose phi_q is already exact stay within the interval but may move.
 /// Runs serially (junction seeds are few).
@@ -1194,7 +1194,7 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
 }
 
 /// @brief Factory sampler for MultiLevelSet::fromLabelGrid: the label is the
-/// input value; phi is 0.5*dx at voxels with a face neighbour of a different
+/// input value; phi is 0.5*dx at voxels with a face neighbor of a different
 /// label and @a bg elsewhere. Copied once per task.
 template<typename LabelTreeT>
 struct LabelGridSampler
@@ -1274,9 +1274,9 @@ private:
 /// @details Factory back end. @a labels holds the inactive structure (tiles
 /// and leaves) whose values must carry the deep-interior labels; @a sampler
 /// provides label(p) and the initial phi(p) anywhere.
-/// -# Interface voxels: voxels of @a candidates with a face neighbour of a
+/// -# Interface voxels: voxels of @a candidates with a face neighbor of a
 ///    different sampled label.
-/// -# Band: interface voxels dilated by @a halfWidth (26-neighbours); every
+/// -# Band: interface voxels dilated by @a halfWidth (26-neighbors); every
 ///    label leaf touched by the band or its face shell gets the sampled
 ///    label at all its voxels, active exactly on the band.
 /// -# phi mirrors the label tree's structure; band voxels get the sampled
@@ -1429,7 +1429,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     tools::dilateActiveValues(band, halfWidth, NN_FACE_EDGE_VERTEX, IGNORE_TILES);
     if (halfWidth <= mHalfWidth) band.topologyIntersection(phi);
 
-    // 2. output tree over the band, initialised with phi
+    // 2. output tree over the band, initialized with phi
     typename FloatTreeT::Ptr out(new FloatTreeT(band, bg, TopologyCopy()));
     {
         tree::LeafManager<FloatTreeT> leafs(*out);
@@ -1603,7 +1603,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
 namespace lsmo_internal {
 
 /// @brief Index of offset (i,j,k) in the 19-point layout of
-/// math::CurvatureStencil (0 centre, 1-6 faces, 7-18 edges), or -1.
+/// math::CurvatureStencil (0 center, 1-6 faces, 7-18 edges), or -1.
 constexpr int
 stencilIndex(int i, int j, int k)
 {
@@ -1630,7 +1630,7 @@ stencilIndex(int i, int j, int k)
 /// All derivatives are in world units. Not thread-safe; use one per thread.
 ///
 /// The stencil also samples auxiliary grids (velocity, pressure, ...) at its
-/// centre voxel through sampleAtCentre(), which caches the result per centre
+/// center voxel through sampleAtCenter(), which caches the result per center
 /// voxel so that speed functors evaluating several labels at one voxel sample
 /// each field once.
 template<typename MultiLevelSetT>
@@ -1677,7 +1677,7 @@ public:
     float voxelSize() const { return mDx; }
     const math::Transform& transform() const { return mTransform; }
 
-    /// @brief Value of @a grid at the world position of the centre voxel.
+    /// @brief Value of @a grid at the world position of the center voxel.
     /// If the transform of @a grid equals that of the stencil's grids, the
     /// index spaces coincide and the voxel value is read directly (exactly
     /// what BoxSampler returns at an integer index); otherwise, or if
@@ -1686,17 +1686,17 @@ public:
     /// and each grid is read through a value accessor kept by the stencil
     /// (several grids, e.g. per-label fields, are cached side by side).
     /// @a grid must outlive the stencil.
-    float sampleAtCentre(const FloatGrid& grid, bool forceSampling = false) const
+    float sampleAtCenter(const FloatGrid& grid, bool forceSampling = false) const
     {
         return this->sample(grid, mScalarCache, forceSampling);
     }
-    /// @brief Vector-valued version of sampleAtCentre().
-    Vec3f sampleAtCentre(const Vec3SGrid& grid, bool forceSampling = false) const
+    /// @brief Vector-valued version of sampleAtCenter().
+    Vec3f sampleAtCenter(const Vec3SGrid& grid, bool forceSampling = false) const
     {
         return this->sample(grid, mVectorCache, forceSampling);
     }
 
-    /// @brief psi at offset (i,j,k) from the centre; the 19 points have at
+    /// @brief psi at offset (i,j,k) from the center; the 19 points have at
     /// most two non-zero offsets.
     template<int i, int j, int k>
     float getValue() const
@@ -1758,7 +1758,7 @@ public:
 private:
     /// Cache entry of a sampled grid: the grid, a value accessor to its
     /// tree, whether the grid shares the stencil's transform, and the value
-    /// at the current centre voxel.
+    /// at the current center voxel.
     template<typename GridT>
     struct FieldEntry
     {
@@ -1840,7 +1840,7 @@ private:
 /// thread-safe.
 /// @note Unlike the reference implementation, the curvature term uses the
 /// curvature of the interface, k_x/(1 - psi*k_x), rather than the mean
-/// curvature k_x of the level set through the voxel centre (falling back to
+/// curvature k_x of the level set through the voxel center (falling back to
 /// k_x when |psi*k_x| >= 0.5), which makes the evaluation point exact for a
 /// sphere. It does not remove the measured bias of mean curvature flow (a
 /// sphere shrinks about 3.5% too fast; the correction changes r^2 at t = 20
@@ -1957,7 +1957,7 @@ public:
             kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
         }
 
-        // fields are sampled at the stencil centre (== ijk), once per voxel
+        // fields are sampled at the stencil center (== ijk), once per voxel
         float advection = 0.0f;
         const Vec3SGrid* advField = mAdvection.get();
         float advWeight = mAdvectionWeight;
@@ -1969,7 +1969,7 @@ public:
             }
         }
         if (advField) {
-            const Vec3f vel = s.sampleAtCentre(*advField, mForceSampling);
+            const Vec3f vel = s.sampleAtCenter(*advField, mForceSampling);
             for (int a = 0; a < 3; ++a) {
                 const float f = advWeight * vel[a];
                 if (f > 0.0f) advection += f * dneg[a];
@@ -1979,7 +1979,7 @@ public:
 
         float pressure = 0.0f;
         if (mPressure) {
-            const float force = mPressureWeight * s.sampleAtCentre(*mPressure, mForceSampling);
+            const float force = mPressureWeight * s.sampleAtCenter(*mPressure, mForceSampling);
             float gsPos = 0.0f, gsNeg = 0.0f;
             for (int a = 0; a < 3; ++a) {
                 const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
@@ -2033,10 +2033,10 @@ enum class MultiObjectConnectivity { FG26_BG6, FG6_BG26, FG18_BG6, FG6_BG18 };
 
 namespace lsmo_internal {
 
-/// Adjacency tables of the 3x3x3 neighbourhood, bit i <-> (dx,dy,dz) with
+/// Adjacency tables of the 3x3x3 neighborhood, bit i <-> (dx,dy,dz) with
 /// i = (dx+1) + 3(dy+1) + 9(dz+1): adj[a][i] holds the positions other than
-/// the centre that are a-adjacent to i (a = 0: 6, 1: 18, 2: 26), and
-/// star[a] the a-neighbours of the centre (N*_6, N*_18, N*_26).
+/// the center that are a-adjacent to i (a = 0: 6, 1: 18, 2: 26), and
+/// star[a] the a-neighbors of the center (N*_6, N*_18, N*_26).
 struct SimplePointTables
 {
     uint32_t adj[3][27];
@@ -2044,7 +2044,7 @@ struct SimplePointTables
     SimplePointTables()
     {
         auto coord = [](int i) { return Coord(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1); };
-        const uint32_t centre = uint32_t(1) << 13;
+        const uint32_t center = uint32_t(1) << 13;
         for (int a = 0; a < 3; ++a) {
             star[a] = 0;
             for (int i = 0; i < 27; ++i) {
@@ -2054,7 +2054,7 @@ struct SimplePointTables
                     const int d2 = d.x() * d.x() + d.y() * d.y() + d.z() * d.z();
                     if (d2 >= 1 && d2 <= a + 1) adj[a][i] |= uint32_t(1) << j;
                 }
-                adj[a][i] &= ~centre;
+                adj[a][i] &= ~center;
             }
             star[a] = adj[a][13];
         }
@@ -2088,9 +2088,9 @@ inline int countComponents(uint32_t set, int a)
     return count;
 }
 
-/// Bertrand-Malandain topological number T_n(x, X) of the centre x for the
-/// positions @a X of the 26-neighbourhood (centre excluded): the number of
-/// n-components of the geodesic neighbourhood G_n(x, X) = N^k_n(x, X), with
+/// Bertrand-Malandain topological number T_n(x, X) of the center x for the
+/// positions @a X of the 26-neighborhood (center excluded): the number of
+/// n-components of the geodesic neighborhood G_n(x, X) = N^k_n(x, X), with
 /// N^1_n = N*_n(x) & X and N^k_n = union of N_n(y) & N*_26(x) & X over y in
 /// N^{k-1}_n; k = 2 for 6 (paired with 26) and 18, k = 3 for 6+ (6 paired
 /// with 18), k = 1 for 26. @a a is 0, 1, 2 for n = 6, 18, 26.
@@ -2109,17 +2109,17 @@ inline int topologicalNumber(uint32_t X, int a, int k)
     return countComponents(g, a);
 }
 
-/// @brief Whether the centre of a 3x3x3 neighbourhood is a simple point of
+/// @brief Whether the center of a 3x3x3 neighborhood is a simple point of
 /// the foreground region @a inMask (27 bits, bit i <-> (dx,dy,dz) with
-/// i = (dx+1) + 3(dy+1) + 9(dz+1); the centre bit is ignored) under the
+/// i = (dx+1) + 3(dy+1) + 9(dz+1); the center bit is ignored) under the
 /// adjacency pair @a conn: adding or removing it changes neither the
 /// region's nor its complement's topology (no new or lost components,
 /// tunnels or cavities). Decided by T_fg = 1 and T_bg = 1 (Bertrand and
 /// Malandain 1994).
 inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 {
-    const uint32_t all = (uint32_t(1) << 27) - 1, centre = uint32_t(1) << 13;
-    const uint32_t fg = inMask & all & ~centre, bg = ~inMask & all & ~centre;
+    const uint32_t all = (uint32_t(1) << 27) - 1, center = uint32_t(1) << 13;
+    const uint32_t fg = inMask & all & ~center, bg = ~inMask & all & ~center;
     switch (conn) {
         case MultiObjectConnectivity::FG26_BG6:
             return topologicalNumber(fg, 2, 1) == 1 && topologicalNumber(bg, 0, 2) == 1;
@@ -2141,19 +2141,19 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///
 /// @details One forward Euler step of step() does:
 /// -# <b>Projected set and candidates.</b> Every active voxel that is not of
-///    a fixed label and has phi <= 0.5*dx or a face neighbour (active or
+///    a fixed label and has phi <= 0.5*dx or a face neighbor (active or
 ///    not) of a different label is projected: these are the only voxels
 ///    whose label can change in one step (see Time step), so the update is
 ///    restricted to them. Its candidates are its own label and the labels
-///    of its face neighbours, minus fixed labels. Label 0 is passive: it is a
-///    candidate only if it is the voxel's or a face neighbour's label or the
+///    of its face neighbors, minus fixed labels. Label 0 is passive: it is a
+///    candidate only if it is the voxel's or a face neighbor's label or the
 ///    voxel touches a fixed label, and its value is the complement
 ///    v_0 = -min v_l over the non-zero candidates, so object/background
 ///    interfaces move at the object's full speed (and a voxel next to a
 ///    retreating fixed label falls back to label 0). The speed functor is
 ///    called (on time-n data through a LabelAwareStencil) only for non-zero
 ///    candidates; labels with isActive() false get dpsi/dt = +0.999, so
-///    they slowly retreat from their neighbours.
+///    they slowly retreat from their neighbors.
 /// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx)),
 ///    so an interface moves at most half a voxel per step. The
 ///    half-voxel cap is what makes the projected set sufficient: since
@@ -2168,7 +2168,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    until both trees swap buffers together).
 /// -# <b>Topology preservation</b> (opt-in): with
 ///    setTopologyPreservingLabels(), a projected change a -> b that involves
-///    a protected label is deferred and applied in 27 coloured passes
+///    a protected label is deferred and applied in 27 colored passes
 ///    (coordinates mod 3) only if the voxel is a simple point
 ///    (lsmo_internal::isSimplePoint, under setConnectivity()) of every
 ///    protected label in {a, b} on the labels as updated by earlier passes;
@@ -2177,11 +2177,11 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    region except by simple changes, so its components, cavities and
 ///    tunnels are preserved. With no protected label nothing changes.
 /// -# <b>Orphan cleanup</b>: a voxel whose label occurs nowhere in its
-///    26-neighbourhood takes the label and phi of its smallest-phi active
-///    neighbour (fixed labels excluded) and is redistanced (not frozen).
+///    26-neighborhood takes the label and phi of its smallest-phi active
+///    neighbor (fixed labels excluded) and is redistanced (not frozen).
 /// -# <b>Band maintenance</b>: after the buffer swap, inactive face
-///    neighbours of active voxels with phi < (halfWidth-1)*dx are activated
-///    (phi = background, label of the smallest-phi active face neighbour);
+///    neighbors of active voxels with phi < (halfWidth-1)*dx are activated
+///    (phi = background, label of the smallest-phi active face neighbor);
 ///    MultiLevelSetRedistance::redistance(freeze) keeps the projected voxels
 ///    and the fixed-label voxels and solves all others with signed
 ///    reflection, so voxels the interface just passed are re-solved from
@@ -2203,7 +2203,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    with setFullRedistance(true).
 ///    The halfWidth + 1 region is a heuristic, not a proof of equivalence:
 ///    the Jacobi update only lowers values while its second-order upwind
-///    term can raise a value when a neighbour drops, so a converged result
+///    term can raise a value when a neighbor drops, so a converged result
 ///    also depends on the order in which voxels are reached (which the kept
 ///    values change), and the incremental stopping test covers only the
 ///    re-solved leaves while the full one covers the whole band. In the
@@ -2229,7 +2229,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// activated and get phi = min(phi, psi) (frozen if psi <= dx). Claims on
 /// label 0 and on unprotected labels always win; a claim on a voxel of a
 /// topology-preserving label goes through the same simple-point test (27
-/// coloured passes, setConnectivity() rule) as other protected changes,
+/// colored passes, setConnectivity() rule) as other protected changes,
 /// and a rejected claim leaves the voxel with the protected label (phi
 /// 1e-3*dx, frozen): the obstacle lacks that voxel this step and is
 /// re-stamped from its motion in the next. Such trapped voxels are then
@@ -2325,7 +2325,7 @@ public:
     }
     /// @brief Minimum phi, as a fraction of the voxel size, kept at the
     /// active voxels of topology-preserving labels and at their face
-    /// neighbours across a protected interface, after every change the
+    /// neighbors across a protected interface, after every change the
     /// evolver makes (only while some label is topology-preserving; other
     /// evolutions, the factories and extraction are unaffected). It keeps
     /// interface vertices of protected labels apart, so their meshes stay
@@ -2358,7 +2358,7 @@ public:
     /// the object in its rest pose (world space, BoxSampler-interpolated,
     /// any transform) and motion(t) a rigid transform in the row-vector
     /// convention of math::Mat4d::transform (x_t = motion(t).transform(x)).
-    /// See the class documentation. Voxels already labelled @a label that
+    /// See the class documentation. Voxels already labeled @a label that
     /// lie in or near the object at the first step are re-stamped by it.
     /// Kinematic voxels never take voxels of fixed or other kinematic
     /// labels, nor change their phi.
@@ -2488,7 +2488,7 @@ private:
 
     /// A projected label change involving a protected label.
     struct Deferred { Coord ijk; int32_t from, to; float phi; };
-    /// An orphan relabelled from its smallest-phi neighbour.
+    /// An orphan relabeled from its smallest-phi neighbor.
     struct Fix { Coord ijk; LabelT label; float phi; };
     /// A band voxel to activate.
     struct Activation { Coord ijk; float phi; LabelT label; };
@@ -2797,7 +2797,7 @@ private:
     void stampKinematic(double t, BoolTreeT& freeze);
 
     /// Whether @a p (own label @a own) is subject to the phi floor: a voxel
-    /// of a protected label or a face neighbour of one.
+    /// of a protected label or a face neighbor of one.
     template<typename AccT>
     bool floorApplies(AccT& lab, const Coord& p, int32_t own) const
     {
@@ -2841,11 +2841,11 @@ private:
     void applyDeferred(const std::vector<std::vector<Deferred>>& deferred,
         FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze);
 
-    /// The 27 coloured simple-point passes of applyDeferred(): each change
+    /// The 27 colored simple-point passes of applyDeferred(): each change
     /// is decided on the labels as updated by the earlier passes, then
     /// @a accept(change) or @a reject(change) is called (serially).
     template<typename AcceptT, typename RejectT>
-    void colouredPasses(const std::vector<std::vector<Deferred>>& deferred,
+    void coloredPasses(const std::vector<std::vector<Deferred>>& deferred,
         const LabelTreeT& labels, const AcceptT& accept, const RejectT& reject) const;
 
     /// Add @a l to the candidates @a c: label 0 and fixed labels only make
@@ -3264,13 +3264,13 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
         }
     }
     if (claims[0].empty()) return;
-    // claims on protected labels: the simple-point test of the coloured
+    // claims on protected labels: the simple-point test of the colored
     // passes; a rejected voxel keeps its protected label (barrier phi)
     phiAcc.clear();
     labAcc.clear();
     maskAcc.clear();
     std::vector<Deferred> trapped;
-    this->colouredPasses(claims, labels,
+    this->coloredPasses(claims, labels,
         [&](const Deferred& c) { claim(c.ijk, c.to, c.phi); },
         [&](const Deferred& c) {
             log.write(phiAcc, labAcc, c.ijk, [&] {
@@ -3354,7 +3354,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
         if (!adds.empty()) {
             std::vector<std::vector<Deferred>> addList(1);
             for (const auto& kv : adds) addList[0].push_back(kv.second);
-            this->colouredPasses(addList, labels,
+            this->coloredPasses(addList, labels,
                 [&](const Deferred& c) {
                     phiAcc.touchLeaf(c.ijk);
                     labAcc.touchLeaf(c.ijk);
@@ -3379,7 +3379,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
             }
         }
         std::set<Coord> claimed;
-        this->colouredPasses(claimList, labels,
+        this->coloredPasses(claimList, labels,
             [&](const Deferred& c) {
                 claim(c.ijk, c.to, c.phi);
                 claimed.insert(c.ijk);
@@ -3454,22 +3454,22 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 template<typename AcceptT, typename RejectT>
 void
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::colouredPasses(
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::coloredPasses(
     const std::vector<std::vector<Deferred>>& deferred, const LabelTreeT& labels,
     const AcceptT& accept, const RejectT& reject) const
 {
-    // 27 coloured passes (coordinates mod 3): changes of one colour have
-    // disjoint 26-neighbourhoods, so they are decided independently (in
+    // 27 colored passes (coordinates mod 3): changes of one color have
+    // disjoint 26-neighborhoods, so they are decided independently (in
     // parallel) on the labels as updated by the earlier passes, then
     // applied. The result does not depend on the thread count.
-    std::vector<Deferred> byColour[27];
+    std::vector<Deferred> byColor[27];
     for (const auto& list : deferred) {
         for (const Deferred& c : list) {
             auto mod3 = [](int v) { return ((v % 3) + 3) % 3; };
-            byColour[mod3(c.ijk.x()) + 3 * mod3(c.ijk.y()) + 9 * mod3(c.ijk.z())].push_back(c);
+            byColor[mod3(c.ijk.x()) + 3 * mod3(c.ijk.y()) + 9 * mod3(c.ijk.z())].push_back(c);
         }
     }
-    for (const std::vector<Deferred>& pass : byColour) {
+    for (const std::vector<Deferred>& pass : byColor) {
         if (pass.empty()) continue;
         std::vector<char> ok(pass.size(), 0);
         forEachIndex(pass.size(), [&](size_t i) {
@@ -3496,7 +3496,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
     ChangeLog log(mScratch.dirty);
-    this->colouredPasses(deferred, labels,
+    this->coloredPasses(deferred, labels,
         [&](const Deferred& c) {
             log.write(phiAcc, labAcc, c.ijk, [&] {
                 phiAcc.setValueOnly(c.ijk, c.phi);
@@ -3522,8 +3522,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
     const float grow = float((mMls.halfWidth() - 1) * dx);
     const Coord* offs = lsmo_internal::faceOffsets();
 
-    // b. activate the inactive face neighbours of voxels with
-    // phi < (halfWidth-1)*dx; label of the smallest-phi active face neighbour
+    // b. activate the inactive face neighbors of voxels with
+    // phi < (halfWidth-1)*dx; label of the smallest-phi active face neighbor
     // (ties to the smaller label). Candidates are collected per leaf in
     // parallel on the unmodified trees, then applied serially in leaf order;
     // the result is the (phi, label) minimum per voxel, so it does not

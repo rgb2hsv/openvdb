@@ -37,7 +37,7 @@ is NOT in scope.
   `hyperbolic(ijk, label, stencil)` (first-order-in-space terms: advection,
   pressure, constant/inactive speeds) and `parabolic(ijk, label, stencil)`
   (curvature). A functor that only provides `operator()` is treated as fully
-  hyperbolic (current behaviour). `MultiObjectForces` provides both.
+  hyperbolic (current behavior). `MultiObjectForces` provides both.
 - `step(maxDt)` with a split functor performs Strang splitting:
   parabolic(dt/2) → hyperbolic(dt) → parabolic(dt/2). The hyperbolic part uses
   dt = min(maxDt, motion cap / max|F_h|); each parabolic half is subcycled with
@@ -68,7 +68,7 @@ is NOT in scope.
 - `setMaxInterfaceMotion(double voxels)`, default 0.5; 1.0 allowed.
 - At 1.0 the projected set grows by one ring (φ ≤ 1.5·dx or within one voxel of
   a different label). Ring-2 voxels receive candidate labels from their
-  26-neighbourhood with ψ_l estimated by the closest-point estimate of A3
+  26-neighborhood with ψ_l estimated by the closest-point estimate of A3
   (not +φ_q, which caused the earlier label race, nor the Lipschitz bound,
   which slowed motion).
 - Gate for making 1.0 the default: ContactNoCascade (probe geometry: no
@@ -110,7 +110,7 @@ is NOT in scope.
 
 - For field-sampled terms (advection velocity, pressure), sample at the
   closest interface point x_Γ = x − ψ·∇ψ/|∇ψ|² (world space) instead of the
-  voxel centre. Curvature keeps the interface correction already in place.
+  voxel center. Curvature keeps the interface correction already in place.
 - Gate: CurvatureFlow / SingleObjectCurvature bias does not get worse; the
   distance property after evolution (ExtractAccuracyAfterEvolution) improves
   or stays within its gate.

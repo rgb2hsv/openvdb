@@ -535,7 +535,7 @@ countFolded(const LabelMesh& m, const MLS& mls, int32_t label, size_t* tubes = n
 // - randomPhi false: the pair built by MultiLevelSet::fromLabelGrid (the
 //   reference random label volumes);
 // - randomPhi true (stress variant): phi set directly over [-2, n+1]^3,
-//   uniform in [0.02, 0.98]*dx at voxels with a differing face neighbour
+//   uniform in [0.02, 0.98]*dx at voxels with a differing face neighbor
 //   and in [1, 2.9]*dx elsewhere, so the vertex on every cell edge sits at
 //   an independent random position (not the zero set of any smooth field).
 MLS::Ptr

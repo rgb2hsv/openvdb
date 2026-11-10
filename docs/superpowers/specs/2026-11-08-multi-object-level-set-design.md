@@ -10,7 +10,7 @@ Port the multi-object geodesic active contour method implemented in wedge
 (`wedge/src/core/geometry/MultiActiveContour3D.cpp`) to OpenVDB as a reusable,
 upstream-quality tool.
 
-The method represents N labelled objects with **one unsigned distance field φ
+The method represents N labeled objects with **one unsigned distance field φ
 paired with one integer label field L**. For any label l the signed distance is
 
     ψ_l(x) = −φ(x)  if L(x) == l
@@ -18,7 +18,7 @@ paired with one integer label field L**. For any label l the signed distance is
 
 The pair is evolved together so that, at any time, an accurate signed distance
 for any label can be reconstructed near that label's boundary. By construction
-the labelled regions partition space: no gaps, no overlaps.
+the labeled regions partition space: no gaps, no overlaps.
 
 ### Success criteria
 
@@ -50,7 +50,7 @@ the labelled regions partition space: no gaps, no overlaps.
 
 Per step, for active voxels with φ ≤ 0.5:
 
-1. Candidate labels = own label plus labels of the 6 face neighbours.
+1. Candidate labels = own label plus labels of the 6 face neighbors.
 2. For each candidate l compute dψ_l/dt from curvature (clamped to ±10),
    upwind pressure and upwind advection, evaluated on ψ_l from the previous
    state. Label 0 (background) has speed 0. Labels without a force index
@@ -101,8 +101,8 @@ Data holder for the pair.
 
 ### 3.2 `LabelAwareStencil<MultiLevelSetT>`
 
-Read-only accessor that, for a centre voxel and a label l, fills a 19-point
-neighbourhood of ψ_l values (6 face + 12 edge + centre) from the *time-n*
+Read-only accessor that, for a center voxel and a label l, fills a 19-point
+neighborhood of ψ_l values (6 face + 12 edge + center) from the *time-n*
 buffers. It exposes the same accessors as `math::SevenPointStencil` /
 `math::GradStencil` (`getValue<i,j,k>()`, `gradient`, `normSqGrad`,
 `meanCurvature`) so `math::` upwind-gradient and curvature operators can be
@@ -144,7 +144,7 @@ Reproduces wedge's force model:
   + κ (clamped) + pressure·|∇ψ| (Godunov upwind on sign of pressure force),
   matching wedge's `pressureAndAdvectionMotion`.
 - Deviation from wedge (ruling R26): the curvature term is evaluated at the
-  interface rather than the voxel centre, κ_Γ = κ_x / (1 − ψ·κ_x) with κ_x
+  interface rather than the voxel center, κ_Γ = κ_x / (1 − ψ·κ_x) with κ_x
   the voxel's mean curvature and ψ its ψ_l (falls back to κ_x when
   |ψ·κ_x| ≥ 0.5), then weighted and clamped as before.
 
@@ -184,7 +184,7 @@ Separate header (section 6). `VolumeToMesh.h` is not modified.
 Forward Euler. All reads from time-n main buffers, writes to aux buffers.
 
 1. **Interface set.** Voxels with φ ≤ 0.5·dx. Candidates = own label ∪ distinct
-   face-neighbour labels. Fixed labels and label 0 participate with speed 0.
+   face-neighbor labels. Fixed labels and label 0 participate with speed 0.
    Inactive labels get speed +0.999 (constant expansion in wedge sign
    convention, i.e. ψ of the *other* labels grows).
 2. **Speeds.** F_l = `speed(ijk, l, stencil)` per (voxel, candidate). Stored per
@@ -194,13 +194,13 @@ Forward Euler. All reads from time-n main buffers, writes to aux buffers.
 4. **Two-smallest projection.** v_l = ψ_l + dt·F_l; label = argmin (ties →
    smaller label); φ = |(v₁ − v₂)/2|, or |v₁| with a single candidate.
    Non-interface voxels copy their time-n values.
-5. **Orphan cleanup.** A voxel whose label does not appear in its 26-neighbourhood
-   takes the label of its smallest-φ neighbour and is flagged for redistancing.
+5. **Orphan cleanup.** A voxel whose label does not appear in its 26-neighborhood
+   takes the label of its smallest-φ neighbor and is flagged for redistancing.
 6. **Band maintenance.**
    a. Swap aux → main for both trees.
    b. Dilate both trees one face layer where any voxel with φ < (halfWidth − 1)·dx
       touches the band edge. New voxels take the label of their active face
-      neighbour with smallest φ; φ = halfWidth·dx.
+      neighbor with smallest φ; φ = halfWidth·dx.
    c. Redistance (section 5).
    d. Deactivate voxels with φ > halfWidth·dx in both trees; `pruneInactive`.
    e. Debug builds: `assert(validate())`.
@@ -219,10 +219,10 @@ Added at the user's request (2026-11-09).
   in {a, b}: removing x from region a and adding x to region b must each leave
   the region's topology unchanged under the connectivity pair. Simplicity is
   decided by the Bertrand–Malandain topological numbers (T_fg = 1 and
-  T_bg = 1 on the 3×3×3 neighbourhood), which preserve both the region and its
+  T_bg = 1 on the 3×3×3 neighborhood), which preserve both the region and its
   complement (no new components, tunnels or cavities).
-- Proposed changes are applied in 27 coloured passes (voxel coordinates mod 3),
-  so no two changes applied in the same pass share a 26-neighbourhood; each
+- Proposed changes are applied in 27 colored passes (voxel coordinates mod 3),
+  so no two changes applied in the same pass share a 26-neighborhood; each
   pass tests simplicity against the labels as updated by earlier passes. The
   result is independent of thread count.
 - A rejected change keeps the voxel's label; its φ is set to 1e-3·dx (a
@@ -241,13 +241,13 @@ keeping the interface fixed.
 
 ### 5.1 Interface seeding (subcell fix)
 
-Voxel p (label a) is an interface voxel if some face neighbour q has label
+Voxel p (label a) is an interface voxel if some face neighbor q has label
 b ≠ a. Its value is the Russo–Smereka subcell fix (Russo & Smereka 2000,
-second order as analysed by du Chéné, Min & Gibou 2008), applied to
-ψ_a over p and its face neighbours: ψ_a = −φ at voxels of label a, +φ
-elsewhere. Terms that involve an inactive neighbour are omitted from Δ_i
+second order as analyzed by du Chéné, Min & Gibou 2008), applied to
+ψ_a over p and its face neighbors: ψ_a = −φ at voxels of label a, +φ
+elsewhere. Terms that involve an inactive neighbor are omitted from Δ_i
 (only band edges of finite domains have them). A seed with no active face
-neighbour of the other label keeps its value, and seed values are clamped to
+neighbor of the other label keeps its value, and seed values are clamped to
 the φ background. Per axis i, with ψ(−1), ψ(0) = ψ_p, ψ(+1) the values along that axis,
 
     Δ_i = max(|ψ(+1) − ψ(−1)|/2, |ψ(+1) − ψ(0)|, |ψ(0) − ψ(−1)|, ε) / dx
@@ -261,17 +261,17 @@ oblique interfaces by up to ≈ 0.35·dx.) For the per-label reconstruction
 
 All seeds are computed from a read-only snapshot of φ so results are order
 independent. Seeds are frozen for 5.2. Correct at triple junctions because any
-different-label neighbour marks a seed and has the opposite sign in ψ_a.
+different-label neighbor marks a seed and has the opposite sign in ψ_a.
 
 ### 5.2 Outer layers
 
 Solve |∇φ| = 1 on non-seed band voxels with seeds as Dirichlet data:
 
 - Second-order one-sided upwind differences (Chopp 2001) where two same-side
-  upwind neighbours with smaller φ exist; first-order Godunov update otherwise.
+  upwind neighbors with smaller φ exist; first-order Godunov update otherwise.
 - Parallel Jacobi iterations over leaves with double buffers until
   max|Δφ| < tolerance (default 1e-4·dx) or ⌈halfWidth·√3⌉ + 2 iterations.
-- Non-seed voxels only have same-label face neighbours, so no label logic is
+- Non-seed voxels only have same-label face neighbors, so no label logic is
   needed here.
 - Implementation step 1 evaluates whether `FastSweeping.h` internals can be
   reused with frozen seeds and an all-positive field; if not, use the
@@ -285,7 +285,7 @@ therefore underestimates ψ_l outside l there.
 `extractSignedDistance(l, halfWidth)`:
 
 1. Build a boolean "is l" mask over the band (dilated by halfWidth if needed).
-2. Seeds are the band voxels with a face neighbour across the l | not-l
+2. Seeds are the band voxels with a face neighbor across the l | not-l
    boundary. They keep the pair's φ and are not reseeded with 5.1, because the
    subcell fix is not a fixed point of already reinitialized φ. An l-side seed's φ
    is the distance to l's boundary. A not-l seed q stores the distance to its
@@ -293,14 +293,14 @@ therefore underestimates ψ_l outside l there.
    label. Two bounds are proven, given exact l-side distances:
    φ_q ≤ ψ_l(q), because l's boundary seen from q is part of q's own label
    boundary; and ψ_l(q) ≤ |q − p| − φ_p for every l voxel p, because the ball
-   of radius φ_p about p lies in l. Every not-l seed with a face neighbour
+   of radius φ_p about p lies in l. Every not-l seed with a face neighbor
    (active or not) of a third label (neither l nor its own label) is rebuilt
    by a local Godunov extension of ψ_l: per axis, take the smallest known
-   neighbour value a_i (−φ for l-side seeds, +φ for other not-l seeds and
+   neighbor value a_i (−φ for l-side seeds, +φ for other not-l seeds and
    rebuilt seeds once solved), then solve Σ(ψ − a_i)² = dx². Jacobi sweeps
    over these seeds only continue until the values are stable. Each result
    is clamped to [φ_q, min_p(|q − p| − φ_p)] over the l voxels p in the 5³
-   neighbourhood (rulings R17, R19). ψ_l is not smooth at junction lines, so
+   neighborhood (rulings R17, R19). ψ_l is not smooth at junction lines, so
    these values are only first-order accurate there. The rule was chosen by
    measurement over random z-parallel and tilted junctions against
    alternatives (no clamp, gradient-jump trigger, 3³ trigger, l-side-only
@@ -308,7 +308,7 @@ therefore underestimates ψ_l outside l there.
 3. Solve 5.2 on |ψ_l| with those seeds frozen, apply sign from the mask.
 4. Return as `GRID_LEVEL_SET` with background halfWidth·dx.
 
-The evolver's speed stencils use raw ±φ, which is accurate at the face-neighbour
+The evolver's speed stencils use raw ±φ, which is accurate at the face-neighbor
 interface voxels where speeds are evaluated.
 
 ## 6. Topology-constrained multi-label contouring
@@ -355,11 +355,11 @@ multiObjectToMesh(const MultiLevelSetT&,
 
 ### 6.3 Algorithm
 
-Cells are the 2×2×2 voxel-centre cubes of the index grid.
+Cells are the 2×2×2 voxel-center cubes of the index grid.
 
 1. **Interface cells, one pass (ruling R36).** Cells are enumerated in
    blocks of leaf-DIM^3 minimum corners: every leaf of the label tree plus its
-   seven lower neighbour blocks (a cell whose minimum corner lies one voxel
+   seven lower neighbor blocks (a cell whose minimum corner lies one voxel
    below a leaf has corners in it), block-parallel. Each block reads its
    labels plus a one-voxel upper halo once and skips cells whose 8 corner
    labels agree, so every mixed cell is processed exactly once, including
@@ -385,7 +385,7 @@ Cells are the 2×2×2 voxel-centre cubes of the index grid.
    manifold surfaces whose topology matches the digital object for these
    connectivity pairs. A unit test exhaustively checks all 256 cases per pair
    (each case's patches form disks with boundary on the cube faces matching the
-   neighbouring cube's face pattern), so adjacent cells always agree.
+   neighboring cube's face pattern), so adjacent cells always agree.
 4. **Edge vertices.** On a cell edge between corners p (in l) and q (not in l)
    the vertex sits at θ·dx from p with θ = φ_p / (φ_p + φ_q), i.e. the linear
    zero crossing of raw ψ_l. Vertices are keyed by (global edge id, label) and
@@ -395,7 +395,7 @@ Cells are the 2×2×2 voxel-centre cubes of the index grid.
    label; optional normals from the gradient of the cell's local ψ_l.
 
 Cost: cells are enumerated per block of DIM^3 minimum corners: each label
-leaf plus its seven lower-neighbour blocks (a cell whose minimum corner is one
+leaf plus its seven lower-neighbor blocks (a cell whose minimum corner is one
 voxel below a leaf has corners in it). A block reads a 9^3 label window once
 and exits early when the window is uniform; otherwise work is proportional to
 the number of (cell, label) pairs, about 2 per interface cell. Labels absent
@@ -409,9 +409,9 @@ in cells containing three or more labels. With `junctionCorrection` (default
 true), on every edge of which at least one incident cell has three or more
 distinct labels (label 0 included), the outside endpoint q gets
 ψ_l(q) = one local Godunov step on ψ_l (per axis the smaller of the two
-face-neighbour values, −φ in l, +φ elsewhere), clamped to the proven bounds of
+face-neighbor values, −φ in l, +φ elsewhere), clamped to the proven bounds of
 rulings R17/R19: [φ_q, max(φ_q, U)] with U = min over label-l voxels p in the
-5×5×5 neighbourhood of |q − p|·dx − φ_p. The l-side φ_p is kept. The value
+5×5×5 neighborhood of |q − p|·dx − φ_p. The l-side φ_p is kept. The value
 depends only on (q, l), so all cells sharing the edge agree. This affects
 geometry only; topology is fixed by steps 2–3 (ruling R35; the original "5.1
 seeding" rule was measured to change nothing). It lowers the worst-case vertex
@@ -476,7 +476,7 @@ Required integration tests:
    MOGAC's symmetric difference against the exact (rotated) solution is at
    most 1.1 × the reference's symmetric difference against it. Curvature only
    and combined (ruling R28): the mean zero-crossing radius about the exact
-   centre (unmoved, or rotated analytically for combined) is compared with
+   center (unmoved, or rotated analytically for combined) is compared with
    r² = r₀² − 2t; MOGAC's |radius error| ≤ max(1.1 × the reference's
    |radius error|, 0.25·dx). For combined the bound also admits the
    reference's |radius error| + 0.1·dx (ruling R30): the curvature limit
@@ -511,7 +511,7 @@ Contouring tests (`TestLevelSetMultiObjectMesh.cc`):
 
 10. **Case tables.** For each connectivity pair, all 256 cases: every patch is
     a disk, windings are consistent, and the boundary on each cube face depends
-    only on that face's 4 corners (so neighbouring cells always agree).
+    only on that face's 4 corners (so neighboring cells always agree).
 11. **Manifold + closed.** On the round-trip spheres, the vortex end state
     (test 9), and random label volumes: every edge has exactly two incident
     triangles, every vertex link is one disk, and there are no degenerate

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an upstream-quality, header-only OpenVDB tool that evolves N labelled objects as one unsigned distance `FloatGrid` paired with one `Int32Grid` of labels, reconstructs a second-order signed distance per label at any time, and contours every label to a topology-correct manifold mesh.
+**Goal:** Add an upstream-quality, header-only OpenVDB tool that evolves N labeled objects as one unsigned distance `FloatGrid` paired with one `Int32Grid` of labels, reconstructs a second-order signed distance per label at any time, and contours every label to a topology-correct manifold mesh.
 
 **Architecture:** `LevelSetMultiObject.h` holds the φ/L pair (`MultiLevelSet`), a label-aware second-order redistancer, a label-aware stencil, a speed-functor concept with wedge-equivalent built-in forces, and a forward-Euler evolver using wedge's two-smallest projection. `LevelSetMultiObjectMesh.h` holds a rule-generated, connectivity-consistent 256-case table and a leaf-parallel mesher over interface cells.
 
@@ -84,10 +84,10 @@ Below, "Run `<Filter>`" means the second command with that filter.
   - `HolderValidate`: `validate()` true; grids carry `"multi_level_set_role"` metadata `"phi"`/`"labels"`; set one φ value to −1 → false with a non-empty message; activate a voxel only in L → false.
   - `HolderThrows`: mismatched transforms → `ValueError`; `halfWidth = 1` → `ValueError`; non-uniform scale transform → `ValueError`.
   - `HolderSignedDistance`: at (3,0,0) label 1 → `−φ`, label 2 → `+φ`.
-  - `HolderLabelSet`: `{1,2}`; after relabelling some voxels to −7 and 1<<30 → `{−7, 1, 2, 1<<30}` (Review Focus 3).
+  - `HolderLabelSet`: `{1,2}`; after relabeling some voxels to −7 and 1<<30 → `{−7, 1, 2, 1<<30}` (Review Focus 3).
   - `HolderDilateErode`: `dilate(2)` then `erode(2)`: active-voxel counts equal between trees after each, `validate()` true.
 - [ ] **Step 2: Run `TestLevelSetMultiObject.Holder*`** — expected: compile failure (header missing).
-- [ ] **Step 3: Implement `MultiLevelSet`.** `dilate/erode` call `tools::dilateActiveValues`/`erodeActiveValues` with `NN_FACE, IGNORE_TILES` on both trees; new φ voxels get background, new label voxels copy the label of the active face neighbour with smallest φ (do this in a post-pass over newly active voxels). `validate` compares `tree.hasSameTopology()` and scans φ for `< 0` or non-finite.
+- [ ] **Step 3: Implement `MultiLevelSet`.** `dilate/erode` call `tools::dilateActiveValues`/`erodeActiveValues` with `NN_FACE, IGNORE_TILES` on both trees; new φ voxels get background, new label voxels copy the label of the active face neighbor with smallest φ (do this in a post-pass over newly active voxels). `validate` compares `tree.hasSameTopology()` and scans φ for `< 0` or non-finite.
 - [ ] **Step 4: Run `TestLevelSetMultiObject.Holder*`** — expected: PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add MultiLevelSet holder for paired phi/label grids"`
 
@@ -119,13 +119,13 @@ Below, "Run `<Filter>`" means the second command with that filter.
   ```
 
 - [ ] **Step 1: Write failing tests.**
-  - `RedistancePlanar`: a pair with interface at the plane x = 7.3 (labels 1 | 2), φ initialised to garbage `0.5·dx` everywhere in a 4-voxel band. After `redistance()`: every active voxel's φ equals `|x − 7.3|·dx` within `1e-3·dx`; iterations ≤ ⌈3·√3⌉ + 2 = 8.
+  - `RedistancePlanar`: a pair with interface at the plane x = 7.3 (labels 1 | 2), φ initialized to garbage `0.5·dx` everywhere in a 4-voxel band. After `redistance()`: every active voxel's φ equals `|x − 7.3|·dx` within `1e-3·dx`; iterations ≤ ⌈3·√3⌉ + 2 = 8.
   - `RedistanceKeepsCrossing`: same setup with φ already exact; after `redistance()`, the linear zero crossing between x=7 and x=8 is still 7.3 within `1e-5`.
   - `RedistanceOrderIndependent`: grain size 0 vs 1 gives bit-identical φ.
 - [ ] **Step 2: Run `TestLevelSetMultiObject.Redistance*`** — expected: FAIL (undefined).
 - [ ] **Step 3: Implement.**
   - Seeding per §5.1 from a deep-copied φ snapshot; θ guard ε = 1e-6·dx; seeds marked in a `BoolTree` mask and frozen.
-  - Outer layers: parallel Jacobi over `LeafManager` with one aux buffer. Per voxel, per axis take the smaller-φ neighbour `a_i` (and the next one out `a_i'` on that side). Use the second-order one-sided value `(4a_i − a_i')/3` with coefficient `9/4` when `a_i' ≤ a_i`, else first order. Solve the Godunov quadratic `Σ c_i (φ − ā_i)² = dx²` over the sorted upwind set, dropping terms with `φ ≤ ā_i`. Keep `min(old, new)`. Stop at max|Δφ| < tolerance or ⌈halfWidth·√3⌉ + 2 iterations.
+  - Outer layers: parallel Jacobi over `LeafManager` with one aux buffer. Per voxel, per axis take the smaller-φ neighbor `a_i` (and the next one out `a_i'` on that side). Use the second-order one-sided value `(4a_i − a_i')/3` with coefficient `9/4` when `a_i' ≤ a_i`, else first order. Solve the Godunov quadratic `Σ c_i (φ − ā_i)² = dx²` over the sorted upwind set, dropping terms with `φ ≤ ā_i`. Keep `min(old, new)`. Stop at max|Δφ| < tolerance or ⌈halfWidth·√3⌉ + 2 iterations.
   - Before writing the kernel, spend ≤ 30 min checking whether `FastSweeping.h` internals take frozen seeds on an all-positive field (§5.2). Record the outcome in a code comment either way.
 - [ ] **Step 4: Run `TestLevelSetMultiObject.Redistance*`** — expected: PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add second-order label-aware redistancing"`
@@ -143,16 +143,16 @@ Below, "Run `<Filter>`" means the second command with that filter.
   static Ptr fromLabelGrid(const LabelGridT& labels, int halfWidth = 3);
   static Ptr fromSignedGrids(const std::map<int32_t, typename FloatGridT::ConstPtr>&, int halfWidth = 3);
   ```
-  Test helper (file-local in tests, reused by later tasks): `double maxInterfaceError(const FloatGrid& sdf, std::function<double(Vec3d)> analytic)` and `double rmsBandError(...)`, both returning errors in units of dx. "Interface layer" = active voxels with a face neighbour of opposite sign.
+  Test helper (file-local in tests, reused by later tasks): `double maxInterfaceError(const FloatGrid& sdf, std::function<double(Vec3d)> analytic)` and `double rmsBandError(...)`, both returning errors in units of dx. "Interface layer" = active voxels with a face neighbor of opposite sign.
 
 - [ ] **Step 1: Write failing tests.**
   - `RoundTripTwoSpheres`: spheres r = 10 at (−15,0,0) and (15,0,0), dx = 1, via `createLevelSetSphere`, labels 1 and 2 → `fromSignedGrids` → (Task 4 not yet available) compare **raw** `signedDistance(ijk, l)` near each sphere: max interface error < 0.05·dx, RMS band error < 0.1·dx.
-  - `RoundTripNonUnitVoxel`: same in index space at dx = 0.25 (radius 2.5, centres ±3.75); errors in dx units match the dx=1 run within 1e-3 (Review Focus 1).
+  - `RoundTripNonUnitVoxel`: same in index space at dx = 0.25 (radius 2.5, centers ±3.75); errors in dx units match the dx=1 run within 1e-3 (Review Focus 1).
   - `ConvergenceOrder`: sphere r = 0.5 world, dx ∈ {1/20, 1/40, 1/80}; least-squares slope of log(max interface error) vs log(dx) ≥ 1.8.
   - `FromLabelGrid`: a 20³ label block of 1 inside 30³ of 2 → `validate()`, `labelSet()=={1,2}`, φ at interface voxels within 0.5·dx ± 1e-3·dx of the cube faces.
   - `FromSignedGridsThrows`: input grid with class `GRID_FOG_VOLUME` → `ValueError`.
 - [ ] **Step 2: Run `TestLevelSetMultiObject.RoundTrip*:*Convergence*:*From*`** — FAIL.
-- [ ] **Step 3: Implement factories** per §3.1: union of input active topologies, dilated to halfWidth; label = argmin ψ (0 if all > 0); φ by the two-smallest rule; then `redistance()`. `fromLabelGrid` seeds φ = 0.5·dx at voxels with a different-label face neighbour, then redistances.
+- [ ] **Step 3: Implement factories** per §3.1: union of input active topologies, dilated to halfWidth; label = argmin ψ (0 if all > 0); φ by the two-smallest rule; then `redistance()`. `fromLabelGrid` seeds φ = 0.5·dx at voxels with a different-label face neighbor, then redistances.
 - [ ] **Step 4: Run** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add MultiLevelSet factories with accuracy and convergence tests"`
 
@@ -209,10 +209,10 @@ Below, "Run `<Filter>`" means the second command with that filter.
   ```
 
 - [ ] **Step 1: Write failing tests.**
-  - `StencilSphere`: two-sphere fixture; at an interface voxel of sphere 1, `gradient()` has unit length ± 0.05 and points away from the centre; `meanCurvatureNormGrad()` within 10% of 1/r.
+  - `StencilSphere`: two-sphere fixture; at an interface voxel of sphere 1, `gradient()` has unit length ± 0.05 and points away from the center; `meanCurvatureNormGrad()` within 10% of 1/r.
   - `StencilLabelSign`: at a label-2 voxel, `moveTo(ijk,1).getValue<0,0,0>() == +φ` and `moveTo(ijk,2)` gives `−φ`.
   - `ForcesPressureRescale`: pressure grid values {−2, 0, 4}, target 0 → internal values {−1, 0, 1}.
-  - `ForcesMatchesWedgeFormula`: for one hand-built 3³ neighbourhood, `operator()` equals the wedge `pressureAndAdvectionMotion` expression (§3.4) evaluated by hand in the test, within 1e-6.
+  - `ForcesMatchesWedgeFormula`: for one hand-built 3³ neighborhood, `operator()` equals the wedge `pressureAndAdvectionMotion` expression (§3.4) evaluated by hand in the test, within 1e-6.
   - `ForcesFixedAndInactive`: label 0 → `isFixed` true; inactive label → `isActive` false.
   - `ForcesMissingGrid`: `setPressure(nullptr, 1.f)` or `setAdvection(nullptr, 1.f)` → `ValueError`.
 - [ ] **Step 2: Run `TestLevelSetMultiObject.Stencil*:*Forces*`** — FAIL.
@@ -242,7 +242,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
   Test helper `ConstantSpeed{float s; std::set<int32_t> fixed;}` satisfying the concept, plus `RandomSpeed` (per-label speed drawn once from a seeded `std::mt19937`, range [−1, 1]).
 
 - [ ] **Step 1: Write failing tests.**
-  - `PartitionInvariant` (spec test 4): 4 labels in a 32³ checker of 8³ blocks, `RandomSpeed`, 50 steps. After each step: `validate()`. At end: for each pair of labels, extracted interiors overlap at no voxel with both ψ < −1e-3·dx; every band voxel is inside exactly one label or label 0; no orphan voxel (every active voxel has a same-label voxel in its 26-neighbourhood).
+  - `PartitionInvariant` (spec test 4): 4 labels in a 32³ checker of 8³ blocks, `RandomSpeed`, 50 steps. After each step: `validate()`. At end: for each pair of labels, extracted interiors overlap at no voxel with both ψ < −1e-3·dx; every band voxel is inside exactly one label or label 0; no orphan voxel (every active voxel has a same-label voxel in its 26-neighborhood).
   - `PressureGrowth`: sphere r = 8, constant pressure speed so that dr/dt = 1, advect to t = 4 → mean radius of extracted zero set 12 ± 0.5·dx.
   - `CurvatureFlow`: sphere r₀ = 10, curvature weight w = 1, t = 20 → r² = 100 − 2·20 = 60 ± (2·r·0.5·dx).
   - `UniformAdvection`: velocity (1,0,0), t = 5 → centroid shifts 5 ± 0.5·dx.
@@ -365,7 +365,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
   ```cpp
   enum class MultiObjectConnectivity { FG26_BG6, FG6_BG26, FG18_BG6, FG6_BG18 };
   namespace lsmo_internal {
-  // 3x3x3 neighbourhood, bit i = (dx,dy,dz) with i = (dx+1) + 3(dy+1) + 9(dz+1), centre excluded from the test
+  // 3x3x3 neighborhood, bit i = (dx,dy,dz) with i = (dx+1) + 3(dy+1) + 9(dz+1), center excluded from the test
   bool isSimplePoint(uint32_t inMask /*27 bits*/, MultiObjectConnectivity);
   }
   // LevelSetMultiObject:
@@ -378,7 +378,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
   Task 10's `MeshTopology` test reuses `digitalTopology` (Task 9/10 replace `MultiObjectMeshSettings::Connectivity` with `MultiObjectConnectivity`).
 
 - [ ] **Step 1: Write failing tests.**
-  - `SimplePointTable`: exhaustively over all 2^26 neighbourhoods is too slow — instead check hand cases per connectivity: isolated voxel (not simple), end of a line (simple), middle of a line (not simple), voxel completing a ring/tunnel (not simple), voxel filling a cavity's last hole (not simple), face of a solid block (simple); plus 10^5 random masks checked against a brute-force reference (count fg components among 26-nbrs adjacent to centre and bg 6-components 6-adjacent to centre inside the 3x3x3, i.e. the definition of T_fg/T_bg).
+  - `SimplePointTable`: exhaustively over all 2^26 neighborhoods is too slow — instead check hand cases per connectivity: isolated voxel (not simple), end of a line (simple), middle of a line (not simple), voxel completing a ring/tunnel (not simple), voxel filling a cavity's last hole (not simple), face of a solid block (simple); plus 10^5 random masks checked against a brute-force reference (count fg components among 26-nbrs adjacent to center and bg 6-components 6-adjacent to center inside the 3x3x3, i.e. the definition of T_fg/T_bg).
   - `DigitalTopologyHelper`: solid cube (1,0,1), hollow cube (1,1,2), solid torus (1,0,0) — euler = χ of the digital region (cubical complex), two cubes touching at a corner (1 under 26, 2 under 6).
   - `TopologyCubeThroughSpheres` exactly per spec §8 test 15 (gates verbatim), including the control run.
 - [ ] **Step 2: Run** `TestLevelSetMultiObject.SimplePoint*:*DigitalTopology*:*TopologyCube*` — FAIL.

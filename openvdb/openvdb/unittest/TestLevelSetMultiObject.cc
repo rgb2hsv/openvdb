@@ -402,7 +402,7 @@ TEST_F(TestLevelSetMultiObject, HolderDilateErode)
     EXPECT_GT(m->phi()->activeVoxelCount(), n0);
     EXPECT_EQ(m->phi()->activeVoxelCount(), m->labels()->activeVoxelCount());
     EXPECT_TRUE(m->validate());
-    // new voxels outside x<0 copy label 1 from their neighbours
+    // new voxels outside x<0 copy label 1 from their neighbors
     EXPECT_EQ(m->labels()->tree().getValue(Coord(-1, 5, 5)), 1);
     EXPECT_EQ(m->labels()->tree().getValue(Coord(16, 5, 5)), 2);
     EXPECT_FLOAT_EQ(m->phi()->tree().getValue(Coord(-1, 5, 5)), 3.0f);
@@ -475,7 +475,7 @@ namespace {
 // active band x in [4, 11] (four voxels on each side), y, z in [0, 15].
 // Layers x in [7 - halo, 8 + halo] hold the exact distances (halo 0: the two
 // interface layers, enough for redistance(); halo 1: also the outer
-// neighbours read by the subcell reseed); if @a exact is false the remaining
+// neighbors read by the subcell reseed); if @a exact is false the remaining
 // band voxels hold garbage (alternating 0.5*dx and halfWidth*dx).
 MLS::Ptr
 makePlanar(double dx, bool exact, int halo = 1)
@@ -741,7 +741,7 @@ TEST_F(TestLevelSetMultiObject, RedistanceSeedInterface)
     // non-seed voxels are left alone
     EXPECT_EQ(out.getValue(Coord(5, 3, 3)), snapshot.getValue(Coord(5, 3, 3)));
 
-    // A seed whose only other-side neighbour is inactive has no usable
+    // A seed whose only other-side neighbor is inactive has no usable
     // gradient term (Delta would collapse to epsilon): it keeps its value.
     FloatTree lone(float(3 * dx));
     lone.setValueOn(Coord(6, 0, 0), 0.4f);
@@ -759,7 +759,7 @@ TEST_F(TestLevelSetMultiObject, RedistanceSeedInterface)
 
 namespace {
 
-// Interface layer: active voxels with an active face neighbour of opposite
+// Interface layer: active voxels with an active face neighbor of opposite
 // sign. Errors are |sdf - analytic| in units of dx; analytic takes world
 // coordinates.
 double
@@ -815,7 +815,7 @@ rawSignedGrid(const MLS& m, int32_t label, std::function<bool(Vec3d)> keep)
     return g;
 }
 
-// Every seed (an active voxel with a face neighbour, active or
+// Every seed (an active voxel with a face neighbor, active or
 // not, of a different label, as the redistancer sees it) lies within one
 // voxel of the true interface; distToInterface takes world coordinates.
 void
@@ -949,7 +949,7 @@ TEST_F(TestLevelSetMultiObject, FromLabelGrid)
     EXPECT_EQ(m->halfWidth(), 3);
     EXPECT_DOUBLE_EQ(m->voxelSize(), dx);
 
-    // Index-space distance from a voxel centre to the face planes of a box
+    // Index-space distance from a voxel center to the face planes of a box
     // whose voxels span [lo, hi] (faces at lo - 0.5 and hi + 0.5).
     const auto boxDist = [](const Vec3d& p, double lo, double hi) {
         const double l = lo - 0.5, h = hi + 0.5;
@@ -1177,11 +1177,11 @@ namespace {
 using Stencil = tools::LabelAwareStencil<MLS>;
 using Forces = tools::MultiObjectForces<MLS>;
 
-// First active voxel of label 1 whose +x neighbour is label 2 (interface).
+// First active voxel of label 1 whose +x neighbor is label 2 (interface).
 Coord
 sphereInterfaceVoxel(const MLS& m)
 {
-    // Sphere 1 is centred at (-15,0,0) dx with radius 10 dx: its surface
+    // Sphere 1 is centered at (-15,0,0) dx with radius 10 dx: its surface
     // point towards -y is at (-15, -10, 0).
     const Coord c(-15, -10, 0);
     for (int dj = -1; dj <= 1; ++dj) {
@@ -1208,7 +1208,7 @@ TEST_F(TestLevelSetMultiObject, StencilSphere)
     EXPECT_LT(g[1], -0.9f);
     // Single-voxel curvature carries second-difference noise from the
     // redistanced phi, so check the mean over the interface layer of the
-    // sphere (voxels of label 1 with a face neighbour of another label).
+    // sphere (voxels of label 1 with a face neighbor of another label).
     const Coord* offs = tools::lsmo_internal::faceOffsets();
     double sum = 0.0;
     int n = 0;
@@ -1229,7 +1229,7 @@ TEST_F(TestLevelSetMultiObject, StencilSphere)
 TEST_F(TestLevelSetMultiObject, StencilLabelSign)
 {
     auto m = makeTwoSpheres(1.0);
-    const Coord ijk(15, 0, 0); // centre of sphere 2
+    const Coord ijk(15, 0, 0); // center of sphere 2
     ASSERT_EQ(m->labels()->tree().getValue(ijk), 2);
     const float phi = m->phi()->tree().getValue(ijk);
     ASSERT_GT(phi, 0.0f);
@@ -1263,7 +1263,7 @@ TEST_F(TestLevelSetMultiObject, ForcesPressureRescale)
 
 TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
 {
-    // 3^3 neighbourhood, all label 1, so psi = -phi everywhere.
+    // 3^3 neighborhood, all label 1, so psi = -phi everywhere.
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
     Int32Grid::Ptr lab = Int32Grid::create(0);
     auto pa = phi->getAccessor();
@@ -1476,7 +1476,7 @@ centroid(const std::vector<Vec3d>& pts)
 }
 
 // Every active voxel has a voxel of its own label (active or not) among its
-// 26 neighbours.
+// 26 neighbors.
 Index64
 countOrphans(const MLS& m)
 {
@@ -1630,12 +1630,12 @@ TEST_F(TestLevelSetMultiObject, PerLabelAdvection)
     forces.setAdvection(2, Vec3SGrid::create(Vec3s(0.0f, 1.0f, 0.0f)), 1.0f);
     EXPECT_THROW(forces.setAdvection(3, Vec3SGrid::ConstPtr(), 1.0f), ValueError);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-    auto centre = [&](int32_t l) { return centroid(zeroCrossings(*m->extractSignedDistance(l))); };
-    const Vec3d a0 = centre(1), b0 = centre(2);
+    auto center = [&](int32_t l) { return centroid(zeroCrossings(*m->extractSignedDistance(l))); };
+    const Vec3d a0 = center(1), b0 = center(2);
     lsmo.advect(0.0, 5.0);
     std::string msg;
     ASSERT_TRUE(m->validate(&msg)) << msg;
-    const Vec3d a1 = centre(1), b1 = centre(2);
+    const Vec3d a1 = center(1), b1 = center(2);
     std::cout << "PerLabelAdvection: label 1 shift " << (a1 - a0) << ", label 2 shift "
               << (b1 - b0) << std::endl;
     for (int k = 0; k < 3; ++k) {
@@ -1644,7 +1644,7 @@ TEST_F(TestLevelSetMultiObject, PerLabelAdvection)
     }
     forces.clearLabelAdvection(2);
     lsmo.advect(5.0, 7.0);
-    const Vec3d b2 = centre(2);
+    const Vec3d b2 = center(2);
     EXPECT_NEAR(b2[0] - b1[0], 2.0, 0.5 * dx);
     EXPECT_NEAR(b2[1] - b1[1], 0.0, 0.5 * dx);
 }
@@ -2271,7 +2271,7 @@ compareZeroSets(const FloatGrid& a, const FloatGrid& b)
     return r;
 }
 
-// Fixture: sphere r = 12 dx, centred off the rotation axis so the rotational
+// Fixture: sphere r = 12 dx, centered off the rotation axis so the rotational
 // field moves it.
 const double kEqRadius = 12.0;
 const Vec3d kEqCenter(16.0, 0.0, 0.0);
@@ -2311,7 +2311,7 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
     ASSERT_TRUE(m.validate(&msg)) << msg;
     const double dx = m.voxelSize();
     FloatGrid::Ptr sdf = m.extractSignedDistance(1);
-    // the centre, rotated by @a angle about z, is inside
+    // the center, rotated by @a angle about z, is inside
     const Vec3d c(kEqCenter[0] * std::cos(angle), kEqCenter[0] * std::sin(angle), 0.0);
     ASSERT_LT(sdf->tree().getValue(sdf->transform().worldToIndexCellCentered(c)), 0.0f);
     const double vol = tools::levelSetVolume(ref);
@@ -2323,7 +2323,7 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
               << "%), Hausdorff " << d.hausdorff / dx << " dx" << std::endl;
     EXPECT_LT(d.hausdorff, 1.0 * dx);
     if (exactRadius > 0.0) {
-        // Mean zero-crossing radius about the exact centre @a c; MOGAC's
+        // Mean zero-crossing radius about the exact center @a c; MOGAC's
         // radius error at most max(1.1 x the reference's, the reference's +
         // @a radiusSlack, 0.25*dx).
         const double rm = meanRadius(zeroCrossings(*sdf), c);
@@ -2380,7 +2380,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 30.0);
-    // exact: r^2 = r0^2 - 2t at the unmoved centre
+    // exact: r^2 = r0^2 - 2t at the unmoved center
     checkEquivalence("SingleObjectCurvature", *m, *ref, steps, 0.0, nullptr,
         std::sqrt(kEqRadius * kEqRadius - 2.0 * 30.0));
 }
@@ -2404,7 +2404,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     const size_t steps = lsmo.advect(0.0, 10.0);
-    // exact: r^2 = r0^2 - 2t about the centre rotated by 0.05*10 radians.
+    // exact: r^2 = r0^2 - 2t about the center rotated by 0.05*10 radians.
     // 0.1*dx extra slack over the reference's radius error. The
     // curvature limit stableDt = dx^2/(6w) caps every MOGAC step, which forces
     // the advection to CFL ~0.13, where first-order upwinding is most
@@ -2453,7 +2453,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
     //   radius 7 in the xy plane with tube radius 3. No rotations.
     // - four rays at angles k*90 degrees in the z = -20 plane; label k+1
     //   inside and label k+5 outside the ring r = rs = 38.5 (between voxel
-    //   centres) on ray k, each placed so its surface point nearest the ring
+    //   centers) on ray k, each placed so its surface point nearest the ring
     //   is 1.5 voxels from it (facing gap 3 voxels); dx = 1, halfWidth 3.
     // - Tornado field (see Tornado): R = 16, swirl 0.1, inflow 0.2 towards
     //   rs = 38.5 with zone width 1, updraft 0.2; dense over [-64, 64]^3;
@@ -2585,8 +2585,8 @@ refTopoNumber(uint32_t inSet, int n, int k)
 bool
 refSimple(uint32_t mask, Conn conn)
 {
-    const uint32_t all = (uint32_t(1) << 27) - 1, centre = nbBit(0, 0, 0);
-    const uint32_t fg = mask & all & ~centre, bg = ~mask & all & ~centre;
+    const uint32_t all = (uint32_t(1) << 27) - 1, center = nbBit(0, 0, 0);
+    const uint32_t fg = mask & all & ~center, bg = ~mask & all & ~center;
     switch (conn) {
     case Conn::FG26_BG6: return refTopoNumber(fg, 26, 1) == 1 && refTopoNumber(bg, 6, 2) == 1;
     case Conn::FG6_BG26: return refTopoNumber(fg, 6, 2) == 1 && refTopoNumber(bg, 26, 1) == 1;
@@ -2631,13 +2631,13 @@ TEST_F(TestLevelSetMultiObject, SimplePointTable)
         EXPECT_FALSE(isSimplePoint(plug, conn));  // plugs the last hole of a cavity
         EXPECT_FALSE(isSimplePoint(full, conn));  // interior voxel (removal makes a cavity)
         EXPECT_TRUE(isSimplePoint(face, conn));   // face of a solid block
-        // the centre bit is ignored
+        // the center bit is ignored
         EXPECT_EQ(isSimplePoint(face, conn), isSimplePoint(face & ~c, conn));
     }
     // x joins two opposite corner voxels that are not adjacent to each other
     const uint32_t corner = c | nbBit(-1, -1, -1) | nbBit(1, 1, 1);
     EXPECT_FALSE(isSimplePoint(corner, Conn::FG26_BG6)); // two 26-components in N*
-    // 10^5 random neighbourhoods against the reference definitions, at
+    // 10^5 random neighborhoods against the reference definitions, at
     // several densities
     std::mt19937 gen(20261109u);
     std::uniform_real_distribution<double> uni(0.0, 1.0);
@@ -2781,7 +2781,7 @@ TEST_F(TestLevelSetMultiObject, SimplePointPreservesTopology)
 
 namespace {
 
-// The three spheres of the cube test: radius 4, centres at x = 48.
+// The three spheres of the cube test: radius 4, centers at x = 48.
 const Coord kOrbitSpheres[3] = {Coord(48, 10, 12), Coord(48, 20, 28), Coord(48, 29, 15)};
 // Angular speed about x (rad per unit time): one revolution over the run.
 const double kOrbitOmega = 2.0 * math::pi<double>() / 84.0;
@@ -2789,7 +2789,7 @@ const double kOrbitOmega = 2.0 * math::pi<double>() / 84.0;
 // Common initial centroid of the spheres: the point the orbit axis
 // (parallel to x) passes through.
 Vec3d
-orbitCentre()
+orbitCenter()
 {
     Vec3d c(0.0);
     for (const Coord& p : kOrbitSpheres) c += p.asVec3d();
@@ -2800,7 +2800,7 @@ orbitCentre()
 Vec3d
 orbitPosition(const Vec3d& p, double t)
 {
-    const Vec3d c = orbitCentre();
+    const Vec3d c = orbitCenter();
     const double a = kOrbitOmega * t, dy = p[1] - c[1], dz = p[2] - c[2];
     return Vec3d(p[0], c[1] + dy * std::cos(a) - dz * std::sin(a),
         c[2] + dy * std::sin(a) + dz * std::cos(a));
@@ -2811,7 +2811,7 @@ orbitPosition(const Vec3d& p, double t)
 math::Mat4d
 orbitMotion(double t)
 {
-    const Vec3d c = orbitCentre();
+    const Vec3d c = orbitCenter();
     const double a = kOrbitOmega * t, ca = std::cos(a), sa = std::sin(a);
     math::Mat4d m = math::Mat4d::identity();
     m(1, 1) = ca; m(1, 2) = sa;
@@ -2849,7 +2849,7 @@ struct CubeRunResult
     bool changed = false;    // cube topology differed from (1, 0, 1) at some chunk
     double firstChange = -1.0;                // end time of the first changed chunk
     lsmo_test::DigitalTopology firstChangeTopo; // cube topology at that chunk
-    double maxCentroidError[3] = {0, 0, 0}; // sphere centroid vs rotated centre, max over chunks (dx)
+    double maxCentroidError[3] = {0, 0, 0}; // sphere centroid vs rotated center, max over chunks (dx)
     double minVolumeFraction[3] = {1e9, 1e9, 1e9}; // sphere volume / (4/3) pi 4^3, min over chunks
     int maxComponents[3] = {0, 0, 0}; // sphere components, max over chunks (diagnostic)
     Index64 belowFloor = 0; // active voxels with phi < minimumPhi*dx, summed over chunks
@@ -2859,7 +2859,7 @@ struct CubeRunResult
 
 // Cube (label 1, side 40 voxels, [0,39]^3) advected along +x by
 // 1.5 x (side + sphere diameter + 8) = 84 voxels through three balls of
-// radius 4 (labels 2-4, kinematic) centred at x = 48 at distinct (y, z),
+// radius 4 (labels 2-4, kinematic) centered at x = 48 at distinct (y, z),
 // which orbit together rigidly about the axis parallel to x through their
 // common centroid at kOrbitOmega (one revolution over the run), in the
 // plane orthogonal to the cube's motion. The evolver protects topology
@@ -2867,7 +2867,7 @@ struct CubeRunResult
 // (connectivityOf(evolver)). With @a protect, label 1 is
 // topology-preserving and the per-chunk gates are asserted (cube (1,0,1),
 // consistent meshes, validate, partition, sphere centroids within 1 dx of
-// the rotated centres; the obstacles' claims on cube voxels pass the
+// the rotated centers; the obstacles' claims on cube voxels pass the
 // simple-point test and trapped cube voxels are wrapped outward); the worst
 // centroid error, smallest volume and largest component and cavity counts
 // per sphere are returned (the last three as diagnostics: a sphere can be
@@ -3070,7 +3070,7 @@ TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
 
 TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
 {
-    // The coloured passes make the protected result independent of the
+    // The colored passes make the protected result independent of the
     // thread count: serial and parallel runs well past the cube's first
     // contact with the spheres (to t = 72) are bit-identical.
     const CubeRunResult a = runCubeThroughSpheres(true, Conn::FG26_BG6, 0, 72.0);

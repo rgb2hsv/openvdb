@@ -68,8 +68,8 @@ struct TripleJunction
     Vec3d c, a, u, v;  // index space
     int H;             // active box [-H, H-1]^3
 
-    TripleJunction(double th, const Vec3d& centre, const Vec3d& dir, int h = 12)
-        : theta0(th), c(centre), a(dir.unitSafe()), H(h)
+    TripleJunction(double th, const Vec3d& center, const Vec3d& dir, int h = 12)
+        : theta0(th), c(center), a(dir.unitSafe()), H(h)
     {
         const Vec3d ref = std::abs(a[0]) < 0.9 ? Vec3d(1, 0, 0) : Vec3d(0, 1, 0);
         u = (ref - a * ref.dot(a)).unitSafe();
@@ -108,7 +108,7 @@ struct TripleJunction
         return dx * (sector(w) == l ? -d : d);
     }
     double lineDist(const Vec3d& w) const { return local(w).length(); } // index units
-    /// Chebyshev distance (index units) from the voxel centre to the box faces.
+    /// Chebyshev distance (index units) from the voxel center to the box faces.
     double boxDepth(const openvdb::Coord& p) const
     {
         return H - std::max({std::abs(p[0] + 0.5), std::abs(p[1] + 0.5), std::abs(p[2] + 0.5)});
@@ -151,7 +151,7 @@ struct TripleJunction
 /// z-parallel through (0.37, -0.21)), seven z-parallel lines with random
 /// theta0 and sub-voxel offset, and four tilted lines. Uses its own
 /// generator arithmetic so the set is the same on every platform; random
-/// numbers are drawn in a fixed order (theta, centre xyz, direction xy).
+/// numbers are drawn in a fixed order (theta, center xyz, direction xy).
 inline std::vector<TripleJunction>
 junctionSet()
 {
@@ -266,7 +266,7 @@ struct Tornado
             *this);
     }
 
-    /// Shape of label @a l (1..8) centred at @a c, dx = 1, half-width 3:
+    /// Shape of label @a l (1..8) centered at @a c, dx = 1, half-width 3:
     /// sphere r = 10; cube side 12; tetrahedron, octahedron, dodecahedron,
     /// icosahedron with factory scale (circumradius) 10; capsule along z with
     /// radius 5 and axis endpoints +-5; closed ring = 8-segment polygon of
@@ -300,12 +300,12 @@ struct Tornado
 
     /// Initial signed grids, labels 1-8: four rays at angles k*90 degrees in
     /// the z = z0 plane; label k+1 inside and label k+5 outside the ring
-    /// r = rs (between voxel centres) on ray k, each placed so its surface
+    /// r = rs (between voxel centers) on ray k, each placed so its surface
     /// point nearest the ring is 1.5 voxels from it (facing gap 3 voxels).
     std::map<int32_t, openvdb::FloatGrid::ConstPtr> inputs() const
     {
         using namespace openvdb;
-        // extent of a shape centred at the origin along unit direction d: max
+        // extent of a shape centered at the origin along unit direction d: max
         // of p.d - psi(p) over interior voxels (psi < 0)
         auto extent = [](const FloatGrid& g, const Vec3d& d) {
             double e = 0.0;

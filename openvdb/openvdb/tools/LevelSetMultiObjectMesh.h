@@ -20,7 +20,7 @@
 ///
 /// @par Algorithm
 /// - Cells are enumerated in blocks of LeafNodeType::DIM^3 minimum corners:
-///   every leaf of the label tree and its seven lower neighbour blocks (a
+///   every leaf of the label tree and its seven lower neighbor blocks (a
 ///   cell whose minimum corner lies one voxel below a leaf has corners in
 ///   it). A block reads its labels plus a one-voxel upper halo once; cells
 ///   whose eight labels agree are skipped, so the work is proportional to the
@@ -48,14 +48,14 @@
 ///   direction of its diagonal) is re-triangulated: disks by the max-min
 ///   quality polygon triangulation, tubes by the max-min quality strip over
 ///   all start chords. Chords between two vertices on a common cube face are
-///   never used, so neighbouring cells cannot share an interior edge. Only the
+///   never used, so neighboring cells cannot share an interior edge. Only the
 ///   triangulation of a loop changes, never which vertices and loops exist,
 ///   so the topology is the table's.
 /// - Vertices are deduplicated per block with a hash map keyed by (edge,
 ///   label); vertices on edges shared with other blocks are merged in a final
 ///   serial pass in block order, so the output is identical for every grain
 ///   size.
-/// - Normals (optional) are the normalised gradient of psi_l (central
+/// - Normals (optional) are the normalized gradient of psi_l (central
 ///   differences) interpolated along the edge.
 ///
 /// @par Guarantees
@@ -79,7 +79,7 @@
 /// - W. E. Lorensen, H. E. Cline, "Marching cubes", SIGGRAPH 1987.
 ///
 /// @par Cube numbering (independent of VolumeToMesh.h)
-/// A cell is the 2x2x2 block of voxel centres with minimum corner ijk.
+/// A cell is the 2x2x2 block of voxel centers with minimum corner ijk.
 /// - Corner bit i (0..7) is the voxel ijk + (i&1, (i>>1)&1, (i>>2)&1); a case
 ///   index has bit i set when corner i lies in the label ("in-corner").
 /// - Edges 0-3 run along x, 4-7 along y, 8-11 along z. Edge 4a+k (axis a) has
@@ -101,7 +101,7 @@
 ///   foreground adjacency is 18 or 26, and separated (segments cut off the
 ///   in-corners) when it is 6. Faces with two crossing edges have the single
 ///   segment between them. Since the segments depend only on the face's four
-///   corner bits, neighbouring cells always agree.
+///   corner bits, neighboring cells always agree.
 /// - Interior rule: two corners on a body diagonal that are not otherwise
 ///   connected are joined by a tube when their side uses 26-adjacency
 ///   (in-pairs for FG26_BG6, out-pairs for FG6_BG26), separated otherwise.
@@ -613,7 +613,7 @@ casePatches(MultiObjectConnectivity conn)
 }
 
 /// Vertices stay at least this fraction of a cell edge away from its corners
-/// (so no triangle collapses when phi vanishes at a voxel centre).
+/// (so no triangle collapses when phi vanishes at a voxel center).
 constexpr double kMeshThetaMin = 1e-3;
 
 /// A patch whose table triangulation has a triangle of quality below this
@@ -634,9 +634,9 @@ triangleQuality(const Vec3d& a, const Vec3d& b, const Vec3d& c, const Vec3d& ref
 }
 
 /// @brief Triangulation of the loop of edge ids @a e[0..n-1] (n <= 12) that
-/// maximises the minimum of quality(i, j, k) over its triangles (i < j < k
+/// maximizes the minimum of quality(i, j, k) over its triangles (i < j < k
 /// loop positions, wound in loop order); chords between two vertices on a
-/// common cube face are not used (they could coincide with a neighbouring
+/// common cube face are not used (they could coincide with a neighboring
 /// cell's edge). O(n^3) dynamic programming.
 /// @return the minimum quality, or -infinity if no triangulation exists
 /// (never for table loops, whose fan is one).
@@ -685,7 +685,7 @@ bestDiskTriangulation(const uint8_t* e, int n, const QualityFn& quality,
 }
 
 /// @brief Triangle strip between loops @a A (m edges) and @a B (n edges) of
-/// a tube that maximises the minimum quality, over every start chord.
+/// a tube that maximizes the minimum quality, over every start chord.
 /// @details Vertices are numbered 0..m-1 for A and m..m+n-1 for B. Walking
 /// forward along A and backward along B, each triangle is either
 /// (A[i], A[i+1], B[j]) or (B[j-1], B[j], A[i]), which keeps the winding of
@@ -879,9 +879,9 @@ struct MeshContext
     /// As in MultiLevelSet::extractSignedDistance two bounds hold:
     /// psi_l(q) >= phi_q, and psi_l(q) <= |q - p| - phi_p for
     /// every voxel p of label l (its ball of radius phi_p lies in l); the
-    /// latter is taken over the 5x5x5 neighbourhood of q. The estimate is one
+    /// latter is taken over the 5x5x5 neighborhood of q. The estimate is one
     /// local Godunov step on psi_l (per axis the smaller psi_l of the two
-    /// face neighbours, -phi in l and +phi elsewhere), clamped to
+    /// face neighbors, -phi in l and +phi elsewhere), clamped to
     /// [phi_q, max(phi_q, upper bound)]. It depends only on q and l, so every
     /// cell sharing the edge places the same vertex.
     double correctedOutside(const Coord& q, LabelT l, double phiQ)
@@ -1154,7 +1154,7 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
     const bool all = labels.empty();
     if (!all && requested.empty()) return result; // only label 0 was requested
 
-    // blocks: every leaf of the label tree and its lower neighbours (cells
+    // blocks: every leaf of the label tree and its lower neighbors (cells
     // whose minimum corner is one voxel below a leaf have corners in it)
     const int dim = int(LabelTreeT::LeafNodeType::DIM);
     std::vector<Coord> blocks;
