@@ -52,7 +52,7 @@ using lsmo_test::junctionSet;
 using lsmo_test::labelVoxelCounts;
 using lsmo_test::makeTwoSpheres;
 using lsmo_test::makeVelocity;
-using lsmo_test::Tornado;
+using lsmo_test::Vortex;
 using lsmo_test::TripleJunction;
 
 // 16^3 block: label 1 for x<8, 2 for x>=8, phi = |x - 7.5|*dx clamped to 3*dx.
@@ -2418,7 +2418,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
 
 
 ////////////////////////////////////////
-// Eight objects in a tornado vortex.
+// Eight objects in a vortex.
 
 namespace {
 
@@ -2442,46 +2442,56 @@ insideVoxelCount(const FloatGrid& g)
 
 } // anonymous namespace
 
-TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
+TEST_F(TestLevelSetMultiObject, VortexEightObjects)
 {
     // Parameters (a first parameter set dissolved every object
     // through first-order upwind diffusion before any contact, and a ring of
     // objects at one radius cannot touch in an axisymmetric flow):
-    // - eight shapes, labels 1-8, circumradius 10 (all >= 10 voxels across):
-    //   sphere r = 10; cube side 12; tetrahedron, octahedron, dodecahedron,
-    //   icosahedron with factory scale (circumradius) 10; capsule along z with
-    //   radius 5 and axis endpoints +-5; closed ring = 8-segment polygon of
-    //   radius 7 in the xy plane with tube radius 3. No rotations.
+    // - eight shapes, labels 1-8, every length times Vortex::kShapeScale =
+    //   1.4 (sphere r = 14; cube side 16.8; tetrahedron, octahedron,
+    //   dodecahedron, icosahedron with circumradius 14; capsule along z with
+    //   radius 7 and axis endpoints +-7; closed ring = 8-segment polygon of
+    //   radius 9.8 in the xy plane with tube radius 4.2). No rotations.
     // - four rays at angles k*90 degrees in the z = -20 plane; label k+1
     //   inside and label k+5 outside the ring r = rs = 38.5 (between voxel
     //   centers) on ray k, each placed so its surface point nearest the ring
-    //   is 1.5 voxels from it (facing gap 3 voxels); dx = 1, halfWidth 3.
-    // - Tornado field (see Tornado): R = 16, swirl 0.1, inflow 0.2 towards
-    //   rs = 38.5 with zone width 1, updraft 0.2; dense over [-64, 64]^3;
-    //   advection weight 1, curvature weight 0.01.
-    // - Advect in chunks of 2 until >= 4 contact pairs (capped at t = 40),
-    //   then two more chunks to t2, then on to 1.5 * t2 (t = 42 for first
-    //   contact at t = 24); contacts must stay >= 4.
+    //   is kRingClearance = 0.75 voxels from it; dx = 1, halfWidth 3.
+    // - Vortex field (see Vortex): R = 16, swirl 0.1, inflow 0.1 towards
+    //   rs = 38.5 with zone width 1, updraft 0.1; dense over [-80, 80]^3
+    //   (the larger shapes reach r ~ 68); advection weight 1, curvature
+    //   weight 0.003.
+    // - Why these values: running twice as long (to t = 84) with the
+    //   original sizes (scale 1, inflow and updraft 0.2, curvature 0.01)
+    //   lost the capsule by t = 58. Every object keeps translating towards
+    //   the ring at the far-field inflow speed while its face at the ring
+    //   cannot move, so the flow itself flattens it by inflow * (time in
+    //   contact); halving the inflow and updraft, and starting the pairs
+    //   closer, cuts that squeeze while the larger shapes make its relative
+    //   effect smaller (curvature was not the main loss: the loss matches
+    //   the reference's). Contact then comes at t = 36 and the smallest
+    //   label keeps about 1050 voxels at t = 84.
+    // - Advect in chunks of 2 until >= 4 contact pairs (capped at t = 70),
+    //   then on to t = 84; contacts must stay >= 4 at every chunk after
+    //   first contact.
     // Volume gate (two-sided): with refLoss the loss of the same
     // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
     // same field over the same time, each label's voxel loss lies in
     // [1.1*min(refLoss, 0) - 2%, 1.1*max(refLoss, 0) + 2%].
-    // (Shapes, placement, field and schedule: lsmo_test::Tornado.)
-    const Tornado tornado;
-    const std::map<int32_t, FloatGrid::ConstPtr> in = tornado.inputs();
+    // (Shapes, placement, field and schedule: lsmo_test::Vortex.)
+    const Vortex vortex;
+    const std::map<int32_t, FloatGrid::ConstPtr> in = vortex.inputs();
     auto m = MLS::fromSignedGrids(in, 3);
     ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}));
     const std::map<int32_t, Index64> vol0 = labelVoxelCounts(*m);
     ASSERT_TRUE(contactPairs(*m).empty());
 
-    Vec3SGrid::Ptr vel = tornado.velocity();
+    Vec3SGrid::Ptr vel = vortex.velocity();
     size_t steps = 0;
     double tContact = -1.0;
     std::set<std::pair<int32_t, int32_t>> pairs;
     const auto start = std::chrono::steady_clock::now();
-    // Keep going for two chunks after the first chunk with >= 4
-    // contact pairs, then to 1.5x that time; contacts must persist.
-    const double t = tornado.run(*m, vel, steps, tContact,
+    // Keep going to the end time; contacts must persist after first contact.
+    const double t = vortex.run(*m, vel, steps, tContact,
         [&](double tc, size_t n, const std::set<std::pair<int32_t, int32_t>>& p, int after) {
             std::string msg;
             if (!m->validate(&msg)) { ADD_FAILURE() << "t " << tc << ": " << msg; return false; }
@@ -2491,17 +2501,17 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
             EXPECT_EQ(badCover, Index64(0)) << "t " << tc;
             EXPECT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << tc;
             pairs = p;
-            std::cout << "Tornado: t " << tc << " steps " << n << " contacts " << p.size();
+            std::cout << "Vortex: t " << tc << " steps " << n << " contacts " << p.size();
             for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
             std::cout << std::endl;
-            if (after > 0) { EXPECT_GE(p.size(), size_t(4)) << "t " << tc; }
+            if (after >= 1) { EXPECT_GE(p.size(), size_t(4)) << "t " << tc; }
             return !::testing::Test::HasFailure();
         });
     ASSERT_FALSE(::testing::Test::HasFailure());
-    std::cout << "Tornado: >= 4 contact pairs first at t " << tContact << std::endl;
+    std::cout << "Vortex: >= 4 contact pairs first at t " << tContact << std::endl;
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    std::cout << "Tornado: t " << t << ", " << steps << " steps, " << secs << " s, contact pairs";
+    std::cout << "Vortex: t " << t << ", " << steps << " steps, " << secs << " s, contact pairs";
     for (const auto& pr : pairs) std::cout << " " << pr.first << "-" << pr.second;
     std::cout << std::endl;
     EXPECT_GE(pairs.size(), size_t(4));
@@ -2516,7 +2526,7 @@ TEST_F(TestLevelSetMultiObject, TornadoEightObjects)
         const double v0 = double(vol0.at(l));
         const double v1 = vol1.count(l) ? double(vol1.at(l)) : 0.0;
         const double loss = 1.0 - v1 / v0;
-        std::cout << "Tornado: label " << l << " voxels " << v0 << " -> " << v1 << " (loss "
+        std::cout << "Vortex: label " << l << " voxels " << v0 << " -> " << v1 << " (loss "
                   << 100.0 * loss << "%), reference loss " << 100.0 * refLoss << "%" << std::endl;
         EXPECT_GE(v1, 1.0) << "label " << l;
         // two-sided (a reference gain bounds MOGAC's gain too)
@@ -3203,9 +3213,11 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
     // grain size. (A legitimate numerical change elsewhere re-records them.)
-    constexpr uint64_t kTornadoHash = 0x2a727c01aed0a316ull;
+    constexpr uint64_t kVortexHash = 0xbb16401453a4e6d7ull;
     constexpr uint64_t kCubeHash[2] = {0x8b7ce4b2a0056e19ull, 0xb246f92014f05228ull}; // FG26, FG6
     constexpr uint64_t kPartitionHash = 0x9b3bc454962e6cbeull;
+    // end times of the recorded cube runs and of the serial vs parallel check
+    constexpr double kCubeHashEnd = 72.0, kSerialCheckEnd = 40.0;
     const bool record = std::getenv("LSMO_RECORD_HASHES") != nullptr;
     auto check = [&](const char* what, uint64_t h, uint64_t expected) {
         if (record) {
@@ -3216,7 +3228,7 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
         }
     };
 
-    check("tornado", stateHash(*Tornado().endState()), kTornadoHash);
+    check("vortex", stateHash(*Vortex().endState()), kVortexHash);
 
     const Conn rules[2] = {Conn::FG26_BG6, Conn::FG6_BG26};
     for (int r = 0; r < 2; ++r) {
@@ -3224,8 +3236,12 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
         // contact; serial runs match grain 64 (TopologySerialMatchesParallel,
         // FG26_BG6; the serial runs of both rules matched when recording)
         check(("cube " + lsmo_test::connectivityName(rules[r])).c_str(),
-            stateHash(*evolveCubeThroughSpheres(rules[r], 64, 72.0)), kCubeHash[r]);
+            stateHash(*evolveCubeThroughSpheres(rules[r], 64, kCubeHashEnd)), kCubeHash[r]);
     }
+    // serial vs parallel for FG6_BG26 (TopologySerialMatchesParallel covers
+    // FG26_BG6), bit for bit: a hash of every value and activity bit
+    EXPECT_EQ(stateHash(*evolveCubeThroughSpheres(Conn::FG6_BG26, 0, kSerialCheckEnd)),
+        stateHash(*evolveCubeThroughSpheres(Conn::FG6_BG26, 64, kSerialCheckEnd)));
 
     for (int grain : {0, 64}) {
         check(("partition grain " + std::to_string(grain)).c_str(),
@@ -3515,13 +3531,13 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
                 forces, none, 30.0, 5.0, 10.0);
         }
         {
-            const Tornado tornado;
+            const Vortex vortex;
             Forces forces;
-            forces.setAdvection(tornado.velocity(), 1.0f);
-            forces.setCurvatureWeight(0.01f);
-            compare("Tornado",
-                [&] { return MLS::fromSignedGrids(tornado.inputs(), hw); }, forces, none,
-                42.0, 2.0, 8.0);
+            forces.setAdvection(vortex.velocity(), 1.0f);
+            forces.setCurvatureWeight(float(Vortex::kCurvatureWeight));
+            compare("Vortex",
+                [&] { return MLS::fromSignedGrids(vortex.inputs(), hw); }, forces, none,
+                Vortex::kEndTime, 2.0, 8.0);
         }
         {
             // TopologyCubeThroughSpheres: protected cube (label 1) advected

@@ -72,7 +72,7 @@ is NOT in scope.
   (not +φ_q, which caused the earlier label race, nor the Lipschitz bound,
   which slowed motion).
 - Gate for making 1.0 the default: ContactNoCascade (probe geometry: no
-  cascade), PressureGrowth, UniformAdvection, CurvatureFlow, Tornado and the
+  cascade), PressureGrowth, UniformAdvection, CurvatureFlow, Vortex and the
   topology tests all pass at 1.0 with unchanged gates. If not, 0.5 stays the
   default and the result is reported.
 
@@ -104,7 +104,7 @@ is NOT in scope.
 - halfWidth ≥ 3 required for HJWENO5 (throw ValueError otherwise).
 - Existing equivalence tests pin FIRST_BIAS/TVD_RK1 explicitly (they compare
   against OpenVDB's first-order reference); new tests show HJWENO5/RK2 reduces
-  advection error and tornado volume loss.
+  advection error and vortex volume loss.
 
 ### A2 Speed extension
 
@@ -135,7 +135,7 @@ is NOT in scope.
   λ_l = (V_l − V_target) / (A_l · dt) · relaxation (default 0.5), where V_l is
   the label's volume (voxel count·dx³ plus interface sub-voxel correction from
   φ) and A_l its interface area estimate.
-- Gate: tornado with all labels constrained keeps each label's volume within
+- Gate: vortex with all labels constrained keeps each label's volume within
   2% of its initial value; unconstrained labels unaffected.
 
 ### M1 16-bit labels by default
@@ -164,10 +164,10 @@ is NOT in scope.
 - AuxBuffersMemory: peak bytes during step ≤ 1.3× pair memory (via
   tree.memUsage before/after; documented approximation).
 - FieldDirectReadMatchesSampler (aligned transforms: identical results).
-- Weno5ReducesError (advection and tornado volume loss vs FIRST_BIAS).
+- Weno5ReducesError (advection and vortex volume loss vs FIRST_BIAS).
 - SpeedExtensionCurvature / ExtractAccuracyAfterEvolution (gates above).
 - ClosestPointJunctions (12-junction set).
-- VolumeConstraintTornado (≤ 2%).
+- VolumeConstraintVortex (≤ 2%).
 - Int16LabelsDefault, Int16RangeThrows, Int16GridIO (register + write + read).
 - A benchmark printing per-step time before/after (informational).
 

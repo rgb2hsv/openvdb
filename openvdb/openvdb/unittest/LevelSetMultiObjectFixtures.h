@@ -5,7 +5,7 @@
 ///
 /// @brief Test-only fixture builders shared by TestLevelSetMultiObject.cc and
 /// TestLevelSetMultiObjectMesh.cc: two spheres, the seeded triple-junction
-/// set and the eight-object tornado.
+/// set and the eight-object vortex.
 
 #ifndef OPENVDB_UNITTEST_LEVEL_SET_MULTI_OBJECT_FIXTURES_HAS_BEEN_INCLUDED
 #define OPENVDB_UNITTEST_LEVEL_SET_MULTI_OBJECT_FIXTURES_HAS_BEEN_INCLUDED
@@ -178,7 +178,7 @@ junctionSet()
 
 
 ////////////////////////////////////////
-// Velocity fields and the tornado
+// Velocity fields and the vortex
 
 /// Dense Vec3SGrid over the index box @a box (voxel size @a dx), each voxel
 /// set to f(its world position); background zero.
@@ -232,7 +232,7 @@ contactPairs(const MLS& m)
     return pairs;
 }
 
-/// Tornado field:
+/// Vortex field:
 /// - Rankine-style swirl about z: u_theta = swirl*(r/R) for r < R,
 ///   swirl*(R/r) outside (divergence-free);
 /// - radial inflow towards the ring r = rs: u_r = -inflow*tanh((r - rs)/w),
@@ -243,10 +243,22 @@ contactPairs(const MLS& m)
 /// axisymmetric flow keeps the angular gaps of objects at one radius, so
 /// contact comes from objects on the same ray pressed together in the
 /// convergence zone until their gap is below a voxel.
-struct Tornado
+struct Vortex
 {
-    double R = 16.0, swirl = 0.1, inflow = 0.2, rs = 38.5, w = 1.0, updraft = 0.2,
+    /// Schedule: chunk length, cap on the time to first contact, end time.
+    static constexpr double kChunk = 2.0, kContactCap = 70.0, kEndTime = 84.0;
+
+    /// Parameters (see VortexEightObjects for why they were chosen).
+    static constexpr double kShapeScale = 1.4;   ///< factor on every shape dimension
+    static constexpr double kInflow = 0.1;       ///< far-field radial speed towards the ring
+    static constexpr double kUpdraft = 0.1;      ///< peak updraft speed
+    static constexpr double kCurvatureWeight = 0.003;
+    static constexpr double kRingClearance = 0.75; ///< voxels from the ring to each surface
+    static constexpr int kBoxHalfWidth = 80;     ///< velocity grid is [-80, 80]^3
+    double R = 16.0, swirl = 0.1, inflow = kInflow, rs = 38.5, w = 1.0, updraft = kUpdraft,
         z0 = -20.0;
+    double scale = kShapeScale, curvature = kCurvatureWeight, gap = kRingClearance;
+    int box = kBoxHalfWidth;
     openvdb::Vec3s operator()(const openvdb::Vec3d& p) const
     {
         using openvdb::Vec3d;
@@ -259,10 +271,10 @@ struct Tornado
         return openvdb::Vec3s(v);
     }
 
-    /// The tornado velocity grid: dense over [-64, 64]^3, dx = 1.
+    /// The vortex velocity grid: dense over [-80, 80]^3, dx = 1.
     openvdb::Vec3SGrid::Ptr velocity() const
     {
-        return makeVelocity(openvdb::CoordBBox(openvdb::Coord(-64), openvdb::Coord(64)), 1.0,
+        return makeVelocity(openvdb::CoordBBox(openvdb::Coord(-box), openvdb::Coord(box)), 1.0,
             *this);
     }
 
@@ -270,30 +282,33 @@ struct Tornado
     /// sphere r = 10; cube side 12; tetrahedron, octahedron, dodecahedron,
     /// icosahedron with factory scale (circumradius) 10; capsule along z with
     /// radius 5 and axis endpoints +-5; closed ring = 8-segment polygon of
-    /// radius 7 in the xy plane with tube radius 3. No rotations.
-    static openvdb::FloatGrid::Ptr shape(int32_t l, const openvdb::Vec3f& c)
+    /// radius 7 in the xy plane with tube radius 3; every length times
+    /// kShapeScale. No rotations.
+    openvdb::FloatGrid::Ptr shape(int32_t l, const openvdb::Vec3f& c) const
     {
         using namespace openvdb;
+        const float S = float(scale);
         const float dx = 1.0f, hw = 3.0f;
         switch (l) {
-        case 1: return tools::createLevelSetSphere<FloatGrid>(10.0f, c, dx, hw);
-        case 2: return tools::createLevelSetCube<FloatGrid>(12.0f, c, dx, hw);
-        case 3: return tools::createLevelSetTetrahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 4: return tools::createLevelSetOctahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 5: return tools::createLevelSetDodecahedron<FloatGrid>(10.0f, c, dx, hw);
-        case 6: return tools::createLevelSetIcosahedron<FloatGrid>(10.0f, c, dx, hw);
+        case 1: return tools::createLevelSetSphere<FloatGrid>(10.0f * S, c, dx, hw);
+        case 2: return tools::createLevelSetCube<FloatGrid>(12.0f * S, c, dx, hw);
+        case 3: return tools::createLevelSetTetrahedron<FloatGrid>(10.0f * S, c, dx, hw);
+        case 4: return tools::createLevelSetOctahedron<FloatGrid>(10.0f * S, c, dx, hw);
+        case 5: return tools::createLevelSetDodecahedron<FloatGrid>(10.0f * S, c, dx, hw);
+        case 6: return tools::createLevelSetIcosahedron<FloatGrid>(10.0f * S, c, dx, hw);
         case 7:
             return tools::createLevelSetCapsule<FloatGrid>(
-                c - Vec3f(0.0f, 0.0f, 5.0f), c + Vec3f(0.0f, 0.0f, 5.0f), 5.0f, dx, hw);
+                c - Vec3f(0.0f, 0.0f, 5.0f * S), c + Vec3f(0.0f, 0.0f, 5.0f * S), 5.0f * S, dx, hw);
         default: {
             std::vector<Vec3f> verts;
             std::vector<Vec2I> segs;
             for (int i = 0; i < 8; ++i) {
                 const double a = i * math::pi<double>() / 4.0;
-                verts.push_back(c + Vec3f(float(7.0 * std::cos(a)), float(7.0 * std::sin(a)), 0.0f));
+                verts.push_back(c + Vec3f(float(7.0 * S * std::cos(a)),
+                    float(7.0 * S * std::sin(a)), 0.0f));
                 segs.push_back(Vec2I(i, (i + 1) % 8));
             }
-            return tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 3.0f, dx, hw);
+            return tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 3.0f * S, dx, hw);
         }
         }
     }
@@ -301,7 +316,7 @@ struct Tornado
     /// Initial signed grids, labels 1-8: four rays at angles k*90 degrees in
     /// the z = z0 plane; label k+1 inside and label k+5 outside the ring
     /// r = rs (between voxel centers) on ray k, each placed so its surface
-    /// point nearest the ring is 1.5 voxels from it (facing gap 3 voxels).
+    /// point nearest the ring is kRingClearance voxels from it.
     std::map<int32_t, openvdb::FloatGrid::ConstPtr> inputs() const
     {
         using namespace openvdb;
@@ -320,16 +335,15 @@ struct Tornado
             const Vec3d ray(std::cos(a), std::sin(a), 0.0);
             const bool inner = l <= 4;
             const double e = extent(*shape(l, Vec3f(0.0f)), inner ? ray : -ray);
-            const double rad = inner ? rs - 1.5 - e : rs + 1.5 + e;
+            const double rad = inner ? rs - gap - e : rs + gap + e;
             in[l] = shape(l, Vec3f(ray * rad + Vec3d(0.0, 0.0, z0)));
         }
         return in;
     }
 
-    /// @brief Run the tornado schedule on @a m: advection weight 1, curvature
-    /// weight 0.01, chunks of 2 until >= 4 contact pairs (capped at t = 40),
-    /// then two more chunks to t2, then further chunks to 1.5 * t2 (first
-    /// contact at t = 24: t2 = 28, end t = 42).
+    /// @brief Run the vortex schedule on @a m: advection weight 1, curvature
+    /// weight 0.01, chunks of kChunk until >= 4 contact pairs (capped at
+    /// t = kContactCap), then on in chunks to the end time kEndTime.
     /// @details perChunk(t, steps, pairs, afterContact) runs after every
     /// chunk (afterContact: chunks completed after the first chunk with
     /// >= 4 pairs, -1 before); returning false stops the run.
@@ -341,22 +355,20 @@ struct Tornado
     {
         Forces forces;
         forces.setAdvection(vel, 1.0f);
-        forces.setCurvatureWeight(0.01f);
+        forces.setCurvatureWeight(float(curvature));
         openvdb::tools::LevelSetMultiObject<MLS, Forces> lsmo(m, forces);
-        const double tCap = 40.0, chunk = 2.0;
         double t = 0.0;
         steps = 0;
         tContact = -1.0;
         int after = -1;
-        double tEnd = -1.0; // 1.5 x the time two chunks after first contact
-        while (after < 2 || t < tEnd - 1e-9) {
-            if (after < 0 && t >= tCap - 1e-9) break;
-            const double t1 = tEnd > 0.0 ? std::min(t + chunk, tEnd) : t + chunk;
+        while (after < 0 || t < kEndTime - 1e-9) {
+            if (after < 0 && t >= kContactCap - 1e-9) break;
+            const double t1 = after >= 0 ? std::min(t + kChunk, kEndTime) : t + kChunk;
             steps += lsmo.advect(t, t1);
             t = t1;
             const auto pairs = contactPairs(m);
             if (after >= 0) {
-                if (++after == 2) tEnd = 1.5 * t;
+                ++after;
             } else if (pairs.size() >= 4) {
                 after = 0;
                 tContact = t;
@@ -366,7 +378,7 @@ struct Tornado
         return t;
     }
 
-    /// The tornado end state (labels 1-8 after run()).
+    /// The vortex end state (labels 1-8 after run()).
     MLS::Ptr endState() const
     {
         MLS::Ptr m = MLS::fromSignedGrids(inputs(), 3);

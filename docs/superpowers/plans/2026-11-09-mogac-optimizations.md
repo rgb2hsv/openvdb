@@ -89,10 +89,10 @@
 - Consumes: Task 1 scratch masks.
 - Produces: `int MultiLevelSetRedistance::redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)` — solves only active, non-frozen voxels in `dirty`; others keep values. Evolver: `void setFullRedistance(bool)` (default false = incremental). Dirty mask = dilate(projected ∪ label-changed ∪ newly activated, halfWidth) ∩ band. Warm start per spec §S2.
 
-- [ ] **Step 1: Write failing test `IncrementalRedistanceMatchesFull`:** for PressureGrowth, UniformAdvection, CurvatureFlow, Tornado and TopologyCubeThroughSpheres scenarios, run with `setFullRedistance(true)` and `(false)`; assert max |φ_full − φ_incr| ≤ 1e-4·dx over active voxels and identical label trees after every chunk.
+- [ ] **Step 1: Write failing test `IncrementalRedistanceMatchesFull`:** for PressureGrowth, UniformAdvection, CurvatureFlow, Vortex and TopologyCubeThroughSpheres scenarios, run with `setFullRedistance(true)` and `(false)`; assert max |φ_full − φ_incr| ≤ 1e-4·dx over active voxels and identical label trees after every chunk.
 - [ ] **Step 2: Run** — FAIL.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run all** — pass; report per-step time before/after on the Tornado scenario.
+- [ ] **Step 4: Run all** — pass; report per-step time before/after on the Vortex scenario.
 - [ ] **Step 5: Commit** — `"MOGAC: incremental redistancing over the dirty region"`
 
 ---
@@ -133,9 +133,9 @@
 
 **Interfaces:** `lsmo_internal::CoordHash` (hash for `Coord`, e.g. from its three components; usable with std::unordered_map/set). Internal containers switch to hashed versions: `mInactive`, `mFixed`, `mProtected` (per-candidate lookups) → `std::unordered_set<int32_t>` (public setters keep taking `std::set<int32_t>` and convert; getters that return `const std::set&` keep an ordered copy or change to return by value — choose and document); `mLabelAdvection`, `mKinematic` → `std::unordered_map<int32_t, …>` where only looked up, keeping any order-dependent iteration deterministic; per-step `std::map<Coord, size_t>` leaf index, `claimObject`, wrap `adds`, `claimed` → `std::unordered_map/set<Coord, …, CoordHash>`. Wherever iteration order affects results (serial apply of deferred changes, wrap adds, claim order, first-object-wins), iterate over a sorted vector of keys or keep the existing ordered container — results must stay identical and thread-count independent. Public API containers (fromSignedGrids input map, multiObjectToMesh result map, label-set setters) stay ordered.
 
-- [ ] **Step 1: Write test `HashedContainersKeepResults`:** run the Tornado, TopologyCubeThroughSpheres (both rules, kinematic spheres) and PartitionInvariant scenarios and compare φ/label tree hashes against values recorded from the pre-change build (record them first, commit them as constants in the test); also grain 0 vs 64 identical.
+- [ ] **Step 1: Write test `HashedContainersKeepResults`:** run the Vortex, TopologyCubeThroughSpheres (both rules, kinematic spheres) and PartitionInvariant scenarios and compare φ/label tree hashes against values recorded from the pre-change build (record them first, commit them as constants in the test); also grain 0 vs 64 identical.
 - [ ] **Step 2: Implement** the container changes.
-- [ ] **Step 3: Run all** `TestLevelSetMultiObject*` — pass; numeric outputs identical; report per-step timing before/after on Tornado and the cube test (keep a change only where it is not slower — revert any hashed container that measures slower and note it).
+- [ ] **Step 3: Run all** `TestLevelSetMultiObject*` — pass; numeric outputs identical; report per-step timing before/after on Vortex and the cube test (keep a change only where it is not slower — revert any hashed container that measures slower and note it).
 - [ ] **Step 4: Commit** — `"MOGAC: hashed containers on hot paths"`
 
 ---
@@ -190,7 +190,7 @@
 **Interfaces:**
 - Produces: evolver `void setSpatialScheme(math::BiasedGradientScheme)` (FIRST_BIAS or HJWENO5_BIAS, default HJWENO5_BIAS; others throw `ValueError`), `void setTemporalScheme(math::TemporalIntegrationScheme)` (TVD_RK1 or TVD_RK2, default TVD_RK2); `LabelAwareStencil` gains radius-3 axis reads and `void upwindDifferencesWeno5(float dneg[3], float dpos[3]) const`. Requires halfWidth ≥ 3 for HJWENO5 (throw at construction/setter). `MultiObjectForces` uses the evolver-selected upwind differences (passed via the stencil).
 
-- [ ] **Step 1: Write failing tests:** pin `SingleObject*` to FIRST_BIAS/TVD_RK1 explicitly; `Weno5ReducesAdvectionError` (SingleObjectAdvection scenario: HJWENO5/RK2 symdiff vs analytic < 0.6 × FIRST_BIAS/RK1's); `Weno5ReducesTornadoLoss` (Tornado with defaults: worst per-label volume loss < 0.6 × the FIRST_BIAS/RK1 run's); `Rk2StagesRespectProtection` = TopologyCubeThroughSpheres and FixedLabels pass with defaults (Review Focus 2); `Weno5NeedsHalfWidth3` (halfWidth 2 + HJWENO5 → `ValueError`).
+- [ ] **Step 1: Write failing tests:** pin `SingleObject*` to FIRST_BIAS/TVD_RK1 explicitly; `Weno5ReducesAdvectionError` (SingleObjectAdvection scenario: HJWENO5/RK2 symdiff vs analytic < 0.6 × FIRST_BIAS/RK1's); `Weno5ReducesVortexLoss` (Vortex with defaults: worst per-label volume loss < 0.6 × the FIRST_BIAS/RK1 run's); `Rk2StagesRespectProtection` = TopologyCubeThroughSpheres and FixedLabels pass with defaults (Review Focus 2); `Weno5NeedsHalfWidth3` (halfWidth 2 + HJWENO5 → `ValueError`).
 - [ ] **Step 2: Run** — FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run all** — pass; non-SingleObject tests keep their gates with the new defaults (report any gate that needed a controller ruling instead of changing it).
@@ -235,7 +235,7 @@
 **Interfaces:**
 - Produces: evolver `void setVolumeConstraint(int32_t label, double targetVolume)`, `void preserveInitialVolume(int32_t label)`, `void clearVolumeConstraints()`, `void setVolumeRelaxation(double)` (default 0.5), `double labelVolume(int32_t) const` (voxel count·dx³ + sub-voxel interface correction from φ). Per step: λ_l = relaxation·(V_l − V_target)/(A_l·dt), A_l from the interface voxels' |∇ψ|·dx² sum; skipped (λ_l = 0) when A_l·dt ≤ 1e-12 or V_l = 0.
 
-- [ ] **Step 1: Write failing tests:** `VolumeConstraintTornado` — Tornado with every label `preserveInitialVolume`: each label's volume within 2% of initial at the end, contacts ≥ 4; unconstrained labels in a mixed run behave as before. `VolumeConstraintVanishingLabel` — a label that vanishes under strong inward pressure with a constraint on another label: no NaN/inf, `validate()` holds (Review Focus 4).
+- [ ] **Step 1: Write failing tests:** `VolumeConstraintVortex` — Vortex with every label `preserveInitialVolume`: each label's volume within 2% of initial at the end, contacts ≥ 4; unconstrained labels in a mixed run behave as before. `VolumeConstraintVanishingLabel` — a label that vanishes under strong inward pressure with a constraint on another label: no NaN/inf, `validate()` holds (Review Focus 4).
 - [ ] **Step 2: Run** — FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run all** — pass.
@@ -251,7 +251,7 @@
 - Consumes: `lsmo_internal::closestPointPsi` (Task 8).
 - Produces: evolver `void setMaxInterfaceMotion(double voxels)` (0.5 or 1.0; other values throw `ValueError`). At 1.0: projected set = φ ≤ 1.5·dx or within one voxel of a different label; ring-2 candidates from the 26-neighborhood with ψ_l = `closestPointPsi`.
 
-- [ ] **Step 1: Write failing tests:** `FullVoxelMotion` — run ContactNoCascade (probe geometry: label-2 extent growth ≤ 1 voxel per step), PressureGrowth, UniformAdvection, CurvatureFlow, Tornado, TopologyCubeThroughSpheres and FixedLabels at motion 1.0 with their existing gates; also assert the step count is ≤ 0.6 × the 0.5 run's for PressureGrowth.
+- [ ] **Step 1: Write failing tests:** `FullVoxelMotion` — run ContactNoCascade (probe geometry: label-2 extent growth ≤ 1 voxel per step), PressureGrowth, UniformAdvection, CurvatureFlow, Vortex, TopologyCubeThroughSpheres and FixedLabels at motion 1.0 with their existing gates; also assert the step count is ≤ 0.6 × the 0.5 run's for PressureGrowth.
 - [ ] **Step 2: Run** — FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run all.** If every gate passes at 1.0, make 1.0 the default and re-run everything; otherwise keep 0.5 as the default, keep `FullVoxelMotion` asserting only the gates that pass, and report the failing ones with numbers (controller rules).
@@ -263,7 +263,7 @@
 
 **Files:** Modify both tool headers (Doxygen for every new setter/default), `pendingchanges/multi_object_level_set.txt`; Test `TestLevelSetMultiObject.cc` (`StepBenchmark`).
 
-- [ ] **Step 1: Write `StepBenchmark`** (informational, prints only): Tornado and a ~1M-voxel sphere-growth scene; per-step time and steps for t = 10 with (a) FIRST_BIAS/RK1/no splitting/full redistance/0.5 motion — the pre-plan configuration — and (b) defaults; print both and the speedup.
+- [ ] **Step 1: Write `StepBenchmark`** (informational, prints only): Vortex and a ~1M-voxel sphere-growth scene; per-step time and steps for t = 10 with (a) FIRST_BIAS/RK1/no splitting/full redistance/0.5 motion — the pre-plan configuration — and (b) defaults; print both and the speedup.
 - [ ] **Step 2: Docs:** document every new setter, the new defaults, `registerMultiLevelSetGridTypes()` and the int16 range; update pendingchanges (wrapped like the other entries).
 - [ ] **Step 3: Run all** `TestLevelSetMultiObject*` in `build/`; rebuild `build-strict/` (OPENVDB_CXX_STRICT=ON) in the background and run the same filter there — no warnings.
 - [ ] **Step 4: Commit** — `"MOGAC optimizations: benchmark, docs, pending changes"`

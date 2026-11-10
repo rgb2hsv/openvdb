@@ -484,21 +484,29 @@ Required integration tests:
    CFL ≈ 0.13, where first-order upwinding is most diffusive; operator
    splitting (advection at its own CFL, curvature substepped) is a known
    follow-up.
-9. **Eight objects in a tornado vortex** (parameters per ruling R27). Eight
+9. **Eight objects in a vortex** (parameters per rulings R27 and O18). Eight
    shapes with **eight distinct labels** (sphere, cube, tetrahedron,
    octahedron, dodecahedron, icosahedron, capsule, closed tube ring; via
    `LevelSetSphere`, `LevelSetPlatonic`, `LevelSetTubes`), each of
-   circumradius 10·dx, dx = 1. They sit in pairs on four rays (angles k·90°)
+   circumradius 14·dx (the original sizes times 1.4), dx = 1. They sit in pairs on four rays (angles k·90°)
    in the plane z = −20, one inside and one outside the ring r = 38.5, each
-   with its nearest surface point 1.5·dx from the ring. Velocity field:
+   with its nearest surface point 0.75·dx from the ring. Velocity field:
    Rankine-style swirl about z (core R = 16, amplitude 0.1), radial inflow
-   towards the ring u_r = −0.2·tanh(r − 38.5), updraft 0.2·exp(−r²/(2R²)).
+   towards the ring u_r = −0.1·tanh(r − 38.5), updraft 0.1·exp(−r²/(2R²)); the velocity grid is
+   dense over [−80, 80]³.
    (An exact flow never makes disjoint objects touch and an axisymmetric
    flow keeps the angular gaps of objects at one radius, so contact comes
    from pairs pressed together in the convergence zone until their gap is
-   below a voxel.) Advection weight 1, curvature weight 0.01; advect in
-   chunks of 2 until ≥ 4 contact pairs (capped at t = 40), then two more
-   chunks during which the contacts must persist (ruling R31).
+   below a voxel.) Advection weight 1, curvature weight 0.003; advect in
+   chunks of 2 until ≥ 4 contact pairs (capped at t = 70), then on to
+   t = 84 with the contacts required to persist at every chunk (rulings R31
+   and O18). The run is long, so the field is weak: every object keeps
+   translating towards the ring at the far-field inflow speed while its face
+   at the ring cannot move, so the flow flattens it by inflow × (time in
+   contact), and the original strength (inflow and updraft 0.2, circumradius
+   10) lost the capsule by t = 58; halving the inflow and updraft, starting
+   the pairs closer and enlarging the shapes keeps every label alive (smallest
+   about 1050 voxels at t = 84).
    - Every chunk: `validate()`, partition invariant, no NaN.
    - At end: ≥ 4 distinct label pairs sharing a face; every label still owns
      at least one voxel; with refLoss the volume loss of the same shape

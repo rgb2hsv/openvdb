@@ -656,16 +656,16 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshManifold)
         printStats("two spheres (" + std::to_string(tris) + " triangles)", stats);
     }
     {
-        auto m = lsmo_test::Tornado().endState();
+        auto m = lsmo_test::Vortex().endState();
         const auto start = std::chrono::steady_clock::now();
         auto meshes = meshWithStats(*m, s, stats);
-        std::cout << "[Mesh] tornado end state: multiObjectToMesh "
+        std::cout << "[Mesh] vortex end state: multiObjectToMesh "
                   << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                   << " s" << std::endl;
         EXPECT_EQ(meshes.size(), size_t(8));
         size_t tris = 0;
-        expectManifold("tornado", *m, meshes, &tris);
-        printStats("tornado end state (" + std::to_string(tris) + " triangles)", stats);
+        expectManifold("vortex", *m, meshes, &tris);
+        printStats("vortex end state (" + std::to_string(tris) + " triangles)", stats);
         // identical output serial and parallel, also with normals
         tools::MultiObjectMeshSettings serial = s, parallel = s;
         serial.grainSize = 0;
@@ -1121,13 +1121,13 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
 
 ////////////////////////////////////////
 // Contouring all labels at once against one extractSignedDistance +
-// volumeToMesh per label, on the tornado end state. The timings are
+// volumeToMesh per label, on the vortex end state. The timings are
 // informational only (wall-clock comparisons are unreliable on shared
 // machines); only the output is checked.
 TEST_F(TestLevelSetMultiObjectMesh, MeshBenchmark)
 {
-    const lsmo_test::Tornado tornado;
-    auto m = tornado.endState();
+    const lsmo_test::Vortex vortex;
+    auto m = vortex.endState();
     ASSERT_TRUE(m);
     const std::vector<int32_t> labels = m->labelSet();
     ASSERT_GE(labels.size(), size_t(2));

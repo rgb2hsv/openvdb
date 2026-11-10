@@ -272,11 +272,11 @@ Below, "Run `<Filter>`" means the second command with that filter.
 
 ---
 
-### Task 8: Eight objects in a tornado vortex (spec test 9)
+### Task 8: Eight objects in a vortex (spec test 9)
 
 **Files:** Test only, `TestLevelSetMultiObject.cc`.
 
-- [ ] **Step 1: Write test `TornadoEightObjects`.** Domain index box [−64, 64]³, dx = 1.
+- [ ] **Step 1: Write test `VortexEightObjects`.** Domain index box [−64, 64]³, dx = 1.
   - Objects at radius 40 in the z = −20 plane, angles k·45°, labels 1–8, all of characteristic size 8. In order: `createLevelSetSphere`, `createLevelSetCube`, `createLevelSetTetrahedron`, `createLevelSetOctahedron`, `createLevelSetDodecahedron`, `createLevelSetIcosahedron`, `createLevelSetCapsule`, and a closed ring from `createLevelSetTubeComplex` (8-segment polygon, radius 6, tube radius 2).
   - Velocity `Vec3SGrid` over the domain with r = √(x²+y²) and core radius R = 16:
     - swirl u_θ = 1.0·(r/R) for r < R, else 1.0·(R/r);
@@ -288,8 +288,8 @@ Below, "Run `<Filter>`" means the second command with that filter.
     - distinct label pairs (a, b), a, b ≠ 0, sharing a face ≥ 4;
     - every label still owns ≥ 1 voxel;
     - per-label volume (voxel count with L == l) within ±25% of initial.
-- [ ] **Step 2: Run `TestLevelSetMultiObject.TornadoEightObjects`** — PASS. If contact < 4, increase t to 200 (record the change in the test comment); don't change the thresholds.
-- [ ] **Step 3: Commit** — `git commit -m "Add eight-object tornado vortex integration test"`
+- [ ] **Step 2: Run `TestLevelSetMultiObject.VortexEightObjects`** — PASS. If contact < 4, increase t to 200 (record the change in the test comment); don't change the thresholds.
+- [ ] **Step 3: Commit** — `git commit -m "Add eight-object vortex integration test"`
 
 ---
 
@@ -336,7 +336,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
 - Produces: `struct LabelMesh {...}` and `multiObjectToMesh(...)` exactly as §6.2.
 
 - [ ] **Step 1: Write failing tests.** Helpers: `bool isClosedManifold(const LabelMesh&)` (edge→triangle count == 2, each vertex link one cycle, no zero-area triangles); `int components(const LabelMesh&)`; `int eulerChar(const LabelMesh&)`; `digitalTopology(labelGrid, l, conn) -> {fgComponents, cavities, chi}`. The last one uses a BFS with the chosen adjacency, and χ from the cubical complex (V − E + F − C over the closed unit cubes of the voxels, with the complex chosen per connectivity as in Lachaud–Montanvert).
-  - `MeshManifold` (test 11): two spheres, tornado end state, and 5 random-noise label volumes (seeded, 24³, 4 labels): `isClosedManifold` for every label mesh.
+  - `MeshManifold` (test 11): two spheres, vortex end state, and 5 random-noise label volumes (seeded, 24³, 4 labels): `isClosedManifold` for every label mesh.
   - `MeshTopology` (test 12), for each connectivity, assert components == fgComponents + cavities and χ(M) == 2·χ(R) on:
     - solid torus;
     - two cubes touching only along an edge: 1 component under fg 26 and 18, 2 under fg 6;
@@ -395,7 +395,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
 - Modify: both headers (Doxygen)
 - Create: `pendingchanges/multi_object_level_set.txt`
 
-- [ ] **Step 1: Write `MeshBenchmark`** — the tornado end state (fixture header). Time `multiObjectToMesh` (all labels) against the sum over labels of `extractSignedDistance` + `volumeToMesh`, best of 3 runs each, and print both. `EXPECT_LE(multiTime, perLabelTime)`.
+- [ ] **Step 1: Write `MeshBenchmark`** — the vortex end state (fixture header). Time `multiObjectToMesh` (all labels) against the sum over labels of `extractSignedDistance` + `volumeToMesh`, best of 3 runs each, and print both. `EXPECT_LE(multiTime, perLabelTime)`.
 - [ ] **Step 2: Run `TestLevelSetMultiObjectMesh.MeshBenchmark`** — PASS, with timings printed.
 - [ ] **Step 3: Doxygen.**
   - File-level `@brief`, usage example (build pair → forces → `advect` → `extractSignedDistance` → `multiObjectToMesh`) and the §10 references.
