@@ -2073,7 +2073,50 @@ public:
     /// @brief Labels whose digital topology is preserved (default
     /// none): a label change a -> b at a voxel is applied only if the voxel is
     /// a simple point of every protected label in {a, b}.
-    void setTopologyPreservingLabels(std::set<int32_t> labels) { mProtected = std::move(labels); }
+    /// @throw ValueError if a label is kinematic, or if label 0 is listed
+    /// while kinematic labels exist (passive label 0 takes over the voxels
+    /// an obstacle leaves, which cannot be protected).
+    void setTopologyPreservingLabels(std::set<int32_t> labels)
+    {
+        for (const int32_t l : labels) {
+            if (this->isKinematic(l)) {
+                OPENVDB_THROW(ValueError, "LevelSetMultiObject: kinematic label " << l
+                    << " cannot be topology-preserving");
+            }
+        }
+        if (labels.count(0) && !mKinematic.empty()) {
+            OPENVDB_THROW(ValueError,
+                "LevelSetMultiObject: label 0 cannot be topology-preserving with kinematic labels");
+        }
+        mProtected = std::move(labels);
+    }
+    /// @brief Minimum phi, as a fraction of the voxel size, kept at the
+    /// active voxels of topology-preserving labels and at their face
+    /// neighbours across a protected interface, after every change the
+    /// evolver makes (only while some label is topology-preserving; other
+    /// evolutions, the factories and extraction are unaffected). It keeps
+    /// interface vertices of protected labels apart, so their meshes stay
+    /// manifold. Default 1e-3.
+    /// @throw ValueError if @a fractionOfDx is negative or not finite.
+    void setMinimumPhi(double fractionOfDx)
+    {
+        if (!(fractionOfDx >= 0.0) || !std::isfinite(fractionOfDx)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: invalid minimum phi");
+        }
+        mMinPhiFraction = fractionOfDx;
+    }
+    double minimumPhi() const { return mMinPhiFraction; }
+    /// @brief The phi floor in world units: minimumPhi()*dx if some label is
+    /// topology-preserving, else 0 (pass it as
+    /// MultiObjectMeshSettings::minimumPhi).
+    double phiFloor() const
+    {
+        return mProtected.empty() ? 0.0 : mMinPhiFraction * mMls.voxelSize();
+    }
+    /// @brief Whether the phi floor holds (see setMinimumPhi()); true if no
+    /// label is topology-preserving.
+    /// @param message if non-null, receives the first violation.
+    bool validateTopologyFloor(std::string* message = nullptr) const;
     /// @brief Adjacency pair of topology preservation (default FG26_BG6).
     void setConnectivity(MultiObjectConnectivity conn) { mConnectivity = conn; }
 
@@ -2084,12 +2127,23 @@ public:
     /// convention of math::Mat4d::transform (x_t = motion(t).transform(x)).
     /// See the class documentation. Voxels already labelled @a label that
     /// lie in or near the object at the first step are re-stamped by it.
-    /// @throw ValueError if @a label is 0, @a sdf is null or @a motion is empty.
+    /// Kinematic voxels never take voxels of fixed or other kinematic
+    /// labels, nor change their phi.
+    /// @throw ValueError if @a label is 0, @a sdf is null, @a motion is
+    /// empty, @a label is topology-preserving or label 0 is.
     void setKinematicLabel(int32_t label, FloatGrid::ConstPtr sdf,
         std::function<math::Mat4d(double)> motion)
     {
         if (label == 0) OPENVDB_THROW(ValueError, "LevelSetMultiObject: kinematic label 0");
         if (!sdf) OPENVDB_THROW(ValueError, "LevelSetMultiObject: null kinematic sdf");
+        if (this->isProtected(label)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: topology-preserving label " << label
+                << " cannot be kinematic");
+        }
+        if (this->isProtected(0)) {
+            OPENVDB_THROW(ValueError,
+                "LevelSetMultiObject: no kinematic labels while label 0 is topology-preserving");
+        }
         if (!motion) OPENVDB_THROW(ValueError, "LevelSetMultiObject: empty kinematic motion");
         Kinematic k;
         k.sdf = std::move(sdf);
@@ -2405,6 +2459,23 @@ private:
 
     void stampKinematic(double t, BoolTreeT& freeze);
 
+    /// Whether @a p (own label @a own) is subject to the phi floor: a voxel
+    /// of a protected label or a face neighbour of one.
+    template<typename AccT>
+    bool floorApplies(AccT& lab, const Coord& p, int32_t own) const
+    {
+        if (this->isProtected(own)) return true;
+        const Coord* offs = lsmo_internal::faceOffsets();
+        for (int f = 0; f < 6; ++f) {
+            const int32_t l = static_cast<int32_t>(lab.getValue(p + offs[f]));
+            if (l != own && this->isProtected(l)) return true;
+        }
+        return false;
+    }
+    /// Raise phi to phiFloor() wherever floorApplies (no-op without
+    /// protected labels).
+    void enforcePhiFloor();
+
     bool isProtected(int32_t l) const { return !mProtected.empty() && mProtected.count(l) != 0; }
     /// Whether a change @a from -> @a to involves a protected label.
     bool involvesProtected(int32_t from, int32_t to) const
@@ -2503,6 +2574,7 @@ private:
     std::map<int32_t, Kinematic> mKinematic;
     double mTime = 0.0;
     MultiObjectConnectivity mConnectivity = MultiObjectConnectivity::FG26_BG6;
+    double mMinPhiFraction = 1e-3;
     float mCfl = 0.999f;
     bool mClampSpeed = false;
     int mGrainSize = 1;
@@ -2676,6 +2748,53 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::enforcePhiFloor()
+{
+    if (mProtected.empty()) return;
+    const float eps = float(this->phiFloor());
+    if (!(eps > 0.0f)) return;
+    const LabelTreeT& labels = mMls.labels()->tree();
+    tree::LeafManager<FloatTreeT> leafs(mMls.phi()->tree());
+    forEachIndex(leafs.leafCount(), [&](size_t i) {
+        tree::ValueAccessor<const LabelTreeT> lab(labels);
+        for (auto it = leafs.leaf(i).beginValueOn(); it; ++it) {
+            if (!(*it < eps)) continue;
+            const Coord p = it.getCoord();
+            if (this->floorApplies(lab, p, static_cast<int32_t>(lab.getValue(p)))) {
+                it.setValue(eps);
+            }
+        }
+    });
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+bool
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::validateTopologyFloor(
+    std::string* message) const
+{
+    if (mProtected.empty()) return true;
+    const float eps = float(this->phiFloor());
+    tree::ValueAccessor<const LabelTreeT> lab(mMls.labels()->tree());
+    for (auto it = mMls.phi()->tree().cbeginValueOn(); it; ++it) {
+        if (!(*it < eps)) continue;
+        const Coord p = it.getCoord();
+        if (this->floorApplies(lab, p, static_cast<int32_t>(lab.getValue(p)))) {
+            if (message) {
+                std::ostringstream os;
+                os << "phi " << *it << " < floor " << eps << " at " << p << " (label "
+                   << lab.getValue(p) << ")";
+                *message = os.str();
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     double t, BoolTreeT& freeze)
 {
@@ -2686,7 +2805,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     const float bg = phi.background();
     // phi of stamped voxels is at least this, so that a voxel on the
     // obstacle surface is not ambiguous (phi = 0)
-    const float minPhi = float(1e-3 * dx);
+    const float minPhi = float(std::max(1e-3 * dx, this->phiFloor()));
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
@@ -2735,14 +2854,18 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
             const float psiRaw = tools::BoxSampler::sample(sdfAcc, sdfXform.worldToIndex(rest));
             const float psi = psiRaw < 0.0f ? std::min(psiRaw, -minPhi) : std::max(psiRaw, minPhi);
             const int32_t own = static_cast<int32_t>(labAcc.getValue(p));
+            // fixed and other kinematic labels are never taken or changed
+            if (own != label && this->isFixed(own)) continue;
             if (psi < 0.0f) {
                 // inside the obstacle: claims label 0 and unprotected labels;
                 // claims on protected labels are decided below
                 phiAcc.touchLeaf(p);
                 labAcc.touchLeaf(p);
                 if (own != label && this->isProtected(own)) {
-                    claims[0].push_back(Deferred{p, own, label, -psi});
-                    claimObject[p] = objects.size() - 1;
+                    // one claim per voxel when objects overlap
+                    if (claimObject.emplace(p, objects.size() - 1).second) {
+                        claims[0].push_back(Deferred{p, own, label, -psi});
+                    }
                 } else {
                     claim(p, label, -psi);
                 }
@@ -2995,7 +3118,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
     const std::vector<std::vector<Deferred>>& deferred,
     FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze)
 {
-    const float barrier = float(1e-3 * mMls.voxelSize());
+    const float barrier = float(std::max(1e-3 * mMls.voxelSize(), this->phiFloor()));
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
@@ -3072,9 +3195,10 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
         for (const auto& kv : added) {
             phiW.setValueOnly(kv.first, bg);
             // an activated voxel keeps its inactive label when the change
-            // involves a protected label (topology preservation)
+            // involves a protected label (topology preservation) or would
+            // make it a fixed or kinematic label's voxel (they never grow)
             const LabelT l = labW.getValue(kv.first);
-            if (this->isKinematic(static_cast<int32_t>(l))
+            if (this->isFixed(static_cast<int32_t>(l))
                 || this->involvesProtected(static_cast<int32_t>(kv.second),
                     static_cast<int32_t>(l))) {
                 labW.setValueOnly(kv.first, kv.second);
@@ -3083,13 +3207,16 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
     }
 
     // c. redistance: projected and fixed voxels frozen, the rest solved with
-    // signed reflection
+    // signed reflection (the phi floor of protected interfaces holds for
+    // its input and its output)
+    this->enforcePhiFloor();
     {
         MultiLevelSetRedistance<MultiLevelSetT> redist(mMls);
         redist.setTolerance(mTolerance);
         redist.setGrainSize(mGrainSize);
         redist.redistance(freeze);
     }
+    this->enforcePhiFloor();
 
     // d. deactivate phi >= halfWidth*dx in both trees (labels kept)
     {

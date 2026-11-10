@@ -77,6 +77,12 @@ template<typename EvolverT>
 inline Connectivity
 connectivityOf(const EvolverT& evolver) { return evolver.connectivity(); }
 
+/// The phi floor (world units) the evolver keeps at protected interfaces
+/// (LevelSetMultiObject::phiFloor), to mesh its state as it sees it.
+template<typename EvolverT>
+inline double
+phiFloorOf(const EvolverT& evolver) { return evolver.phiFloor(); }
+
 
 ////////////////////////////////////////
 // Digital topology
@@ -506,7 +512,8 @@ dumpDirectory(const std::string& tag)
 {
     namespace fs = std::filesystem;
     const char* env = std::getenv("OPENVDB_MOGAC_DEBUG_DIR");
-    fs::path dir = (env && *env) ? fs::path(env) : fs::temp_directory_path() / "openvdb_mogac_debug";
+    fs::path dir = (env && *env) ? fs::path(env)
+                                 : fs::temp_directory_path() / "openvdb_mogac_debug";
     std::string test = "no_test";
     if (const auto* info = ::testing::UnitTest::GetInstance()->current_test_info()) {
         test = std::string(info->test_suite_name()) + "." + info->name();
@@ -588,16 +595,20 @@ writeReport(const std::filesystem::path& file, const TopologyReport& r,
 /// rule and every mismatch. A debug dump (see the file documentation) is
 /// written to <dir>/<test>/<tag>/ when the check fails, or always when
 /// OPENVDB_MOGAC_DEBUG_DIR is set; the message then gives its directory.
+/// @a minimumPhi (world units) is passed to the mesher
+/// (MultiObjectMeshSettings::minimumPhi); give an evolver's phiFloorOf().
 template<typename MLS>
 inline TopologyReport
 verifyLabelTopology(const MLS& mls, int32_t label, const openvdb::CoordBBox& domain,
-    Connectivity conn, const std::string& tag, const DigitalTopology* expected = nullptr)
+    Connectivity conn, const std::string& tag, const DigitalTopology* expected = nullptr,
+    double minimumPhi = 0.0)
 {
     TopologyReport r;
     RegionDetails details;
     r.region = digitalTopology(*mls.labels(), label, domain, conn, &details);
     openvdb::tools::MultiObjectMeshSettings settings;
     settings.connectivity = conn;
+    settings.minimumPhi = minimumPhi;
     const auto meshes = openvdb::tools::multiObjectToMesh(mls, {label}, settings);
     const auto it = meshes.find(label);
     const openvdb::tools::LabelMesh mesh = it != meshes.end() ? it->second
@@ -663,8 +674,8 @@ public:
         mHadOld = old != nullptr;
         if (old) mOld = old;
         static int counter = 0;
-        mPath = fs::temp_directory_path()
-            / ("openvdb_mogac_test_" + std::to_string(detail::processId()) + "_" + std::to_string(counter++));
+        mPath = fs::temp_directory_path() / ("openvdb_mogac_test_"
+            + std::to_string(detail::processId()) + "_" + std::to_string(counter++));
         fs::remove_all(mPath);
         fs::create_directories(mPath);
         detail::setEnv("OPENVDB_MOGAC_DEBUG_DIR", mPath.string());

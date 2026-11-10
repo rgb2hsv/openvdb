@@ -919,6 +919,65 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTopologyUtility)
 }
 
 
+// Regression: a 2x2x2 cell whose two antipodal out-corners have
+// phi = 1e-3*dx (FG6_BG26 tube of the outside region) once made the tube
+// retriangulation reuse a chord (a pinched double cone, chi 3). Corner
+// values are those of the cell found in the cube-through-spheres run.
+TEST_F(TestLevelSetMultiObjectMesh, MeshTubeNoRepeatedChord)
+{
+    // cell corners at (0..1)^3 + lo; (1,0,0) and (0,1,1) are label 0
+    const Coord lo(1, 1, 1);
+    const std::map<Coord, float> cell = {
+        {Coord(0, 0, 0), 0.0494777f}, {Coord(1, 0, 0), 0.001f},
+        {Coord(0, 1, 0), 0.0498429f}, {Coord(1, 1, 0), 0.162809f},
+        {Coord(0, 0, 1), 0.257466f},  {Coord(1, 0, 1), 0.472167f},
+        {Coord(0, 1, 1), 0.001f},     {Coord(1, 1, 1), 0.239218f}};
+    auto xform = math::Transform::createLinearTransform(1.0);
+    FloatGrid::Ptr phi = FloatGrid::create(3.0f);
+    Int32Grid::Ptr lab = Int32Grid::create(0);
+    phi->setTransform(xform);
+    lab->setTransform(xform->copy());
+    auto pa = phi->getAccessor();
+    auto la = lab->getAccessor();
+    // label 1 over [-2, 5]^3 minus the two out-corners; label 0 around it
+    const CoordBBox body(Coord(-2), Coord(5));
+    for (auto it = CoordBBox(Coord(-4), Coord(7)).begin(); it; ++it) {
+        const Coord& p = *it;
+        const auto c = cell.find(p - lo);
+        const bool out = c != cell.end() && (p - lo == Coord(1, 0, 0) || p - lo == Coord(0, 1, 1));
+        const bool in = body.isInside(p) && !out;
+        la.setValue(p, in ? 1 : 0);
+        float d;
+        if (c != cell.end()) {
+            d = c->second;
+        } else {
+            // distance to the body's outer surface, in voxels (staircase)
+            int depth = 100;
+            for (int a = 0; a < 3; ++a) {
+                depth = std::min({depth, std::abs(p[a] - body.min()[a] + (in ? 0 : 1)),
+                    std::abs(body.max()[a] - p[a] + (in ? 0 : 1))});
+            }
+            d = std::min(2.9f, 0.5f + float(in ? depth : std::max(0, depth - 1)));
+        }
+        pa.setValue(p, d);
+    }
+    MLS m(phi, lab, 3);
+    tools::MultiObjectMeshSettings s;
+    s.connectivity = Conn::FG6_BG26;
+    tools::lsmo_internal::MeshStats stats;
+    const auto meshes = meshWithStats(m, s, stats);
+    const auto t = lsmo_test::meshTopology(meshes.at(1));
+    std::cout << "[MeshTubeNoRepeatedChord] retriangulated " << stats.retriangulated
+              << ", euler " << t.euler << ", components " << t.components << std::endl;
+    EXPECT_TRUE(t.closed);
+    EXPECT_TRUE(t.manifold) << t.defect;
+    EXPECT_TRUE(t.nonManifoldEdgeMidpoints.empty());
+    // outer surface (sphere) plus the tube's cavity surface (sphere)
+    EXPECT_EQ(t.components, 2);
+    EXPECT_EQ(t.euler, 4);
+}
+
+
 // Sphere vertices within 0.1*dx of the analytic surface.
 TEST_F(TestLevelSetMultiObjectMesh, MeshGeometrySphere)
 {

@@ -1689,6 +1689,71 @@ TEST_F(TestLevelSetMultiObject, KinematicLabelBasics)
     EXPECT_NEAR(lsmo.time(), 44.0, 1e-6);
 }
 
+TEST_F(TestLevelSetMultiObject, KinematicFixedWall)
+{
+    // A kinematic sphere (label 2) pushed through a fixed wall (label 3)
+    // never takes or changes wall voxels: the wall is bit-identical.
+    const double r = 4.0;
+    const Vec3d c0(-8.0, 15.0, 15.0);
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    {
+        auto acc = labels->getAccessor();
+        for (auto p = CoordBBox(Coord(4, 8, 8), Coord(6, 22, 22)).begin(); p; ++p) acc.setValue(*p, 3);
+        for (auto p = CoordBBox(Coord::round(c0) - Coord(5), Coord::round(c0) + Coord(5)).begin(); p; ++p) {
+            if (((*p).asVec3d() - c0).length() < r) acc.setValue(*p, 2);
+        }
+    }
+    auto m = MLS::fromLabelGrid(*labels);
+    Forces forces;
+    forces.setFixedLabels({3});
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo.setKinematicLabel(2, tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(c0), 1.0f),
+        [](double t) {
+            math::Mat4d mm = math::Mat4d::identity();
+            mm.setTranslation(Vec3d(t, 0.0, 0.0));
+            return mm;
+        });
+    struct Snap { int32_t label; bool on; float phi; };
+    const CoordBBox box(Coord(-20, 0, 0), Coord(30, 30, 30));
+    auto wall = [&]() {
+        std::map<Coord, Snap> w;
+        for (auto p = box.begin(); p; ++p) {
+            if (m->labels()->tree().getValue(*p) != 3) continue;
+            w[*p] = Snap{3, m->phi()->tree().isValueOn(*p), m->phi()->tree().getValue(*p)};
+        }
+        return w;
+    };
+    const auto wall0 = wall();
+    ASSERT_FALSE(wall0.empty());
+    lsmo.advect(0.0, 20.0); // the sphere reaches and presses into the wall
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const auto wall1 = wall();
+    EXPECT_EQ(wall1.size(), wall0.size());
+    Index64 diff = 0;
+    for (const auto& kv : wall0) {
+        auto it = wall1.find(kv.first);
+        if (it == wall1.end() || it->second.on != kv.second.on
+            || std::memcmp(&it->second.phi, &kv.second.phi, sizeof(float)) != 0) ++diff;
+    }
+    EXPECT_EQ(diff, Index64(0));
+    // kinematic and topology-preserving labels exclude each other, and
+    // label 0 cannot be protected together with kinematic labels
+    EXPECT_THROW(lsmo.setTopologyPreservingLabels({2}), ValueError);
+    EXPECT_THROW(lsmo.setTopologyPreservingLabels({0}), ValueError);
+    lsmo.setTopologyPreservingLabels({1});
+    EXPECT_THROW(lsmo.setKinematicLabel(1, tools::createLevelSetSphere<FloatGrid>(1.0f,
+        Vec3f(0.0f), 1.0f), [](double) { return math::Mat4d::identity(); }), ValueError);
+    // the phi floor: settable, only in effect with protected labels
+    EXPECT_THROW(lsmo.setMinimumPhi(-1.0), ValueError);
+    lsmo.setMinimumPhi(5e-3);
+    EXPECT_DOUBLE_EQ(lsmo.minimumPhi(), 5e-3);
+    EXPECT_DOUBLE_EQ(lsmo.phiFloor(), 5e-3 * m->voxelSize());
+    lsmo.setTopologyPreservingLabels({});
+    EXPECT_DOUBLE_EQ(lsmo.phiFloor(), 0.0);
+    EXPECT_TRUE(lsmo.validateTopologyFloor());
+}
+
 namespace {
 
 // Smooth test fields evaluated at world positions, on a box of voxels of
@@ -2755,7 +2820,7 @@ struct CubeRunResult
     double maxCentroidError[3] = {0, 0, 0}; // sphere centroid vs rotated centre, max over chunks (dx)
     double minVolumeFraction[3] = {1e9, 1e9, 1e9}; // sphere volume / (4/3) pi 4^3, min over chunks
     int maxComponents[3] = {0, 0, 0}; // sphere components, max over chunks (diagnostic)
-    int meshDefects = 0;              // chunks whose cube mesh disagrees with the region
+    Index64 belowFloor = 0; // active voxels with phi < minimumPhi*dx, summed over chunks
     int maxCavities[3] = {0, 0, 0};   // sphere cavities, max over chunks (diagnostic)
     MLS::Ptr state;          // final state
 };
@@ -2847,7 +2912,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
         return os.str();
     };
     EXPECT_TOPOLOGY_CONSISTENT(lsmo_test::verifyLabelTopology(*m, 1, domain, conn,
-        chunkTag(0.0, "cube"), &ball));
+        chunkTag(0.0, "cube"), &ball, lsmo_test::phiFloorOf(lsmo)));
     auto volume = [](const FloatGrid& g) {
         return g.tree().activeVoxelCount() > 0 ? tools::levelSetVolume(g) : 0.0;
     };
@@ -2860,19 +2925,16 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
         const double t1 = std::min(distance, t + chunk);
         steps += lsmo.advect(t, t1);
         t = t1;
+        const double floor = lsmo_test::phiFloorOf(lsmo);
         const auto cube = lsmo_test::verifyLabelTopology(*m, 1, domain, conn, chunkTag(t, "cube"),
-            protect ? &ball : nullptr);
-        // The cube's digital topology under the rule is the gate. A mesh
-        // inconsistency with the right region numbers is a mesher defect (a
-        // non-manifold edge where several voxels have near-zero phi), counted
-        // and dumped, not a topology change.
-        if (protect) {
-            EXPECT_TRUE(cube.region == ball) << cube.message;
-        }
-        const bool meshDefect = !cube.ok && (!protect || cube.region == ball);
-        if (meshDefect) {
-            ++res.meshDefects;
-            std::cout << log << ": mesh defect: " << cube.message << std::endl;
+            protect ? &ball : nullptr, floor);
+        EXPECT_TOPOLOGY_CONSISTENT(cube);
+        // the phi floor holds on protected interfaces (protected runs); without
+        // protection there is no floor and smaller phi values occur
+        std::string floorMsg;
+        EXPECT_TRUE(lsmo.validateTopologyFloor(&floorMsg)) << "t " << t << ": " << floorMsg;
+        for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+            if (*it < float(lsmo.minimumPhi() * dx)) ++res.belowFloor;
         }
         res.topo.push_back(cube.region);
         std::ostringstream row;
@@ -2891,7 +2953,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
             }
             continue;
         }
-        bool chunkOk = cube.region == ball;
+        bool chunkOk = cube.ok;
         for (int s = 0; s < 3; ++s) {
             const int32_t l = 2 + s;
             // Spheres: consistent meshes and centroids are gated; their
@@ -2899,7 +2961,8 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
             // the protected cube cannot give up can dent a sphere where it
             // exits the cube (see setKinematicLabel).
             const std::string stag = chunkTag(t, "sphere" + std::to_string(l));
-            const auto sphere = lsmo_test::verifyLabelTopology(*m, l, domain, conn, stag);
+            const auto sphere = lsmo_test::verifyLabelTopology(*m, l, domain, conn, stag, nullptr,
+                floor);
             EXPECT_TOPOLOGY_CONSISTENT(sphere);
             chunkOk = chunkOk && sphere.ok;
             res.maxComponents[s] = std::max(res.maxComponents[s], sphere.region.components);
@@ -2930,7 +2993,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
     res.frontShift = double(labelMaxX() - front0);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::cout << log << ": " << steps << " steps, " << secs << " s, t " << t
-              << ", cube mesh defects " << res.meshDefects
+              << ", active phi below minimumPhi*dx (summed over chunks) " << res.belowFloor
               << ", leading-face shift " << res.frontShift << ", centroid shift " << res.shift
               << std::endl;
     if (protect) {
@@ -2966,6 +3029,8 @@ TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
         // control: without protection the spheres change the cube's topology
         const CubeRunResult ctrl = runCubeThroughSpheres(false, rule);
         EXPECT_TRUE(ctrl.changed);
+        // no protected label: no floor, and phi values below it occur
+        EXPECT_GT(ctrl.belowFloor, Index64(0));
         std::cout << "TopologyCube(control/" << lsmo_test::connectivityName(rule)
                   << "): first change at t " << ctrl.firstChange << " " << ctrl.firstChangeTopo
                   << std::endl;
@@ -2978,22 +3043,26 @@ TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
     // thread count: serial and parallel runs well past the cube's first
     // contact with the spheres (to t = 72) are bit-identical.
     const CubeRunResult a = runCubeThroughSpheres(true, Conn::FG26_BG6, 0, 72.0);
-    const CubeRunResult b = runCubeThroughSpheres(true, Conn::FG26_BG6, 1, 72.0);
-    ASSERT_TRUE(a.state && b.state);
-    const Int32Tree& la = a.state->labels()->tree();
-    const Int32Tree& lb = b.state->labels()->tree();
-    const FloatTree& pa = a.state->phi()->tree();
-    const FloatTree& pb = b.state->phi()->tree();
-    ASSERT_TRUE(la.hasSameTopology(lb));
-    Index64 diff = 0;
-    for (auto it = pa.cbeginValueOn(); it; ++it) {
-        const float v = pb.getValue(it.getCoord());
-        if (std::memcmp(&v, &*it, sizeof(float)) != 0) ++diff;
+    ASSERT_TRUE(a.state);
+    for (int grain : {1, 64}) {
+        SCOPED_TRACE("grain " + std::to_string(grain));
+        const CubeRunResult b = runCubeThroughSpheres(true, Conn::FG26_BG6, grain, 72.0);
+        ASSERT_TRUE(b.state);
+        const Int32Tree& la = a.state->labels()->tree();
+        const Int32Tree& lb = b.state->labels()->tree();
+        const FloatTree& pa = a.state->phi()->tree();
+        const FloatTree& pb = b.state->phi()->tree();
+        ASSERT_TRUE(la.hasSameTopology(lb));
+        Index64 diff = 0;
+        for (auto it = pa.cbeginValueOn(); it; ++it) {
+            const float v = pb.getValue(it.getCoord());
+            if (std::memcmp(&v, &*it, sizeof(float)) != 0) ++diff;
+        }
+        for (auto it = la.cbeginValueAll(); it; ++it) {
+            if (lb.getValue(it.getCoord()) != *it) ++diff;
+        }
+        EXPECT_EQ(diff, Index64(0));
     }
-    for (auto it = la.cbeginValueAll(); it; ++it) {
-        if (lb.getValue(it.getCoord()) != *it) ++diff;
-    }
-    EXPECT_EQ(diff, Index64(0));
 }
 
 

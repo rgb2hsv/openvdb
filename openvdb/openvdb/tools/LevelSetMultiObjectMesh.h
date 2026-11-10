@@ -157,6 +157,10 @@ struct MultiObjectMeshSettings
     /// TBB grain size in blocks of cells; zero or negative runs serially.
     /// The output does not depend on it.
     int grainSize = 1;
+    /// phi is read as max(phi, minimumPhi) (world units; default 0). Pass
+    /// the floor of a topology-preserving evolver
+    /// (LevelSetMultiObject::phiFloor()) to mesh its state as it sees it.
+    double minimumPhi = 0.0;
 };
 
 
@@ -686,8 +690,16 @@ bestDiskTriangulation(const uint8_t* e, int n, const QualityFn& quality,
 /// forward along A and backward along B, each triangle is either
 /// (A[i], A[i+1], B[j]) or (B[j-1], B[j], A[i]), which keeps the winding of
 /// both loops. Chords between vertices on a common cube face are not used.
-/// @return the minimum quality, or -infinity if no strip exists (never for
-/// table tubes, whose strip is one).
+/// A path state (s, t) is the chord (A[i0+s], B[j0-t]), so (0, t) and
+/// (m, t) are the same chord, as are (s, 0) and (s, n): a path with m
+/// consecutive A steps from s = 0 or n consecutive B steps from t = 0 would
+/// use a chord twice (a pinched strip). The search state therefore records
+/// whether the current run of A steps started at s = 0 and whether the
+/// current run of B steps started at t = 0, and such full runs are
+/// forbidden. As a backstop, a strip that still repeats a chord is
+/// discarded.
+/// @return the minimum quality, or -infinity if no strip exists (the caller
+/// then keeps the table strip).
 template<typename QualityFn>
 inline double
 bestTubeTriangulation(const uint8_t* A, int m, const uint8_t* B, int n, const QualityFn& quality,
@@ -696,9 +708,13 @@ bestTubeTriangulation(const uint8_t* A, int m, const uint8_t* B, int n, const Qu
     constexpr double kNone = -std::numeric_limits<double>::infinity();
     auto chordOk = [&](int a, int b) { return (cubeEdgeFaces(A[a]) & cubeEdgeFaces(B[b])) == 0; };
     double bestQ = kNone;
-    std::vector<std::array<int, 3>> cur;
-    double f[13][13];
-    int from[13][13]; // 0: A step, 1: B step
+    // f[s][t][k]: best minimum quality reaching state (s, t) with flags
+    // k = 2*ra + rb; ra: the path is on a row it entered at s = 0 (A steps
+    // from there would reach s = m on that row), rb: the path is on a column
+    // it entered at t = 0.
+    double f[13][13][4];
+    int8_t from[13][13][4]; // previous flags*2 + step (0: A step, 1: B step), -1 none
+    std::vector<std::array<int, 3>> cand;
     for (int i0 = 0; i0 < m; ++i0) {
         for (int j0 = 0; j0 < n; ++j0) {
             if (!chordOk(i0, j0)) continue;
@@ -706,33 +722,61 @@ bestTubeTriangulation(const uint8_t* A, int m, const uint8_t* B, int n, const Qu
             auto bj = [&](int t) { return ((j0 - t) % n + n) % n; };
             for (int s = 0; s <= m; ++s) {
                 for (int t = 0; t <= n; ++t) {
-                    f[s][t] = kNone;
-                    from[s][t] = -1;
+                    for (int k = 0; k < 4; ++k) { f[s][t][k] = kNone; from[s][t][k] = -1; }
                     if (s == 0 && t == 0) {
-                        f[0][0] = std::numeric_limits<double>::infinity();
+                        f[0][0][3] = std::numeric_limits<double>::infinity();
                         continue;
                     }
-                    if ((s == m && t == 0) || (s == 0 && t == n)) continue; // start chord reused
                     if (!chordOk(ai(s), bj(t))) continue;
-                    if (s > 0 && f[s - 1][t] != kNone) {
-                        const double v = std::min(f[s - 1][t],
-                            quality(ai(s - 1), ai(s), m + bj(t)));
-                        if (from[s][t] < 0 || v > f[s][t]) { f[s][t] = v; from[s][t] = 0; }
-                    }
-                    if (t > 0 && f[s][t - 1] != kNone) {
-                        const double v = std::min(f[s][t - 1],
-                            quality(m + bj(t), m + bj(t - 1), ai(s)));
-                        if (from[s][t] < 0 || v > f[s][t]) { f[s][t] = v; from[s][t] = 1; }
+                    for (int k = 0; k < 4; ++k) {
+                        // A step from (s-1, t, k): ra kept, rb set iff t == 0
+                        if (s > 0 && f[s - 1][t][k] != kNone) {
+                            const int ra = k >> 1;
+                            if (!(s == m && ra)) { // m A steps from column 0
+                                const int nk = 2 * ra + (t == 0 ? 1 : 0);
+                                const double v = std::min(f[s - 1][t][k],
+                                    quality(ai(s - 1), ai(s), m + bj(t)));
+                                if (from[s][t][nk] < 0 || v > f[s][t][nk]) {
+                                    f[s][t][nk] = v;
+                                    from[s][t][nk] = int8_t(2 * k);
+                                }
+                            }
+                        }
+                        // B step from (s, t-1, k): rb kept, ra set iff s == 0
+                        if (t > 0 && f[s][t - 1][k] != kNone) {
+                            const int rb = k & 1;
+                            if (!(t == n && rb)) { // n B steps from row 0
+                                const int nk = 2 * (s == 0 ? 1 : 0) + rb;
+                                const double v = std::min(f[s][t - 1][k],
+                                    quality(m + bj(t), m + bj(t - 1), ai(s)));
+                                if (from[s][t][nk] < 0 || v > f[s][t][nk]) {
+                                    f[s][t][nk] = v;
+                                    from[s][t][nk] = int8_t(2 * k + 1);
+                                }
+                            }
+                        }
                     }
                 }
             }
-            if (from[m][n] < 0 || !(f[m][n] > bestQ)) continue;
-            bestQ = f[m][n];
-            tris.clear();
-            for (int s = m, t = n; s > 0 || t > 0;) {
-                if (from[s][t] == 0) { tris.push_back({ai(s - 1), ai(s), m + bj(t)}); --s; }
-                else { tris.push_back({m + bj(t), m + bj(t - 1), ai(s)}); --t; }
+            int bk = -1;
+            for (int k = 0; k < 4; ++k) {
+                if (from[m][n][k] >= 0 && (bk < 0 || f[m][n][k] > f[m][n][bk])) bk = k;
             }
+            if (bk < 0 || !(f[m][n][bk] > bestQ)) continue;
+            // trace back, checking that no chord repeats (backstop)
+            cand.clear();
+            std::set<std::pair<int, int>> chords{{ai(m), bj(n)}};
+            bool repeated = false;
+            for (int s = m, t = n, k = bk; s > 0 || t > 0;) {
+                const int code = from[s][t][k];
+                if (code % 2 == 0) { cand.push_back({ai(s - 1), ai(s), m + bj(t)}); --s; }
+                else { cand.push_back({m + bj(t), m + bj(t - 1), ai(s)}); --t; }
+                k = code / 2;
+                if (s > 0 || t > 0) repeated |= !chords.insert({ai(s), bj(t)}).second;
+            }
+            if (repeated) continue;
+            bestQ = f[m][n][bk];
+            tris = cand;
         }
     }
     return bestQ;
@@ -790,10 +834,16 @@ struct MeshContext
         : phi(phiTree), lab(labelTree), xform(xf), settings(s), requested(req)
         , patches(casePatches(s.connectivity)), dx(xf.voxelSize()[0]) {}
 
+    /// phi at @a x, at least settings.minimumPhi.
+    double phiAt(const Coord& x)
+    {
+        return std::max(double(phi.getValue(x)), settings.minimumPhi);
+    }
+
     /// psi_l(x): -phi inside label l, +phi elsewhere (labels via getValue).
     double psi(const Coord& x, LabelT l)
     {
-        const double v = double(phi.getValue(x));
+        const double v = phiAt(x);
         return lab.getValue(x) == l ? -v : v;
     }
 
@@ -843,7 +893,7 @@ struct MeshContext
                     const Coord p = q.offsetBy(i, j, k);
                     if (lab.getValue(p) != l) continue;
                     upper = std::min(upper,
-                        dx * std::sqrt(double(i * i + j * j + k * k)) - double(phi.getValue(p)));
+                        dx * std::sqrt(double(i * i + j * j + k * k)) - phiAt(p));
                 }
         double abar[3], coef[3] = {1.0, 1.0, 1.0};
         int m = 0;
@@ -905,8 +955,8 @@ contourBlock(MeshContext<FloatTreeT, LabelTreeT>& ctx, const Coord& o, int dim, 
         hi[axis] += 1;
         const bool loIn = ctx.lab.getValue(lo) == l;
         const Coord p = loIn ? lo : hi, q = loIn ? hi : lo;
-        const double phiP = double(ctx.phi.getValue(p));
-        double psiQ = double(ctx.phi.getValue(q));
+        const double phiP = ctx.phiAt(p);
+        double psiQ = ctx.phiAt(q);
         if (correct && (cellJunction || ctx.junctionEdge(lo, axis))) {
             const double c = ctx.correctedOutside(q, l, psiQ);
             if (c != psiQ) ++out.stats.corrected;
