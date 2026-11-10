@@ -236,7 +236,7 @@ Below, "Run `<Filter>`" means the second command with that filter.
       LevelSetMultiObject(MultiLevelSetT&, const SpeedT&, InterruptT* = nullptr);
       float  step(float maxDt);
       size_t advect(double t0, double t1);
-      void setCFL(float); void setClampSpeed(bool); void setGrainSize(int); void setRedistanceTolerance(float);
+      void setCFL(float); void setGrainSize(int); void setRedistanceTolerance(float);
   };
   ```
   Test helper `ConstantSpeed{float s; std::set<int32_t> fixed;}` satisfying the concept, plus `RandomSpeed` (per-label speed drawn once from a seeded `std::mt19937`, range [−1, 1]).

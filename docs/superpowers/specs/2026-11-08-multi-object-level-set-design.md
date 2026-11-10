@@ -55,8 +55,7 @@ Per step, for active voxels with φ ≤ 0.5:
    upwind pressure and upwind advection, evaluated on ψ_l from the previous
    state. Label 0 (background) has speed 0. Labels without a force index
    expand at constant speed 0.999.
-3. Time step from CFL: dt = maxStep · min(1, 0.999 / max|F|), unless speeds are
-   clamped to ±1.
+3. Time step from CFL: dt = maxStep · min(1, 0.999 / max|F|).
 4. v_l = ψ_l + dt·F_l. New label = argmin v_l (ties → smaller label);
    φ = |(v₁ − v₂)/2| using the two smallest values, or |v₁| if only one.
 5. Redistance outer layers (first order, 3 passes), plug orphan voxels, swap
