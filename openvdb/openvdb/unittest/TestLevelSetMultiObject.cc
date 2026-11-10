@@ -1671,6 +1671,37 @@ TEST_F(TestLevelSetMultiObject, EmptyStep)
     }
 }
 
+TEST_F(TestLevelSetMultiObject, StepPeakMemory)
+{
+    // Two spheres of radius 15 at (+-16, 0, 0) in a 64^3 box (dx = 1, halfWidth 3),
+    // both growing into contact. The evolver's own working memory during a step
+    // (auxiliary leaf buffers plus pooled per-leaf scratch) stays within 1.3x the
+    // memory of the pair (a deep copy of both trees alone would be about 1x, on
+    // top of the candidate lists), also once the pooled scratch has been reused
+    // over many steps of a growing band. Pair bytes are taken before each step
+    // (tree.memUsage, an approximation of the allocated bytes).
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(15.0f, Vec3f(-16.0f, 0.0f, 0.0f), 1.0f);
+    in[2] = tools::createLevelSetSphere<FloatGrid>(15.0f, Vec3f(16.0f, 0.0f, 0.0f), 1.0f);
+    auto m = MLS::fromSignedGrids(in, 3);
+    ConstantSpeed speed;
+    speed.s = -1.0f;
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    EXPECT_EQ(lsmo.scratchMemUsage(), size_t(0));
+    for (int n = 0; n < 16; ++n) {
+        const size_t pairBytes = size_t(m->phi()->memUsage() + m->labels()->memUsage());
+        ASSERT_GT(lsmo.step(1.0f), 0.0f);
+        const size_t scratch = lsmo.scratchMemUsage();
+        std::cout << "StepPeakMemory: step " << n << " pair " << pairBytes << " B, scratch "
+                  << scratch << " B (" << double(scratch) / double(pairBytes) << "x)"
+                  << std::endl;
+        EXPECT_GT(scratch, size_t(0)) << "step " << n;
+        EXPECT_LE(double(scratch), 1.3 * double(pairBytes)) << "step " << n;
+    }
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+}
+
 TEST_F(TestLevelSetMultiObject, InterruptMidAdvect)
 {
     auto m = makeSphere(8.0);

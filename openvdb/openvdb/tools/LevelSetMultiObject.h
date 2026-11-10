@@ -1881,8 +1881,9 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// -# <b>Projection.</b> v_l = psi_l + dt*F_l with psi_l = -phi for the own
 ///    label and +phi otherwise; the new label is the smallest v (ties to the
 ///    smaller label) and phi = |v_1 - v_2|/2 over the two smallest values, or
-///    |v_1| with one candidate. Results are written to copies of both trees
-///    (time-n data stays readable until both are swapped in together).
+///    |v_1| with one candidate. Results are written to an auxiliary leaf
+///    buffer of each tree (time-n data stays readable in the leaf buffers
+///    until both trees swap buffers together).
 /// -# <b>Topology preservation</b> (opt-in): with
 ///    setTopologyPreservingLabels(), a projected change a -> b that involves
 ///    a protected label is deferred and applied in 27 coloured passes
@@ -1896,7 +1897,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// -# <b>Orphan cleanup</b>: a voxel whose label occurs nowhere in its
 ///    26-neighbourhood takes the label and phi of its smallest-phi active
 ///    neighbour (fixed labels excluded) and is redistanced (not frozen).
-/// -# <b>Band maintenance</b>: both trees are swapped in; inactive face
+/// -# <b>Band maintenance</b>: after the buffer swap, inactive face
 ///    neighbours of active voxels with phi < (halfWidth-1)*dx are activated
 ///    (phi = background, label of the smallest-phi active face neighbour);
 ///    MultiLevelSetRedistance::redistance(freeze) keeps the projected voxels
@@ -1975,6 +1976,13 @@ public:
     const std::set<int32_t>& topologyPreservingLabels() const { return mProtected; }
     MultiObjectConnectivity connectivity() const { return mConnectivity; }
 
+    /// @brief Peak bytes of the evolver's own working memory during the last
+    /// step: the auxiliary leaf buffers of both trees plus the per-leaf
+    /// scratch (candidate lists, masks) that is kept and reused across steps.
+    /// Temporaries of the redistance pass are not included. 0 before the
+    /// first step.
+    size_t scratchMemUsage() const { return mPeakScratchBytes; }
+
     /// @brief One forward Euler step of at most @a maxDt (world time).
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
     /// changes if nothing can move, 0 if @a maxDt <= 0.
@@ -2005,23 +2013,200 @@ private:
     /// Own label + 6 face labels.
     static constexpr int kMaxCandidates = 7;
 
-    /// Candidate list of one projected voxel: non-zero labels with their
-    /// speeds, and whether passive label 0 participates.
-    struct VoxelEntry
+    /// A candidate label and its speed.
+    using Candidate = std::pair<int32_t, float>;
+
+    /// Candidate labels of one voxel being built.
+    struct CandidateSet
     {
-        Index offset = 0;
-        int32_t own = 0;
-        float phi = 0.0f; // time n
+        std::array<int32_t, kMaxCandidates> label;
         int n = 0;
         bool zero = false;
-        std::array<std::pair<int32_t, float>, kMaxCandidates> cand;
     };
+
+    /// One projected voxel with a non-zero candidate: its n candidates
+    /// (labels with speeds) follow those of the previous entry in
+    /// LeafData::cand; zero says whether passive label 0 participates. Its
+    /// own label and phi are read from the time-n leaf buffers.
+    struct VoxelEntry
+    {
+        uint16_t offset = 0;
+        uint8_t n = 0;
+        bool zero = false;
+    };
+    static_assert(FloatTreeT::LeafNodeType::SIZE <= 65536, "leaf offsets must fit 16 bits");
 
     struct LeafData
     {
         std::vector<VoxelEntry> entries;
+        std::vector<Candidate> cand;
         float maxSpeed = 0.0f;
         bool any = false;
+    };
+
+    /// A projected label change involving a protected label.
+    struct Deferred { Coord ijk; int32_t from, to; float phi; };
+    /// An orphan relabelled from its smallest-phi neighbour.
+    struct Fix { Coord ijk; LabelT label; float phi; };
+    /// A band voxel to activate.
+    struct Activation { Coord ijk; float phi; LabelT label; };
+
+    using BoolLeafT = typename BoolTreeT::LeafNodeType;
+
+    template<typename T>
+    static size_t vectorBytes(const std::vector<T>& v) { return v.capacity() * sizeof(T); }
+    template<typename T>
+    static size_t vectorBytes(const std::vector<std::vector<T>>& v)
+    {
+        size_t n = v.capacity() * sizeof(std::vector<T>);
+        for (const auto& w : v) n += w.capacity() * sizeof(T);
+        return n;
+    }
+
+    /// Per-leaf scratch owned by the evolver and reused across steps: lists
+    /// keep their storage (see recycle()), the per-leaf arrays grow only
+    /// when the leaf count grows, and mask leaves are recycled.
+    struct Scratch
+    {
+        std::vector<LeafData> data;
+        std::vector<std::vector<Deferred>> deferred;
+        /// projected and fixed-label voxels (redistance freeze mask)
+        BoolTreeT freeze{false};
+        std::vector<std::unique_ptr<BoolLeafT>> freeLeaves;
+
+        /// Empty @a v for reuse. Slots reused by other leaves would keep
+        /// growing to the largest list they ever held, so a list holding
+        /// more than twice what it used last time (plus some slack) is
+        /// reallocated at its last size.
+        template<typename T>
+        static void recycle(std::vector<T>& v)
+        {
+            constexpr size_t kSlack = 16;
+            if (v.capacity() > 2 * v.size() + kSlack) {
+                std::vector<T> w;
+                w.reserve(v.size());
+                v.swap(w);
+            } else {
+                v.clear();
+            }
+        }
+
+        /// At least @a n empty lists.
+        template<typename T>
+        static void resetLists(std::vector<std::vector<T>>& v, size_t n)
+        {
+            if (v.size() < n) v.resize(n);
+            for (auto& w : v) recycle(w);
+        }
+
+        void resetData(size_t n)
+        {
+            if (data.size() < n) data.resize(n);
+            for (LeafData& d : data) {
+                recycle(d.entries);
+                recycle(d.cand);
+                d.maxSpeed = 0.0f;
+                d.any = false;
+            }
+        }
+
+        /// Make @a freeze an inactive (false) mask with one leaf per leaf
+        /// of @a phi, recycling the leaves of the previous step.
+        void resetFreeze(const FloatTreeT& phi)
+        {
+            std::vector<BoolLeafT*> stolen;
+            freeze.stealNodes(stolen);
+            for (BoolLeafT* leaf : stolen) freeLeaves.emplace_back(leaf);
+            freeze.clear();
+            for (auto leaf = phi.cbeginLeaf(); leaf; ++leaf) {
+                std::unique_ptr<BoolLeafT> mask;
+                if (freeLeaves.empty()) {
+                    mask.reset(new BoolLeafT(leaf->origin(), false, false));
+                } else {
+                    mask = std::move(freeLeaves.back());
+                    freeLeaves.pop_back();
+                    mask->setOrigin(leaf->origin());
+                    mask->fill(false, false);
+                }
+                freeze.addLeaf(mask.release());
+            }
+        }
+
+        size_t memUsage() const
+        {
+            size_t n = vectorBytes(data);
+            for (const LeafData& d : data) n += vectorBytes(d.entries) + vectorBytes(d.cand);
+            n += vectorBytes(deferred);
+            n += size_t(freeze.memUsage());
+            n += freeLeaves.capacity() * sizeof(std::unique_ptr<BoolLeafT>)
+                + freeLeaves.size() * sizeof(BoolLeafT);
+            return n;
+        }
+    };
+
+    /// Double buffering of both trees through tree::LeafManager auxiliary
+    /// buffers: time n+1 is written to aux buffer kNext of each leaf while
+    /// the leaf buffers keep time n, then both trees swap buffers together.
+    /// Further aux buffers per leaf (e.g. a Runge-Kutta stage) fit after
+    /// kNext.
+    struct PairBuffers
+    {
+        static constexpr size_t kNext = 1;
+        static constexpr size_t kAuxPerLeaf = 1;
+        using PhiBufferT = typename FloatTreeT::LeafNodeType::Buffer;
+        using LabelBufferT = typename LabelTreeT::LeafNodeType::Buffer;
+
+        PairBuffers(FloatTreeT& phiTree, LabelTreeT& labelTree, bool serial)
+            : phi(phiTree, kAuxPerLeaf, serial), labels(labelTree, kAuxPerLeaf, serial)
+            , mSerial(serial)
+        {
+            // label leaf of each phi leaf (the same index unless the label
+            // tree has leaves where phi has none)
+            bool same = labels.leafCount() == phi.leafCount();
+            for (size_t i = 0; same && i < phi.leafCount(); ++i) {
+                same = labels.leaf(i).origin() == phi.leaf(i).origin();
+            }
+            if (same) return;
+            std::map<Coord, size_t> index;
+            for (size_t j = 0; j < labels.leafCount(); ++j) index[labels.leaf(j).origin()] = j;
+            mLabelIndex.resize(phi.leafCount());
+            for (size_t i = 0; i < phi.leafCount(); ++i) {
+                OPENVDB_ASSERT(index.count(phi.leaf(i).origin()));
+                mLabelIndex[i] = index[phi.leaf(i).origin()];
+            }
+        }
+
+        PhiBufferT& phiBuffer(size_t i, size_t b) { return phi.getBuffer(i, b); }
+        LabelBufferT& labelBuffer(size_t i, size_t b)
+        {
+            return labels.getBuffer(mLabelIndex.empty() ? i : mLabelIndex[i], b);
+        }
+        /// Swap aux buffer @a b with the leaf buffers of both trees.
+        void swap(size_t b)
+        {
+            phi.swapLeafBuffer(b, mSerial);
+            labels.swapLeafBuffer(b, mSerial);
+        }
+        void release()
+        {
+            phi.removeAuxBuffers();
+            labels.removeAuxBuffers();
+        }
+        size_t memUsage() const
+        {
+            const size_t phiBytes = sizeof(PhiBufferT)
+                + FloatTreeT::LeafNodeType::SIZE * sizeof(float);
+            const size_t labelBytes = sizeof(LabelBufferT)
+                + LabelTreeT::LeafNodeType::SIZE * sizeof(LabelT);
+            return phi.auxBufferCount() * phiBytes + labels.auxBufferCount() * labelBytes
+                + mLabelIndex.capacity() * sizeof(size_t);
+        }
+
+        tree::LeafManager<FloatTreeT> phi;
+        tree::LeafManager<LabelTreeT> labels;
+    private:
+        std::vector<size_t> mLabelIndex;
+        bool mSerial;
     };
 
     template<typename BodyT>
@@ -2063,18 +2248,16 @@ private:
         return true;
     }
 
-    /// A projected label change involving a protected label.
-    struct Deferred { Coord ijk; int32_t from, to; float phi; };
     void applyDeferred(const std::vector<std::vector<Deferred>>& deferred,
-        FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze);
+        FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze);
 
-    /// Add @a l to @a e's candidates: label 0 and fixed labels only make
+    /// Add @a l to the candidates @a c: label 0 and fixed labels only make
     /// passive label 0 participate (a fixed label can never be captured).
-    void addCandidate(VoxelEntry& e, int32_t l) const
+    void addCandidate(CandidateSet& c, int32_t l) const
     {
-        if (l == 0 || mSpeed.isFixed(l)) { e.zero = true; return; } // passive 0 / wall
-        for (int i = 0; i < e.n; ++i) if (e.cand[i].first == l) return;
-        e.cand[e.n++] = std::make_pair(l, 0.0f); // at most 7 distinct labels
+        if (l == 0 || mSpeed.isFixed(l)) { c.zero = true; return; } // passive 0 / wall
+        for (int i = 0; i < c.n; ++i) if (c.label[i] == l) return;
+        c.label[c.n++] = l; // at most 7 distinct labels
     }
 
     float evalSpeed(StencilT& s, const Coord& ijk, int32_t label) const
@@ -2090,8 +2273,11 @@ private:
         return f;
     }
 
-    /// Two-smallest projection; false if @a e has no non-zero candidate.
-    static bool project(const VoxelEntry& e, float dt, int32_t& label, float& phi)
+    /// Two-smallest projection of @a e (own label @a own, time-n
+    /// @a phiN) with candidates @a cand; false if @a e has no non-zero
+    /// candidate.
+    static bool project(const VoxelEntry& e, int32_t own, float phiN, const Candidate* cand,
+        float dt, int32_t& label, float& phi)
     {
         if (e.n == 0) return false;
         const float inf = std::numeric_limits<float>::infinity();
@@ -2107,9 +2293,9 @@ private:
             }
         };
         for (int i = 0; i < e.n; ++i) {
-            const int32_t l = e.cand[i].first;
-            const float psi = (l == e.own) ? -e.phi : e.phi;
-            const float v = psi + dt * e.cand[i].second;
+            const int32_t l = cand[i].first;
+            const float psi = (l == own) ? -phiN : phiN;
+            const float v = psi + dt * cand[i].second;
             consider(l, v);
             minV = std::min(minV, v);
         }
@@ -2119,14 +2305,7 @@ private:
         return true;
     }
 
-    /// Replace both trees together (time n -> n+1).
-    void swapBuffers(typename FloatTreeT::Ptr phi, typename LabelTreeT::Ptr labels)
-    {
-        mMls.phi()->setTree(phi);
-        mMls.labels()->setTree(labels);
-    }
-
-    void cleanOrphans(FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze);
+    void cleanOrphans(FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze);
     void bandMaintenance(const BoolTreeT& freeze);
 
     MultiLevelSetT& mMls;
@@ -2138,6 +2317,8 @@ private:
     bool mClampSpeed = false;
     int mGrainSize = 1;
     float mTolerance;
+    Scratch mScratch;
+    size_t mPeakScratchBytes = 0;
 };
 
 
@@ -2159,20 +2340,25 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     }
 
     // Freeze mask: projected voxels and fixed-label voxels.
-    BoolTreeT freeze(phi, false, TopologyCopy());
-    freeze.voxelizeActiveTiles();
-    for (auto leaf = freeze.beginLeaf(); leaf; ++leaf) leaf->setValuesOff();
+    Scratch& scratch = mScratch;
+    scratch.resetFreeze(phi);
+    BoolTreeT& freeze = scratch.freeze;
 
     // 1-2. projected set, candidates and speeds, all on time-n data
     tree::LeafManager<const FloatTreeT> leafs(phi);
     const size_t leafCount = leafs.leafCount();
-    std::vector<LeafData> data(leafCount);
+    scratch.resetData(leafCount);
+    std::vector<LeafData>& data = scratch.data;
+    constexpr Index kLeafSize = FloatTreeT::LeafNodeType::SIZE;
     forEachIndex(leafCount, [&](size_t i) {
         const auto& leaf = leafs.leaf(i);
         LeafData& d = data[i];
         auto* maskLeaf = freeze.probeLeaf(leaf.origin());
-        StencilT stencil(mMls);
         tree::ValueAccessor<const LabelTreeT> lab(labels);
+        // staged on the stack so that the pooled lists get their exact size
+        VoxelEntry entries[kLeafSize];
+        int32_t candLabels[kLeafSize * kMaxCandidates];
+        size_t numEntries = 0, numCand = 0;
         for (auto it = leaf.cbeginValueOn(); it; ++it) {
             const Coord p = it.getCoord();
             const int32_t own = static_cast<int32_t>(lab.getValue(p));
@@ -2188,25 +2374,39 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
             }
             if (!seed && *it > halfDx) continue;
             if (maskLeaf) maskLeaf->setValueOn(it.pos());
-            d.entries.emplace_back();
-            VoxelEntry& e = d.entries.back();
-            e.offset = it.pos();
-            e.own = own;
-            e.phi = *it;
-            this->addCandidate(e, own);
-            for (int f = 0; f < 6; ++f) this->addCandidate(e, nb[f]);
-            for (int c = 0; c < e.n; ++c) {
-                const float s = this->evalSpeed(stencil, p, e.cand[c].first);
-                e.cand[c].second = s;
+            CandidateSet c;
+            this->addCandidate(c, own);
+            for (int f = 0; f < 6; ++f) this->addCandidate(c, nb[f]);
+            if (c.n == 0) continue; // only passive label 0: cannot change
+            VoxelEntry& e = entries[numEntries++];
+            e.offset = uint16_t(it.pos());
+            e.n = uint8_t(c.n);
+            e.zero = c.zero;
+            for (int k = 0; k < c.n; ++k) candLabels[numCand++] = c.label[k];
+        }
+        if (numEntries == 0) return;
+        d.entries.assign(entries, entries + numEntries);
+        d.cand.reserve(numCand);
+        StencilT stencil(mMls);
+        const int32_t* l = candLabels;
+        for (size_t k = 0; k < numEntries; ++k) {
+            const Coord p = leaf.offsetToGlobalCoord(entries[k].offset);
+            for (int j = 0; j < entries[k].n; ++j, ++l) {
+                const float s = this->evalSpeed(stencil, p, *l);
+                d.cand.emplace_back(*l, s);
                 d.maxSpeed = std::max(d.maxSpeed, std::abs(s));
             }
-            d.any |= e.n > 0;
         }
+        d.any = true;
     });
 
     float maxSpeed = 0.0f;
     bool any = false;
-    for (const LeafData& d : data) { maxSpeed = std::max(maxSpeed, d.maxSpeed); any |= d.any; }
+    for (size_t i = 0; i < leafCount; ++i) {
+        maxSpeed = std::max(maxSpeed, data[i].maxSpeed);
+        any |= data[i].any;
+    }
+    mPeakScratchBytes = scratch.memUsage();
 
     // 3. time step: interfaces move at most half a voxel, so only projected
     // voxels can change label
@@ -2215,36 +2415,51 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     if (mClampSpeed) dt = std::min(dt, halfDx);
     else if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
 
-    // 4. two-smallest projection, written to copies of both trees
-    typename FloatTreeT::Ptr newPhi(new FloatTreeT(phi));
-    typename LabelTreeT::Ptr newLabels(new LabelTreeT(labels));
+    // 4. two-smallest projection, written to aux buffer kNext of both
+    // trees (initialized with time n) while time n stays in the leaf buffers
+    constexpr size_t kNext = PairBuffers::kNext;
+    PairBuffers buffers(phi, labels, mGrainSize <= 0);
+    OPENVDB_ASSERT(buffers.phi.leafCount() == leafCount);
     // changes involving a protected label are deferred (topology preservation)
-    std::vector<std::vector<Deferred>> deferred(mProtected.empty() ? 0 : leafCount);
+    std::vector<std::vector<Deferred>>& deferred = scratch.deferred;
+    Scratch::resetLists(deferred, mProtected.empty() ? 0 : leafCount);
     forEachIndex(leafCount, [&](size_t i) {
         const LeafData& d = data[i];
         if (d.entries.empty()) return;
         const auto& leaf = leafs.leaf(i);
-        auto* phiLeaf = newPhi->probeLeaf(leaf.origin());
-        auto* labLeaf = newLabels->probeLeaf(leaf.origin());
+        OPENVDB_ASSERT(buffers.phi.leaf(i).origin() == leaf.origin());
+        auto& phiBuf = buffers.phiBuffer(i, kNext);
+        auto& labBuf = buffers.labelBuffer(i, kNext);
+        const auto& labN = buffers.labelBuffer(i, 0); // time n until the swap
+        const Candidate* cand = d.cand.data();
         for (const VoxelEntry& e : d.entries) {
+            const int32_t own = static_cast<int32_t>(labN.getValue(e.offset));
             int32_t l; float v;
-            if (!project(e, dt, l, v)) continue;
-            if (this->involvesProtected(e.own, l)) {
-                deferred[i].push_back(Deferred{leaf.offsetToGlobalCoord(e.offset), e.own, l, v});
+            const bool moved = project(e, own, leaf.getValue(e.offset), cand, dt, l, v);
+            cand += e.n;
+            if (!moved) continue;
+            if (this->involvesProtected(own, l)) {
+                deferred[i].push_back(Deferred{leaf.offsetToGlobalCoord(e.offset), own, l, v});
                 continue;
             }
-            phiLeaf->setValueOnly(e.offset, v);
-            labLeaf->setValueOnly(e.offset, LabelT(l));
+            phiBuf.setValue(e.offset, v);
+            labBuf.setValue(e.offset, LabelT(l));
         }
     });
-    if (!deferred.empty()) this->applyDeferred(deferred, *newPhi, *newLabels, freeze);
+    mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage() + buffers.memUsage());
 
-    // 5. orphan cleanup
-    this->cleanOrphans(*newPhi, *newLabels, freeze);
+    // 5a. swap both trees together (time n+1 in the leaf buffers); time n is
+    // no longer needed
+    buffers.swap(kNext);
+    buffers.release();
 
-    // 6a. swap both trees together; b-e. band maintenance
-    this->swapBuffers(newPhi, newLabels);
+    // 5b. deferred (topology-preserving) changes; 5c. orphan cleanup
+    if (!mProtected.empty()) this->applyDeferred(deferred, phi, labels, freeze);
+    this->cleanOrphans(phi, labels, freeze);
+
+    // 6. band maintenance (topology changes, after the swap)
     this->bandMaintenance(freeze);
+    mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage());
     OPENVDB_ASSERT(mMls.validate());
     return dt;
 }
@@ -2253,14 +2468,13 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 void
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
-    FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze)
+    FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze)
 {
-    struct Fix { Coord ijk; LabelT label; float phi; };
-    tree::LeafManager<const FloatTreeT> leafs(newPhi);
+    tree::LeafManager<const FloatTreeT> leafs(phi);
     std::vector<std::vector<Fix>> fixes(leafs.leafCount());
     forEachIndex(leafs.leafCount(), [&](size_t i) {
-        tree::ValueAccessor<const FloatTreeT> phiAcc(newPhi);
-        tree::ValueAccessor<const LabelTreeT> labAcc(newLabels);
+        tree::ValueAccessor<const FloatTreeT> phiAcc(phi);
+        tree::ValueAccessor<const LabelTreeT> labAcc(labels);
         for (auto it = leafs.leaf(i).cbeginValueOn(); it; ++it) {
             const Coord p = it.getCoord();
             const LabelT own = labAcc.getValue(p);
@@ -2285,8 +2499,9 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
             if (!found && bestLabel != own) fixes[i].push_back(Fix{p, bestLabel, best});
         }
     });
-    tree::ValueAccessor<FloatTreeT> phiAcc(newPhi);
-    tree::ValueAccessor<LabelTreeT> labAcc(newLabels);
+    mPeakScratchBytes = std::max(mPeakScratchBytes, mScratch.memUsage() + vectorBytes(fixes));
+    tree::ValueAccessor<FloatTreeT> phiAcc(phi);
+    tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
     for (const auto& list : fixes) {
         for (const Fix& fx : list) {
@@ -2308,7 +2523,7 @@ template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 void
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
     const std::vector<std::vector<Deferred>>& deferred,
-    FloatTreeT& newPhi, LabelTreeT& newLabels, BoolTreeT& freeze)
+    FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze)
 {
     // 27 coloured passes (coordinates mod 3): changes of one colour have
     // disjoint 26-neighbourhoods, so they are decided independently (in
@@ -2322,14 +2537,14 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
         }
     }
     const float barrier = float(1e-3 * mMls.voxelSize());
-    tree::ValueAccessor<FloatTreeT> phiAcc(newPhi);
-    tree::ValueAccessor<LabelTreeT> labAcc(newLabels);
+    tree::ValueAccessor<FloatTreeT> phiAcc(phi);
+    tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
     for (const std::vector<Deferred>& pass : byColour) {
         if (pass.empty()) continue;
         std::vector<char> accept(pass.size(), 0);
         forEachIndex(pass.size(), [&](size_t i) {
-            tree::ValueAccessor<const LabelTreeT> lab(newLabels);
+            tree::ValueAccessor<const LabelTreeT> lab(labels);
             const Deferred& c = pass[i];
             accept[i] = this->topologyAllows(lab, c.ijk, c.from, c.to);
         });
@@ -2366,7 +2581,6 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
     // the result is the (phi, label) minimum per voxel, so it does not
     // depend on the order or the thread count.
     {
-        struct Activation { Coord ijk; float phi; LabelT label; };
         tree::LeafManager<const FloatTreeT> leafs(phi);
         std::vector<std::vector<Activation>> found(leafs.leafCount());
         forEachIndex(leafs.leafCount(), [&](size_t i) {
@@ -2383,6 +2597,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
                 }
             }
         });
+        mPeakScratchBytes = std::max(mPeakScratchBytes, mScratch.memUsage() + vectorBytes(found));
         // Serial merge. Every candidate voxel was inactive before the merge,
         // so an active one here was activated by an earlier candidate; its
         // phi temporarily holds the best candidate value.
