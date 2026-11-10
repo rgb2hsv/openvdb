@@ -2931,8 +2931,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
         EXPECT_TOPOLOGY_CONSISTENT(cube);
         // the phi floor holds on protected interfaces (protected runs); without
         // protection there is no floor and smaller phi values occur
-        std::string floorMsg;
-        EXPECT_TRUE(lsmo.validateTopologyFloor(&floorMsg)) << "t " << t << ": " << floorMsg;
+        EXPECT_TRUE(lsmo.validateTopologyFloor()) << "t " << t;
         for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
             if (*it < float(lsmo.minimumPhi() * dx)) ++res.belowFloor;
         }
@@ -3196,5 +3195,179 @@ TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)
         std::cout << "WorldUnitsHalfVoxel curvature flow: steps " << steps << " r^2 " << r * r
                   << " (expected 40)" << std::endl;
         EXPECT_NEAR(r * r, 40.0, 2.0 * std::sqrt(40.0) * 0.5);
+    }
+}
+
+
+////////////////////////////////////////
+// Incremental (dirty-region) redistancing
+
+namespace {
+
+// Runs the same evolution twice from @a make(), with setFullRedistance(true)
+// and (false), in chunks of @a chunk up to @a tEnd; after every chunk the
+// label trees must be identical and max |phi_full - phi_incr| over the
+// active voxels at most 1e-4*dx. Returns the advect wall time of both runs
+// in seconds (full, incremental).
+template<typename SpeedT, typename MakeT, typename ConfigT>
+std::pair<double, double>
+expectIncrementalMatchesFull(const std::string& name, const MakeT& make, const SpeedT& speed,
+    const ConfigT& config, double tEnd, double chunk)
+{
+    using Evolver = tools::LevelSetMultiObject<MLS, SpeedT>;
+    MLS::Ptr full = make(), incr = make();
+    const double dx = full->voxelSize();
+    Evolver ef(*full, speed), ei(*incr, speed);
+    config(ef);
+    config(ei);
+    ef.setFullRedistance(true);
+    ei.setFullRedistance(false);
+    double secs[2] = {0.0, 0.0}, worst = 0.0;
+    size_t steps = 0;
+    for (double t = 0.0; t < tEnd - 1e-9;) {
+        const double t1 = std::min(tEnd, t + chunk);
+        auto start = std::chrono::steady_clock::now();
+        steps += ef.advect(t, t1);
+        secs[0] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        start = std::chrono::steady_clock::now();
+        ei.advect(t, t1);
+        secs[1] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        t = t1;
+        const Index64 labelDiff = treeDifferences(full->labels()->tree(), incr->labels()->tree());
+        EXPECT_EQ(labelDiff, Index64(0)) << name << " t " << t;
+        EXPECT_TRUE(full->phi()->tree().hasSameTopology(incr->phi()->tree())) << name << " t " << t;
+        double maxDiff = 0.0;
+        tree::ValueAccessor<const FloatTree> acc(incr->phi()->tree());
+        for (auto it = full->phi()->tree().cbeginValueOn(); it; ++it) {
+            float v;
+            if (!acc.probeValue(it.getCoord(), v)) { maxDiff = 1e30; continue; }
+            maxDiff = std::max(maxDiff, std::abs(double(*it) - double(v)));
+        }
+        worst = std::max(worst, maxDiff);
+        EXPECT_LE(maxDiff, 1e-4 * dx) << name << " t " << t;
+        if (::testing::Test::HasFailure()) break;
+    }
+    std::cout << "IncrementalRedistance " << name << ": " << steps << " steps, max |phi_full"
+              << " - phi_incr| " << worst / dx << " dx, full " << secs[0] << " s ("
+              << 1e3 * secs[0] / double(std::max<size_t>(steps, 1)) << " ms/step), incremental "
+              << secs[1] << " s (" << 1e3 * secs[1] / double(std::max<size_t>(steps, 1))
+              << " ms/step)" << std::endl;
+    return {secs[0], secs[1]};
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
+{
+    auto none = [](auto&) {};
+    {
+        // a growing sphere (label 1) next to a static one (label 2): most of
+        // the band is clean, so kept values serve as Dirichlet data
+        auto make = [] {
+            std::map<int32_t, FloatGrid::ConstPtr> in;
+            in[1] = tools::createLevelSetSphere<FloatGrid>(6.0f, Vec3f(0.0f), 1.0f);
+            in[2] = tools::createLevelSetSphere<FloatGrid>(16.0f, Vec3f(30.0f, 0.0f, 0.0f), 1.0f);
+            return MLS::fromSignedGrids(in);
+        };
+        LabelSpeed speed;
+        speed.speeds = {{1, -1.0f}, {2, 0.0f}};
+        expectIncrementalMatchesFull("PartlyStatic", make, speed, none, 6.0, 1.0);
+    }
+    {
+        ConstantSpeed speed;
+        speed.s = -1.0f;
+        expectIncrementalMatchesFull("PressureGrowth", [] { return makeSphere(8.0); }, speed,
+            none, 6.0, 1.0);
+    }
+    {
+        Forces forces;
+        forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+        expectIncrementalMatchesFull("UniformAdvection", [] { return makeSphere(8.0); }, forces,
+            none, 7.5, 1.5);
+    }
+    {
+        Forces forces;
+        forces.setCurvatureWeight(1.0f);
+        expectIncrementalMatchesFull("CurvatureFlow", [] { return makeSphere(10.0); }, forces,
+            none, 30.0, 5.0);
+    }
+    {
+        const Tornado tornado;
+        Forces forces;
+        forces.setAdvection(tornado.velocity(), 1.0f);
+        forces.setCurvatureWeight(0.01f);
+        expectIncrementalMatchesFull("Tornado",
+            [&] { return MLS::fromSignedGrids(tornado.inputs(), 3); }, forces, none, 42.0, 2.0);
+    }
+    {
+        // TopologyCubeThroughSpheres: protected cube (label 1) advected
+        // along +x through three orbiting kinematic spheres (labels 2-4)
+        const int side = 40;
+        auto make = [&] {
+            Int32Grid::Ptr labels = Int32Grid::create(0);
+            auto acc = labels->getAccessor();
+            for (auto p = CoordBBox(Coord(0), Coord(side - 1)).begin(); p; ++p) {
+                acc.setValue(*p, 1);
+            }
+            for (int s = 0; s < 3; ++s) {
+                const Coord& c = kOrbitSpheres[s];
+                for (auto p = CoordBBox(c - Coord(4), c + Coord(4)).begin(); p; ++p) {
+                    if ((*p - c).asVec3i().lengthSqr() <= 16) acc.setValue(*p, 2 + s);
+                }
+            }
+            return MLS::fromLabelGrid(*labels);
+        };
+        Forces forces;
+        forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+        forces.setCurvatureWeight(0.0f);
+        auto config = [](tools::LevelSetMultiObject<MLS, Forces>& e) {
+            for (int s = 0; s < 3; ++s) {
+                e.setKinematicLabel(2 + s, tools::createLevelSetSphere<FloatGrid>(4.0f,
+                    Vec3f(kOrbitSpheres[s].asVec3d()), 1.0f), orbitMotion);
+            }
+            e.setConnectivity(Conn::FG26_BG6);
+            e.setTopologyPreservingLabels({1});
+        };
+        expectIncrementalMatchesFull("TopologyCubeThroughSpheres", make, forces, config,
+            84.0, 2.0);
+    }
+    {
+        // Only kinematic writes change the pair: a static protected cube
+        // (label 1, zero speeds) and a static ball (label 3) next to it; a
+        // kinematic ball (label 2) moves along +y into the cube (claims,
+        // rejected claims, wraps) and on past the static ball.
+        auto make = [] {
+            Int32Grid::Ptr labels = Int32Grid::create(0);
+            auto acc = labels->getAccessor();
+            for (auto p = CoordBBox(Coord(0), Coord(23)).begin(); p; ++p) acc.setValue(*p, 1);
+            for (auto p = CoordBBox(Coord(-30, -20, 0), Coord(-10, 0, 20)).begin(); p; ++p) {
+                if ((*p - Coord(-20, -10, 10)).asVec3i().lengthSqr() <= 64) acc.setValue(*p, 3);
+            }
+            return MLS::fromLabelGrid(*labels);
+        };
+        LabelSpeed speed; // all zero
+        auto config = [](tools::LevelSetMultiObject<MLS, LabelSpeed>& e) {
+            e.setKinematicLabel(2, tools::createLevelSetSphere<FloatGrid>(4.0f,
+                Vec3f(12.0f, -8.0f, 12.0f), 1.0f), [](double t) {
+                    math::Mat4d m = math::Mat4d::identity();
+                    m.setTranslation(Vec3d(0.0, t, 0.0));
+                    return m;
+                });
+            e.setTopologyPreservingLabels({1});
+        };
+        expectIncrementalMatchesFull("KinematicOnly", make, speed, config, 16.0, 2.0);
+        // the same ball moving slowly (one step per chunk, a hundredth of a
+        // voxel per step), so that few voxels change their freeze state and
+        // the stamped values carry the changes
+        auto slow = [](tools::LevelSetMultiObject<MLS, LabelSpeed>& e) {
+            e.setKinematicLabel(2, tools::createLevelSetSphere<FloatGrid>(4.0f,
+                Vec3f(12.0f, -3.3f, 12.0f), 1.0f), [](double t) {
+                    math::Mat4d m = math::Mat4d::identity();
+                    m.setTranslation(Vec3d(0.0, 0.04 * t, 0.0));
+                    return m;
+                });
+            e.setTopologyPreservingLabels({1});
+        };
+        expectIncrementalMatchesFull("KinematicSlow", make, speed, slow, 6.0, 0.25);
     }
 }

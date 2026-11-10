@@ -90,6 +90,7 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -566,6 +567,51 @@ inline double solveGodunov(double* abar, double* coef, int n, double dx)
     return result;
 }
 
+/// One Jacobi update of the outer-layer solver at @a p (current value
+/// @a old) from its active face neighbours; see solveOuterLayers().
+template<typename FloatAccT, typename SeedAccT, typename DiffersOp>
+inline float jacobiUpdate(const Coord& p, float old, FloatAccT& acc, SeedAccT& seedAcc,
+    DiffersOp& op, double dx, bool signedReflection)
+{
+    const Coord* offs = faceOffsets();
+    double abar[3], coef[3];
+    int n = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        float a = kUnknownDistance, a2 = kUnknownDistance;
+        for (int side = 0; side < 2; ++side) {
+            float v;
+            const Coord q = p + offs[2 * axis + side];
+            if (!acc.probeValue(q, v)) continue;
+            bool sameSide = true;
+            if (signedReflection && op(p, q)) {
+                if (!seedAcc.isValueOn(q)) continue; // unknown across
+                v = -v; // frozen voxel across the interface
+                sameSide = false;
+            }
+            if (!(v < a)) continue;
+            a = v;
+            // a' must lie on p's side of the interface
+            const Coord q2 = q + offs[2 * axis + side];
+            if (!sameSide || !acc.probeValue(q2, a2) || op(p, q2)) {
+                a2 = kUnknownDistance;
+            }
+        }
+        if (a == kUnknownDistance) continue;
+        if (a2 < a) { // second order (Chopp 2001)
+            abar[n] = (4.0 * a - a2) / 3.0;
+            coef[n] = 9.0 / 4.0;
+        } else {
+            abar[n] = a;
+            coef[n] = 1.0;
+        }
+        ++n;
+    }
+    if (n == 0) return old;
+    float upd = float(solveGodunov(abar, coef, n, dx));
+    if (signedReflection) upd = std::max(upd, 0.0f);
+    return std::min(old, upd);
+}
+
 /// @brief Outer-layer solver on the unsigned distance @a phi.
 /// @details Active voxels of @a phi that are not active in @a seeds are reset
 /// and solve |grad phi| = 1 by parallel Jacobi iteration with the seeds as
@@ -596,7 +642,6 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
     using LeafRangeT = typename LeafManagerT::LeafRange;
     const float bg = phi.background();
     const bool serial = grainSize <= 0;
-    const Coord* offs = faceOffsets();
 
     auto forEachLeaf = [&](LeafManagerT& leafs, const auto& op) {
         auto body = [&](const LeafRangeT& range) {
@@ -628,44 +673,9 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
                 const auto* mask = seeds.probeConstLeaf(leafIt->origin());
                 for (auto it = leafIt->cbeginValueOn(); it; ++it) {
                     if (mask && mask->isValueOn(it.pos())) continue;
-                    const Coord p = it.getCoord();
                     const float old = *it;
-                    double abar[3], coef[3];
-                    int n = 0;
-                    for (int axis = 0; axis < 3; ++axis) {
-                        float a = kUnknownDistance, a2 = kUnknownDistance;
-                        for (int side = 0; side < 2; ++side) {
-                            float v;
-                            const Coord q = p + offs[2 * axis + side];
-                            if (!acc.probeValue(q, v)) continue;
-                            bool sameSide = true;
-                            if (signedReflection && op(p, q)) {
-                                if (!seedAcc.isValueOn(q)) continue; // unknown across
-                                v = -v; // frozen voxel across the interface
-                                sameSide = false;
-                            }
-                            if (!(v < a)) continue;
-                            a = v;
-                            // a' must lie on p's side of the interface
-                            const Coord q2 = q + offs[2 * axis + side];
-                            if (!sameSide || !acc.probeValue(q2, a2) || op(p, q2)) {
-                                a2 = kUnknownDistance;
-                            }
-                        }
-                        if (a == kUnknownDistance) continue;
-                        if (a2 < a) { // second order (Chopp 2001)
-                            abar[n] = (4.0 * a - a2) / 3.0;
-                            coef[n] = 9.0 / 4.0;
-                        } else {
-                            abar[n] = a;
-                            coef[n] = 1.0;
-                        }
-                        ++n;
-                    }
-                    if (n == 0) { aux.setValue(it.pos(), old); continue; }
-                    float upd = float(solveGodunov(abar, coef, n, dx));
-                    if (signedReflection) upd = std::max(upd, 0.0f);
-                    const float val = std::min(old, upd);
+                    const float val = jacobiUpdate(it.getCoord(), old, acc, seedAcc, op, dx,
+                        signedReflection);
                     aux.setValue(it.pos(), val);
                     maxDelta = std::max(maxDelta, old - val);
                 }
@@ -692,6 +702,126 @@ int solveOuterLayers(FloatTreeT& phi, const BoolTreeT& seeds, const DiffersOp& d
     forEachLeaf(leafs, [&](typename LeafRangeT::Iterator& leafIt) {
         for (auto it = leafIt->beginValueOn(); it; ++it) {
             if (*it == kUnknownDistance) it.setValue(bg);
+        }
+    });
+    return iter;
+}
+
+/// @brief solveOuterLayers() restricted to the voxels of @a solve that are
+/// active in @a phi and not in @a seeds (both masks may hold active tiles).
+/// @details Those voxels are reset and updated by the same Jacobi iteration
+/// (and the same signed reflection) as in solveOuterLayers(); every other
+/// active voxel keeps its value and acts as Dirichlet data, but only
+/// voxels of @a seeds count as frozen across a label change. Iteration
+/// stops when max|delta phi| over the solved voxels falls below
+/// @a tolerance, after @a maxIter iterations, or on interrupt; unreached
+/// voxels get the background. Only the leaves holding solved voxels are
+/// visited.
+/// @return the number of Jacobi iterations performed (0 if none is solved).
+template<typename FloatTreeT, typename BoolTreeT, typename DiffersOp, typename InterruptT>
+int solveOuterLayersMasked(FloatTreeT& phi, const BoolTreeT& seeds, const BoolTreeT& solve,
+    const DiffersOp& differs, double dx, float tolerance, int maxIter, int grainSize,
+    InterruptT* interrupt, bool signedReflection)
+{
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
+    using LeafT = typename FloatTreeT::LeafNodeType;
+    using MaskLeafT = typename BoolTreeT::LeafNodeType;
+    constexpr Index kSize = LeafT::SIZE;
+    const float bg = phi.background();
+
+    using MaskT = typename MaskLeafT::NodeMaskType;
+    std::vector<LeafT*> leaves;
+    std::vector<MaskT> masks;
+    {
+        // the voxels of a leaf in a mask: its leaf's, all (active tile) or none
+        auto maskOf = [](tree::ValueAccessor<const BoolTreeT>& acc, const Coord& o) {
+            if (const MaskLeafT* l = acc.probeConstLeaf(o)) return l->getValueMask();
+            return MaskT(acc.isValueOn(o));
+        };
+        tree::ValueAccessor<const BoolTreeT> solveAcc(solve), seedAcc(seeds);
+        for (auto it = phi.beginLeaf(); it; ++it) {
+            MaskT m = maskOf(solveAcc, it->origin());
+            if (m.isOff()) continue;
+            m &= it->getValueMask();
+            m -= maskOf(seedAcc, it->origin());
+            if (m.isOff()) continue;
+            leaves.push_back(&*it);
+            masks.push_back(m);
+        }
+    }
+    if (leaves.empty()) return 0;
+
+    auto forEach = [&](const auto& op) {
+        if (grainSize > 0) {
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, leaves.size(), size_t(grainSize)),
+                [&](const tbb::blocked_range<size_t>& r) {
+                    for (size_t i = r.begin(); i != r.end(); ++i) op(i);
+                });
+        } else {
+            for (size_t i = 0; i < leaves.size(); ++i) op(i);
+        }
+    };
+
+    // Reset the voxels to solve.
+    forEach([&](size_t i) {
+        for (auto it = masks[i].beginOn(); it; ++it) {
+            leaves[i]->setValueOnly(it.pos(), kUnknownDistance);
+        }
+    });
+
+    // Jacobi: new values of the solved voxels go to a scratch array per leaf,
+    // then are written back.
+    std::vector<float> next(leaves.size() * kSize);
+    auto sweep = [&]() -> float {
+        auto body = [&](const tbb::blocked_range<size_t>& r, float maxDelta) {
+            DiffersOp op = differs; // per-task copy (may own value accessors)
+            tree::ValueAccessor<const FloatTreeT> acc(phi);
+            tree::ValueAccessor<const BoolTreeT> seedAcc(seeds);
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                const LeafT& leaf = *leaves[i];
+                float* out = next.data() + i * kSize;
+                for (auto it = masks[i].beginOn(); it; ++it) {
+                    const Index n = it.pos();
+                    const float old = leaf.getValue(n);
+                    const float val = jacobiUpdate(leaf.offsetToGlobalCoord(n), old, acc,
+                        seedAcc, op, dx, signedReflection);
+                    out[n] = val;
+                    maxDelta = std::max(maxDelta, old - val);
+                }
+            }
+            return maxDelta;
+        };
+        const tbb::blocked_range<size_t> all(0, leaves.size(),
+            size_t(grainSize > 0 ? grainSize : 1));
+        if (grainSize > 0) {
+            return tbb::parallel_reduce(all, 0.0f, body,
+                [](float a, float b) { return std::max(a, b); });
+        }
+        return body(all, 0.0f);
+    };
+
+    int iter = 0;
+    while (iter < maxIter) {
+        if (util::wasInterrupted(interrupt)) break;
+        ++iter;
+        const float maxDelta = sweep();
+        forEach([&](size_t i) {
+            const float* in = next.data() + i * kSize;
+            for (auto it = masks[i].beginOn(); it; ++it) {
+                leaves[i]->setValueOnly(it.pos(), in[it.pos()]);
+            }
+        });
+        if (maxDelta < tolerance) break;
+    }
+
+    // Unreached voxels (no seed or kept voxel nearby, or interrupted) get the
+    // background.
+    forEach([&](size_t i) {
+        for (auto it = masks[i].beginOn(); it; ++it) {
+            if (leaves[i]->getValue(it.pos()) == kUnknownDistance) {
+                leaves[i]->setValueOnly(it.pos(), bg);
+            }
         }
     });
     return iter;
@@ -787,6 +917,27 @@ public:
         const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
         const int iter = lsmo_internal::solveOuterLayers(phi, seeds, differs, dx,
             mTolerance, maxIter, mGrainSize, mInterrupter, /*signedReflection=*/true);
+        if (mInterrupter) mInterrupter->end();
+        return iter;
+    }
+
+    /// @brief Incremental form of redistance(freeze): only the active voxels
+    /// of @a dirty that are not active in @a freeze are reset and solved
+    /// (same scheme, same signed reflection across frozen voxels); every
+    /// other active voxel keeps its value and acts as Dirichlet data. It
+    /// matches redistance(freeze) where @a dirty covers every voxel whose
+    /// result can differ from its current value.
+    /// @return the number of Jacobi iterations performed (0 if nothing is
+    /// solved).
+    int redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)
+    {
+        FloatTreeT& phi = mMls.phi()->tree();
+        const double dx = mMls.voxelSize();
+        const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
+        if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
+        const lsmo_internal::LabelDiffers<LabelTreeT> differs(mMls.labels()->tree());
+        const int iter = lsmo_internal::solveOuterLayersMasked(phi, freeze, dirty, differs,
+            dx, mTolerance, maxIter, mGrainSize, mInterrupter, /*signedReflection=*/true);
         if (mInterrupter) mInterrupter->end();
         return iter;
     }
@@ -1981,6 +2132,17 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    both trees (labels kept, so the interior label stays known);
 ///    pruneInactive(). Builds with OPENVDB_ENABLE_ASSERTS check validate()
 ///    after every step.
+///    By default the redistance is incremental: only the leaves within
+///    ceil(halfWidth*sqrt(3)) + 2 voxels (the Jacobi iteration limit) of a
+///    voxel whose phi, label, activity or freeze state changed since the
+///    last redistance are re-solved, the others keep their values as
+///    Dirichlet data; every write of the step (projection, deferred
+///    changes, kinematic stamps, orphan fixes, band activation and
+///    deactivation, the phi floor) records its changed voxels. This assumes
+///    that only the evolver changes the pair between steps; the first
+///    step, and the first after a change of the topology-preserving or
+///    kinematic labels, the phi floor or the tolerance, re-solve the whole
+///    band, as does every step with setFullRedistance(true).
 ///
 /// Voxels of fixed labels never change label or phi and no label can
 /// capture them; a step with no non-zero candidate and no kinematic label
@@ -2069,7 +2231,12 @@ public:
     /// @brief TBB grain size in leaves; zero or negative runs serially.
     void setGrainSize(int grainSize) { mGrainSize = grainSize; }
     /// @brief Redistance tolerance in world units (default 1e-4*dx).
-    void setRedistanceTolerance(float tolWorld) { mTolerance = tolWorld; }
+    void setRedistanceTolerance(float tolWorld) { mTolerance = tolWorld; mPrimed = false; }
+    /// @brief Re-solve the whole band at every step (default false: only the
+    /// leaves near the voxels the step changed are re-solved; see the class
+    /// documentation). The results agree to within the redistance tolerance.
+    void setFullRedistance(bool on) { mFullRedistance = on; }
+    bool fullRedistance() const { return mFullRedistance; }
     /// @brief Labels whose digital topology is preserved (default
     /// none): a label change a -> b at a voxel is applied only if the voxel is
     /// a simple point of every protected label in {a, b}.
@@ -2089,6 +2256,7 @@ public:
                 "LevelSetMultiObject: label 0 cannot be topology-preserving with kinematic labels");
         }
         mProtected = std::move(labels);
+        mPrimed = false;
     }
     /// @brief Minimum phi, as a fraction of the voxel size, kept at the
     /// active voxels of topology-preserving labels and at their face
@@ -2104,6 +2272,7 @@ public:
             OPENVDB_THROW(ValueError, "LevelSetMultiObject: invalid minimum phi");
         }
         mMinPhiFraction = fractionOfDx;
+        mPrimed = false;
     }
     double minimumPhi() const { return mMinPhiFraction; }
     /// @brief The phi floor in world units: minimumPhi()*dx if some label is
@@ -2116,7 +2285,7 @@ public:
     /// @brief Whether the phi floor holds (see setMinimumPhi()); true if no
     /// label is topology-preserving.
     /// @param message if non-null, receives the first violation.
-    bool validateTopologyFloor(std::string* message = nullptr) const;
+    bool validateTopologyFloor() const;
     /// @brief Adjacency pair of topology preservation (default FG26_BG6).
     void setConnectivity(MultiObjectConnectivity conn) { mConnectivity = conn; }
 
@@ -2158,9 +2327,10 @@ public:
             k.hasBox = true;
         }
         mKinematic[label] = std::move(k);
+        mPrimed = false;
     }
     /// @brief Make @a label an ordinary label again (its voxels stay).
-    void clearKinematicLabel(int32_t label) { mKinematic.erase(label); }
+    void clearKinematicLabel(int32_t label) { mKinematic.erase(label); mPrimed = false; }
     /// @brief Time of the current state (set by advect(); step() advances it
     /// by the time step taken). Kinematic labels are stamped at this time
     /// plus the step.
@@ -2252,6 +2422,89 @@ private:
 
     using BoolLeafT = typename BoolTreeT::LeafNodeType;
 
+    /// Voxel bit masks per leaf origin: the change masks of incremental
+    /// redistancing. Much smaller than a mask tree, whose internal nodes
+    /// cost about as much as those of the pair. Lookups (probe) may run
+    /// concurrently; insertions are serial.
+    struct LeafMasks
+    {
+        using MaskT = typename BoolLeafT::NodeMaskType;
+        static constexpr Int32 kDimMask = Int32(BoolLeafT::DIM - 1);
+
+        static Coord originOf(const Coord& p)
+        {
+            return Coord(p.x() & ~kDimMask, p.y() & ~kDimMask, p.z() & ~kDimMask);
+        }
+        MaskT* probe(const Coord& origin)
+        {
+            auto it = map.find(origin);
+            return it == map.end() ? nullptr : &it->second;
+        }
+        const MaskT* probe(const Coord& origin) const
+        {
+            auto it = map.find(origin);
+            return it == map.end() ? nullptr : &it->second;
+        }
+        /// Set the bit of voxel @a p (serial).
+        void setOn(const Coord& p) { map[originOf(p)].setOn(BoolLeafT::coordToOffset(p)); }
+        /// An entry at every leaf of @a phi (serial; existing bits kept).
+        void touch(const FloatTreeT& phi)
+        {
+            for (auto leaf = phi.cbeginLeaf(); leaf; ++leaf) map[leaf->origin()];
+        }
+        /// All bits off, one entry per leaf of @a phi (serial).
+        void reset(const FloatTreeT& phi)
+        {
+            for (auto it = map.begin(); it != map.end();) {
+                if (phi.probeConstLeaf(it->first)) { it->second.setOff(); ++it; }
+                else it = map.erase(it);
+            }
+            this->touch(phi);
+        }
+        size_t memUsage() const
+        {
+            // nodes (value plus about two pointers and a hash) and buckets
+            return map.size() * (sizeof(typename std::unordered_map<Coord, MaskT>::value_type)
+                + 3 * sizeof(void*)) + map.bucket_count() * sizeof(void*);
+        }
+
+        std::unordered_map<Coord, MaskT> map;
+    };
+
+    /// Phi, label and activity of one voxel, for change tracking.
+    struct VoxelState { float phi = 0.0f; LabelT label = LabelT(0); bool on = false; };
+
+    /// Change tracking for incremental redistancing (serial writers): every
+    /// write to the pair goes through write(), which compares the voxel
+    /// before and after and marks it dirty if it changed.
+    struct ChangeLog
+    {
+        explicit ChangeLog(LeafMasks& dirtyMasks): dirty(dirtyMasks) {}
+
+        template<typename PhiAccT, typename LabAccT>
+        static VoxelState state(PhiAccT& phi, LabAccT& lab, const Coord& p)
+        {
+            VoxelState s;
+            s.on = phi.probeValue(p, s.phi);
+            s.label = lab.getValue(p);
+            return s;
+        }
+        /// Run @a w (which writes voxel @a p through @a phi and @a lab) and
+        /// mark @a p if its phi (while active), label or activity changed.
+        template<typename PhiAccT, typename LabAccT, typename WriteT>
+        void write(PhiAccT& phi, LabAccT& lab, const Coord& p, const WriteT& w)
+        {
+            const VoxelState a = state(phi, lab, p);
+            w();
+            const VoxelState b = state(phi, lab, p);
+            if (a.on != b.on || a.label != b.label || (a.on && a.phi != b.phi)) {
+                dirty.setOn(p);
+            }
+        }
+
+        LeafMasks& dirty;
+    };
+
     template<typename T>
     static size_t vectorBytes(const std::vector<T>& v) { return v.capacity() * sizeof(T); }
     template<typename T>
@@ -2271,6 +2524,11 @@ private:
         std::vector<std::vector<Deferred>> deferred;
         /// projected and fixed-label voxels (redistance freeze mask)
         BoolTreeT freeze{false};
+        /// incremental redistancing: voxels whose phi, label or activity
+        /// changed since the last redistance
+        LeafMasks dirty;
+        /// frozen active voxels of the last redistance
+        LeafMasks prevSeeds;
         std::vector<std::unique_ptr<BoolLeafT>> freeLeaves;
 
         /// Empty @a v for reuse. Slots reused by other leaves would keep
@@ -2311,24 +2569,30 @@ private:
 
         /// Make @a freeze an inactive (false) mask with one leaf per leaf
         /// of @a phi, recycling the leaves of the previous step.
-        void resetFreeze(const FloatTreeT& phi)
+        void resetFreeze(const FloatTreeT& phi) { resetMask(freeze, phi); }
+
+        /// Make @a mask an inactive (false) mask with one leaf per leaf of
+        /// @a phi, recycling its leaves.
+        void resetMask(BoolTreeT& mask, const FloatTreeT& phi)
         {
             std::vector<BoolLeafT*> stolen;
-            freeze.stealNodes(stolen);
+            mask.stealNodes(stolen);
             for (BoolLeafT* leaf : stolen) freeLeaves.emplace_back(leaf);
-            freeze.clear();
+            mask.clear();
             for (auto leaf = phi.cbeginLeaf(); leaf; ++leaf) {
-                std::unique_ptr<BoolLeafT> mask;
-                if (freeLeaves.empty()) {
-                    mask.reset(new BoolLeafT(leaf->origin(), false, false));
-                } else {
-                    mask = std::move(freeLeaves.back());
-                    freeLeaves.pop_back();
-                    mask->setOrigin(leaf->origin());
-                    mask->fill(false, false);
-                }
-                freeze.addLeaf(mask.release());
+                mask.addLeaf(this->takeLeaf(leaf->origin()));
             }
+        }
+
+        /// An inactive mask leaf at @a origin (recycled if possible).
+        BoolLeafT* takeLeaf(const Coord& origin)
+        {
+            if (freeLeaves.empty()) return new BoolLeafT(origin, false, false);
+            BoolLeafT* leaf = freeLeaves.back().release();
+            freeLeaves.pop_back();
+            leaf->setOrigin(origin);
+            leaf->fill(false, false);
+            return leaf;
         }
 
         size_t memUsage() const
@@ -2336,7 +2600,7 @@ private:
             size_t n = vectorBytes(data);
             for (const LeafData& d : data) n += vectorBytes(d.entries) + vectorBytes(d.cand);
             n += vectorBytes(deferred);
-            n += size_t(freeze.memUsage());
+            n += size_t(freeze.memUsage()) + dirty.memUsage() + prevSeeds.memUsage();
             n += freeLeaves.capacity() * sizeof(std::unique_ptr<BoolLeafT>)
                 + freeLeaves.size() * sizeof(BoolLeafT);
             return n;
@@ -2473,7 +2737,8 @@ private:
         return false;
     }
     /// Raise phi to phiFloor() wherever floorApplies (no-op without
-    /// protected labels).
+    /// protected labels); raised voxels are marked dirty (the masks need an
+    /// entry at every phi leaf).
     void enforcePhiFloor();
 
     bool isProtected(int32_t l) const { return !mProtected.empty() && mProtected.count(l) != 0; }
@@ -2566,6 +2831,11 @@ private:
 
     void cleanOrphans(FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze);
     void bandMaintenance(const BoolTreeT& freeze);
+    /// Redistance only near the changes recorded since the last redistance.
+    void incrementalRedistance(MultiLevelSetRedistance<MultiLevelSetT>& redist,
+        const BoolTreeT& freeze);
+    /// Keep the frozen active voxels of this redistance (Scratch::prevSeeds).
+    void rememberSeeds(const BoolTreeT& freeze);
 
     MultiLevelSetT& mMls;
     const SpeedT& mSpeed;
@@ -2579,6 +2849,10 @@ private:
     bool mClampSpeed = false;
     int mGrainSize = 1;
     float mTolerance;
+    bool mFullRedistance = false;
+    /// whether the pair was last redistanced by this evolver (incremental
+    /// redistancing needs a redistanced state outside the dirty region)
+    bool mPrimed = false;
     Scratch mScratch;
     size_t mPeakScratchBytes = 0;
 };
@@ -2605,6 +2879,9 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     Scratch& scratch = mScratch;
     scratch.resetFreeze(phi);
     BoolTreeT& freeze = scratch.freeze;
+    // Change masks of incremental redistancing (they keep the changes made
+    // after the last redistance)
+    scratch.dirty.touch(phi);
 
     // 1-2. projected set, candidates and speeds, all on time-n data
     tree::LeafManager<const FloatTreeT> leafs(phi);
@@ -2708,11 +2985,14 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
             auto& phiBuf = buffers.phiBuffer(i, kNext);
             auto& labBuf = buffers.labelBuffer(i, kNext);
             const auto& labN = buffers.labelBuffer(i, 0); // time n until the swap
+            auto* dirtyLeaf = scratch.dirty.probe(leaf.origin());
+            OPENVDB_ASSERT(dirtyLeaf);
             const Candidate* cand = d.cand.data();
             for (const VoxelEntry& e : d.entries) {
                 const int32_t own = static_cast<int32_t>(labN.getValue(e.offset));
+                const float phiN = leaf.getValue(e.offset);
                 int32_t l; float v;
-                const bool moved = project(e, own, leaf.getValue(e.offset), cand, dt, l, v);
+                const bool moved = project(e, own, phiN, cand, dt, l, v);
                 cand += e.n;
                 if (!moved) continue;
                 if (this->involvesProtected(own, l)) {
@@ -2721,6 +3001,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
                 }
                 phiBuf.setValue(e.offset, v);
                 labBuf.setValue(e.offset, LabelT(l));
+                if (v != phiN || l != own) dirtyLeaf->setOn(e.offset); // re-solve nearby
             }
         });
         mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage() + buffers.memUsage());
@@ -2757,11 +3038,14 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::enforcePhiFloor()
     tree::LeafManager<FloatTreeT> leafs(mMls.phi()->tree());
     forEachIndex(leafs.leafCount(), [&](size_t i) {
         tree::ValueAccessor<const LabelTreeT> lab(labels);
+        auto* dirtyLeaf = mScratch.dirty.probe(leafs.leaf(i).origin());
+        OPENVDB_ASSERT(dirtyLeaf);
         for (auto it = leafs.leaf(i).beginValueOn(); it; ++it) {
             if (!(*it < eps)) continue;
             const Coord p = it.getCoord();
             if (this->floorApplies(lab, p, static_cast<int32_t>(lab.getValue(p)))) {
                 it.setValue(eps);
+                dirtyLeaf->setOn(it.pos());
             }
         }
     });
@@ -2770,8 +3054,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::enforcePhiFloor()
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 bool
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::validateTopologyFloor(
-    std::string* message) const
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::validateTopologyFloor() const
 {
     if (mProtected.empty()) return true;
     const float eps = float(this->phiFloor());
@@ -2780,12 +3063,6 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::validateTopologyFloor(
         if (!(*it < eps)) continue;
         const Coord p = it.getCoord();
         if (this->floorApplies(lab, p, static_cast<int32_t>(lab.getValue(p)))) {
-            if (message) {
-                std::ostringstream os;
-                os << "phi " << *it << " < floor " << eps << " at " << p << " (label "
-                   << lab.getValue(p) << ")";
-                *message = os.str();
-            }
             return false;
         }
     }
@@ -2809,17 +3086,20 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
+    ChangeLog log(mScratch.dirty);
     // a voxel taken by kinematic @a label with phi @a v
     auto claim = [&](const Coord& p, int32_t label, float v) {
-        if (v < bg) {
-            phiAcc.setValueOn(p, v);
-            labAcc.setValueOn(p, LabelT(label));
-            maskAcc.setValueOn(p);
-        } else {
-            phiAcc.setValueOff(p, bg);
-            labAcc.setValueOff(p, LabelT(label));
-            maskAcc.setValueOff(p);
-        }
+        log.write(phiAcc, labAcc, p, [&] {
+            if (v < bg) {
+                phiAcc.setValueOn(p, v);
+                labAcc.setValueOn(p, LabelT(label));
+                maskAcc.setValueOn(p);
+            } else {
+                phiAcc.setValueOff(p, bg);
+                labAcc.setValueOff(p, LabelT(label));
+                maskAcc.setValueOff(p);
+            }
+        });
     };
     std::vector<std::vector<Deferred>> claims(1);
     // the objects at time t, and the object of each queued claim
@@ -2874,24 +3154,30 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
                 phiAcc.touchLeaf(p);
                 labAcc.touchLeaf(p);
                 const float v = std::min(psi, bg);
-                if (v < bg) {
-                    phiAcc.setValueOn(p, v);
-                    labAcc.setValueOn(p, LabelT(0));
-                } else {
-                    phiAcc.setValueOff(p, bg);
-                    labAcc.setValueOff(p, LabelT(0));
-                }
+                log.write(phiAcc, labAcc, p, [&] {
+                    if (v < bg) {
+                        phiAcc.setValueOn(p, v);
+                        labAcc.setValueOn(p, LabelT(0));
+                    } else {
+                        phiAcc.setValueOff(p, bg);
+                        labAcc.setValueOff(p, LabelT(0));
+                    }
+                });
                 maskAcc.setValueOff(p);
             } else if (psi < bg) {
                 // band just outside: keep the label, distance at most psi
                 float cur;
                 if (phiAcc.probeValue(p, cur)) {
-                    if (psi < cur) phiAcc.setValueOnly(p, psi);
+                    if (psi < cur) {
+                        log.write(phiAcc, labAcc, p, [&] { phiAcc.setValueOnly(p, psi); });
+                    }
                 } else {
                     phiAcc.touchLeaf(p);
                     labAcc.touchLeaf(p);
-                    phiAcc.setValueOn(p, psi);
-                    labAcc.setValueOn(p, labAcc.getValue(p));
+                    log.write(phiAcc, labAcc, p, [&] {
+                        phiAcc.setValueOn(p, psi);
+                        labAcc.setValueOn(p, labAcc.getValue(p));
+                    });
                 }
                 if (psi <= float(dx)) maskAcc.setValueOn(p);
             }
@@ -2907,8 +3193,10 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     this->colouredPasses(claims, labels,
         [&](const Deferred& c) { claim(c.ijk, c.to, c.phi); },
         [&](const Deferred& c) {
-            phiAcc.setValueOn(c.ijk, minPhi);
-            labAcc.setValueOn(c.ijk, labAcc.getValue(c.ijk));
+            log.write(phiAcc, labAcc, c.ijk, [&] {
+                phiAcc.setValueOn(c.ijk, minPhi);
+                labAcc.setValueOn(c.ijk, labAcc.getValue(c.ijk));
+            });
             maskAcc.setValueOn(c.ijk);
             trapped.push_back(c);
         });
@@ -2990,8 +3278,10 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
                 [&](const Deferred& c) {
                     phiAcc.touchLeaf(c.ijk);
                     labAcc.touchLeaf(c.ijk);
-                    phiAcc.setValueOn(c.ijk, c.phi);
-                    labAcc.setValueOn(c.ijk, LabelT(c.to));
+                    log.write(phiAcc, labAcc, c.ijk, [&] {
+                        phiAcc.setValueOn(c.ijk, c.phi);
+                        labAcc.setValueOn(c.ijk, LabelT(c.to));
+                    });
                     maskAcc.setValueOn(c.ijk); // at the interface: kept
                     changed = true;
                 },
@@ -3062,6 +3352,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
+    ChangeLog log(mScratch.dirty);
     for (const auto& list : fixes) {
         for (const Fix& fx : list) {
             // protected labels: only simple changes, tested on the
@@ -3070,8 +3361,10 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::cleanOrphans(
             const int32_t to = static_cast<int32_t>(fx.label);
             if (this->involvesProtected(own, to)
                 && !this->topologyAllows(labAcc, fx.ijk, own, to)) continue;
-            phiAcc.setValueOnly(fx.ijk, fx.phi);
-            labAcc.setValueOnly(fx.ijk, fx.label);
+            log.write(phiAcc, labAcc, fx.ijk, [&] {
+                phiAcc.setValueOnly(fx.ijk, fx.phi);
+                labAcc.setValueOnly(fx.ijk, fx.label);
+            });
             maskAcc.setValueOff(fx.ijk); // flagged for redistancing
         }
     }
@@ -3122,14 +3415,17 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
+    ChangeLog log(mScratch.dirty);
     this->colouredPasses(deferred, labels,
         [&](const Deferred& c) {
-            phiAcc.setValueOnly(c.ijk, c.phi);
-            labAcc.setValueOnly(c.ijk, LabelT(c.to));
+            log.write(phiAcc, labAcc, c.ijk, [&] {
+                phiAcc.setValueOnly(c.ijk, c.phi);
+                labAcc.setValueOnly(c.ijk, LabelT(c.to));
+            });
         },
         [&](const Deferred& c) {
             // rejected: keep the label, barrier just inside its region
-            phiAcc.setValueOnly(c.ijk, barrier);
+            log.write(phiAcc, labAcc, c.ijk, [&] { phiAcc.setValueOnly(c.ijk, barrier); });
             maskAcc.setValueOn(c.ijk);
         });
 }
@@ -3193,6 +3489,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
             }
         }
         for (const auto& kv : added) {
+            mScratch.dirty.setOn(kv.first); // newly active
             phiW.setValueOnly(kv.first, bg);
             // an activated voxel keeps its inactive label when the change
             // involves a protected label (topology preservation) or would
@@ -3208,14 +3505,25 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
 
     // c. redistance: projected and fixed voxels frozen, the rest solved with
     // signed reflection (the phi floor of protected interfaces holds for
-    // its input and its output)
+    // its input and its output). Incrementally, only the leaves near a
+    // change since the last redistance are re-solved.
+    Scratch& sc = mScratch;
+    sc.dirty.touch(phi);
     this->enforcePhiFloor();
     {
         MultiLevelSetRedistance<MultiLevelSetT> redist(mMls);
         redist.setTolerance(mTolerance);
         redist.setGrainSize(mGrainSize);
-        redist.redistance(freeze);
+        if (mFullRedistance || !mPrimed) {
+            redist.redistance(freeze);
+        } else {
+            this->incrementalRedistance(redist, freeze);
+        }
+        this->rememberSeeds(freeze);
+        mPrimed = true;
     }
+    // changes from here on are re-solved at the next step
+    sc.dirty.reset(phi);
     this->enforcePhiFloor();
 
     // d. deactivate phi >= halfWidth*dx in both trees (labels kept)
@@ -3224,14 +3532,97 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::bandMaintenance(const B
         forEachIndex(leafs.leafCount(), [&](size_t i) {
             auto& leaf = leafs.leaf(i);
             auto* labLeaf = labels.probeLeaf(leaf.origin());
+            auto* dirtyLeaf = sc.dirty.probe(leaf.origin());
+            OPENVDB_ASSERT(dirtyLeaf);
             for (auto it = leaf.beginValueOn(); it; ++it) {
                 if (*it < bg) continue;
+                dirtyLeaf->setOn(it.pos());
                 leaf.setValueOff(it.pos(), bg);
                 if (labLeaf) labLeaf->setActiveState(it.pos(), false);
             }
         });
     }
     mMls.pruneInactive();
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::incrementalRedistance(
+    MultiLevelSetRedistance<MultiLevelSetT>& redist, const BoolTreeT& freeze)
+{
+    using PhiLeafT = typename FloatTreeT::LeafNodeType;
+    using MaskT = typename BoolLeafT::NodeMaskType;
+    constexpr int kDim = int(PhiLeafT::DIM);
+    const FloatTreeT& phi = mMls.phi()->tree();
+    Scratch& sc = mScratch;
+    tree::LeafManager<const FloatTreeT> leafs(phi);
+    const size_t n = leafs.leafCount();
+
+    // 1. Voxels that became or stopped being frozen since the last
+    // redistance change the Dirichlet data too. The masks have an entry at
+    // every phi leaf.
+    forEachIndex(n, [&](size_t i) {
+        const PhiLeafT& leaf = leafs.leaf(i);
+        const BoolLeafT* f = freeze.probeConstLeaf(leaf.origin());
+        const MaskT* prev = static_cast<const LeafMasks&>(sc.prevSeeds).probe(leaf.origin());
+        const MaskT now = f ? f->getValueMask() & leaf.getValueMask() : MaskT();
+        MaskT* dirtyLeaf = sc.dirty.probe(leaf.origin());
+        OPENVDB_ASSERT(dirtyLeaf);
+        *dirtyLeaf |= prev ? now ^ *prev : now;
+    });
+
+    // 2. Solve every leaf within maxIter voxels of a dirty voxel (taken at
+    // leaf granularity), the farthest a Jacobi solve carries a change: with
+    // the second-order upwind choice and the monotone update, values depend
+    // on the order in which voxels are reached, not only on the data within
+    // their distance.
+    const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
+    const int reach = (maxIter + kDim - 1) / kDim; // in leaves
+    std::vector<char> solveLeaf(n, 0);
+    forEachIndex(n, [&](size_t i) {
+        const Coord o = leafs.leaf(i).origin();
+        const LeafMasks& dirtyMasks = sc.dirty;
+        bool dirty = false;
+        for (int a = -reach; a <= reach && !dirty; ++a) {
+            for (int b = -reach; b <= reach && !dirty; ++b) {
+                for (int c = -reach; c <= reach && !dirty; ++c) {
+                    const MaskT* d = dirtyMasks.probe(o.offsetBy(a * kDim, b * kDim, c * kDim));
+                    dirty = d && !d->isOff();
+                }
+            }
+        }
+        solveLeaf[i] = dirty;
+    });
+    BoolTreeT solve(false);
+    {
+        tree::ValueAccessor<BoolTreeT> solveAcc(solve);
+        for (size_t i = 0; i < n; ++i) {
+            if (!solveLeaf[i]) continue;
+            BoolLeafT* m = new BoolLeafT(leafs.leaf(i).origin(), false, false);
+            m->setValueMask(leafs.leaf(i).getValueMask());
+            solveAcc.addLeaf(m);
+        }
+    }
+    redist.redistance(freeze, solve);
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::rememberSeeds(const BoolTreeT& freeze)
+{
+    const FloatTreeT& phi = mMls.phi()->tree();
+    tree::LeafManager<const FloatTreeT> leafs(phi);
+    mScratch.prevSeeds.reset(phi);
+    forEachIndex(leafs.leafCount(), [&](size_t i) {
+        const auto& leaf = leafs.leaf(i);
+        const BoolLeafT* f = freeze.probeConstLeaf(leaf.origin());
+        if (!f) return;
+        auto* prev = mScratch.prevSeeds.probe(leaf.origin());
+        OPENVDB_ASSERT(prev);
+        *prev = f->getValueMask() & leaf.getValueMask();
+    });
 }
 
 } // namespace tools
