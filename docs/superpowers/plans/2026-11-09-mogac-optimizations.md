@@ -97,6 +97,21 @@
 
 ---
 
+### Task 13: Remove the clamp-speed option (user request) — run after Task 3
+
+**Files:** Modify `openvdb/openvdb/tools/LevelSetMultiObject.h` (evolver), `docs/superpowers/specs/2026-11-08-multi-object-level-set-design.md` (§3.5 setters, §4 step 3).
+
+**Interfaces:**
+- Removes: `LevelSetMultiObject::setClampSpeed(bool)`, `clampSpeed() const`, member `mClampSpeed`, the speed clamp to [−1, 1] and the `dt = min(dt, 0.5·dx)` clamp branch. dt is always min(maxDt, motion cap / max|F|, stableDt). Docs mentioning the option are removed. The curvature-term clamp in `MultiObjectForces` (`setMaxCurvatureForce`) is a different mechanism and stays unless the user says otherwise.
+
+- [ ] **Step 1: Write failing test `NoClampSpeedOption`:** a compile-time check (`static_assert` via a detection trait) that `LevelSetMultiObject<…>` has no `setClampSpeed` member.
+- [ ] **Step 2: Run** — FAIL (member exists).
+- [ ] **Step 3: Remove** the option, branches and docs; update the base spec text.
+- [ ] **Step 4: Run all** `TestLevelSetMultiObject*` — pass with unchanged numeric outputs (no test used the option).
+- [ ] **Step 5: Commit** — `"MOGAC evolver: remove the clamp-speed option"`
+
+---
+
 ### Task 4: 16-bit labels by default (M1)
 
 **Files:** Modify `LevelSetMultiObject.h` (`Int16LabelTree`, default template argument, `registerMultiLevelSetGridTypes()`, factory range checks), `LevelSetMultiObjectMesh.h` if it names `Int32Tree`; Tests in both test files and `LevelSetMultiObjectFixtures.h`.
