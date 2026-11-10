@@ -112,6 +112,19 @@
 
 ---
 
+### Task 14: American spelling throughout the feature (user request) — run after Task 13
+
+**Files:** `openvdb/openvdb/tools/LevelSetMultiObject.h`, `openvdb/openvdb/tools/LevelSetMultiObjectMesh.h`, `openvdb/openvdb/unittest/TestLevelSetMultiObject.cc`, `TestLevelSetMultiObjectMesh.cc`, `LevelSetMultiObjectFixtures.h`, `LevelSetMultiObjectTopology.h`, `pendingchanges/multi_object_level_set.txt`, `docs/superpowers/specs/2026-11-0*-*.md`, `docs/superpowers/plans/2026-11-0*-*.md`.
+
+**Interfaces:** identifier renames only, e.g. `colouredPasses` → `coloredPasses`, `byColour` → `byColor`, any `*Neighbour*`/`*Centre*`/`*Behaviour*` → American forms. No behaviour (behavior) change.
+
+- [ ] **Step 1:** Replace British spellings in identifiers, comments, docs, test names and messages: colour→color (coloured→colored), neighbour→neighbor (all forms), centre→center (centres, centred), behaviour→behavior, labelled→labeled, modelled→modeled, travelled→traveled, grey→gray, favour→favor, -ise/-ised/-ising/-isation → -ize/-ized/-izing/-ization where the British form is used (initialised, normalised, maximises, analysed, parameterised; NOT words that are -ise in American English: otherwise, clockwise, noise, raise, exercise, pairwise, piecewise, bitwise). Do not rename identifiers in OpenVDB code outside the feature's files. Check every gtest name still matches what CI filters reference (none reference renamed tests outside these files).
+- [ ] **Step 2: Verify** `grep -rniE "colour|neighbour|centre|behaviour|labell|modell|travell|\bgrey\b|favour|initialis|normalis|maximis|minimis|analys(e|ed|ing)\b|parameteris" <files above>` returns nothing.
+- [ ] **Step 3: Run all** `TestLevelSetMultiObject*` — pass with unchanged numeric outputs; strict build of the two test files clean.
+- [ ] **Step 4: Commit** — `"MOGAC: American spelling"`
+
+---
+
 ### Task 4: 16-bit labels by default (M1)
 
 **Files:** Modify `LevelSetMultiObject.h` (`Int16LabelTree`, default template argument, `registerMultiLevelSetGridTypes()`, factory range checks), `LevelSetMultiObjectMesh.h` if it names `Int32Tree`; Tests in both test files and `LevelSetMultiObjectFixtures.h`.
