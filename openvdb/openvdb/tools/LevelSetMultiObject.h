@@ -91,6 +91,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -173,7 +174,23 @@ constexpr double kKinematicStepShrinkMax = 0.5;
 constexpr int kMaxKinematicShrinkIterations = 32;
 /// Relative tolerance on the end time of advect(t0, t1) (dimensionless).
 constexpr double kAdvectTimeRelativeEpsilon = 1e-6;
+/// Primes of CoordHash, one per component (the usual spatial-hash primes).
+constexpr uint64_t kCoordHashPrimeX = 73856093u;
+constexpr uint64_t kCoordHashPrimeY = 19349669u;
+constexpr uint64_t kCoordHashPrimeZ = 83492791u;
 /// @}
+
+/// Hash of a Coord for std::unordered_map and std::unordered_set: each
+/// component times its own large prime, combined by xor.
+struct CoordHash
+{
+    size_t operator()(const Coord& p) const noexcept
+    {
+        return size_t((uint64_t(uint32_t(p.x())) * kCoordHashPrimeX)
+            ^ (uint64_t(uint32_t(p.y())) * kCoordHashPrimeY)
+            ^ (uint64_t(uint32_t(p.z())) * kCoordHashPrimeZ));
+    }
+};
 
 } // namespace lsmo_internal
 
@@ -345,12 +362,14 @@ public:
     /// @brief Sorted distinct non-zero labels over all active voxels.
     std::vector<int32_t> labelSet() const
     {
-        std::set<int32_t> s;
+        std::unordered_set<int32_t> s;
         for (auto it = mLabels->tree().cbeginValueOn(); it; ++it) {
             s.insert(static_cast<int32_t>(*it));
         }
         s.erase(0);
-        return std::vector<int32_t>(s.begin(), s.end());
+        std::vector<int32_t> v(s.begin(), s.end());
+        std::sort(v.begin(), v.end());
+        return v;
     }
 
     /// @brief Check the class invariant (identical active topology, phi
@@ -2009,8 +2028,14 @@ public:
     /// field again, if any).
     void clearLabelAdvection(int32_t label) { mLabelAdvection.erase(label); }
 
-    void setInactiveLabels(std::set<int32_t> labels) { mInactive = std::move(labels); }
-    void setFixedLabels(std::set<int32_t> labels) { mFixed = std::move(labels); }
+    void setInactiveLabels(const std::set<int32_t>& labels)
+    {
+        mInactive = std::unordered_set<int32_t>(labels.begin(), labels.end());
+    }
+    void setFixedLabels(const std::set<int32_t>& labels)
+    {
+        mFixed = std::unordered_set<int32_t>(labels.begin(), labels.end());
+    }
 
     /// The internal rescaled pressure copy (null if none was set).
     FloatGrid::ConstPtr pressure() const { return mPressure; }
@@ -2023,7 +2048,7 @@ public:
         OPENVDB_ASSERT(ijk == s.center());
         (void)ijk; // fields are sampled at s.center()
         if (!isActive(label)) return lsmo_internal::kInactiveLabelSpeed;
-        if (mFixed.count(label)) return 0.0f;
+        if (!mFixed.empty() && mFixed.count(label)) return 0.0f;
 
         float dneg[3], dpos[3];
         s.upwindDifferences(dneg, dpos);
@@ -2082,8 +2107,14 @@ public:
 
     /// True for labels declared fixed. Label 0 is NOT fixed here: the
     /// evolver treats it as passive and never asks the functor for its speed.
-    bool isFixed(int32_t label) const { return label != 0 && mFixed.count(label) != 0; }
-    bool isActive(int32_t label) const { return mInactive.count(label) == 0; }
+    bool isFixed(int32_t label) const
+    {
+        return label != 0 && !mFixed.empty() && mFixed.count(label) != 0;
+    }
+    bool isActive(int32_t label) const
+    {
+        return mInactive.empty() || mInactive.count(label) == 0;
+    }
 
     /// dx^2/(6 w) for curvature weight w > 0, else +infinity.
     float stableDt(float dx) const
@@ -2105,9 +2136,10 @@ private:
         Vec3SGrid::ConstPtr field;
         float weight = 0.0f;
     };
-    std::map<int32_t, LabelAdvection> mLabelAdvection;
+    // hashed: looked up per voxel, never iterated
+    std::unordered_map<int32_t, LabelAdvection> mLabelAdvection;
     bool mForceSampling = false;
-    std::set<int32_t> mInactive, mFixed;
+    std::unordered_set<int32_t> mInactive, mFixed;
 };
 
 
@@ -2408,7 +2440,7 @@ public:
             OPENVDB_THROW(ValueError,
                 "LevelSetMultiObject: label 0 cannot be topology-preserving with kinematic labels");
         }
-        mProtected = std::move(labels);
+        mProtected = std::unordered_set<int32_t>(labels.begin(), labels.end());
         mPrimed = false;
     }
     /// @brief Minimum phi, as a fraction of the voxel size, kept at the
@@ -2492,7 +2524,12 @@ public:
     float cfl() const { return mCfl; }
     int grainSize() const { return mGrainSize; }
     float redistanceTolerance() const { return mTolerance; }
-    const std::set<int32_t>& topologyPreservingLabels() const { return mProtected; }
+    /// The topology-preserving labels, in increasing order (a copy: the
+    /// evolver keeps them hashed for its per-voxel lookups).
+    std::set<int32_t> topologyPreservingLabels() const
+    {
+        return std::set<int32_t>(mProtected.begin(), mProtected.end());
+    }
     MultiObjectConnectivity connectivity() const { return mConnectivity; }
 
     /// @brief Peak bytes of the evolver's own working memory during the last
@@ -2626,11 +2663,11 @@ private:
         size_t memUsage() const
         {
             // nodes (value plus about two pointers and a hash) and buckets
-            return map.size() * (sizeof(typename std::unordered_map<Coord, MaskT>::value_type)
+            return map.size() * (sizeof(typename decltype(map)::value_type)
                 + 3 * sizeof(void*)) + map.bucket_count() * sizeof(void*);
         }
 
-        std::unordered_map<Coord, MaskT> map;
+        std::unordered_map<Coord, MaskT, lsmo_internal::CoordHash> map;
     };
 
     /// Phi, label and activity of one voxel, for change tracking.
@@ -2792,12 +2829,14 @@ private:
                 same = labels.leaf(i).origin() == phi.leaf(i).origin();
             }
             if (same) return;
-            std::map<Coord, size_t> index;
+            std::unordered_map<Coord, size_t, lsmo_internal::CoordHash> index;
+            index.reserve(labels.leafCount());
             for (size_t j = 0; j < labels.leafCount(); ++j) index[labels.leaf(j).origin()] = j;
             mLabelIndex.resize(phi.leafCount());
             for (size_t i = 0; i < phi.leafCount(); ++i) {
-                OPENVDB_ASSERT(index.count(phi.leaf(i).origin()));
-                mLabelIndex[i] = index[phi.leaf(i).origin()];
+                const auto it = index.find(phi.leaf(i).origin());
+                OPENVDB_ASSERT(it != index.end());
+                mLabelIndex[i] = it->second;
             }
         }
 
@@ -3009,8 +3048,10 @@ private:
     MultiLevelSetT& mMls;
     const SpeedT& mSpeed;
     InterruptT* mInterrupter;
-    std::set<int32_t> mProtected;
-    std::map<int32_t, Kinematic> mKinematic;
+    // hashed for the per-voxel lookups; stampKinematic visits the kinematic
+    // labels in increasing order (overlapping objects: the lower label wins)
+    std::unordered_set<int32_t> mProtected;
+    std::unordered_map<int32_t, Kinematic> mKinematic;
     double mTime = 0.0;
     MultiObjectConnectivity mConnectivity = MultiObjectConnectivity::FG26_BG6;
     double mMinPhiFraction = lsmo_internal::kDefaultMinimumPhiFraction;
@@ -3278,10 +3319,15 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     // the objects at time t, and the object of each queued claim
     struct Object { int32_t label; math::Mat4d inv; const FloatGrid* sdf; };
     std::vector<Object> objects;
-    std::map<Coord, size_t> claimObject;
-    for (auto& kv : mKinematic) {
-        const int32_t label = kv.first;
-        Kinematic& k = kv.second;
+    std::unordered_map<Coord, size_t, lsmo_internal::CoordHash> claimObject;
+    // labels in increasing order: an object does not take voxels of objects
+    // stamped before it
+    std::vector<int32_t> kinematicLabels;
+    kinematicLabels.reserve(mKinematic.size());
+    for (const auto& kv : mKinematic) kinematicLabels.push_back(kv.first);
+    std::sort(kinematicLabels.begin(), kinematicLabels.end());
+    for (const int32_t label : kinematicLabels) {
+        Kinematic& k = mKinematic.at(label);
         if (!k.hasBox) continue;
         const math::Mat4d m = k.motion(t);
         const math::Mat4d inv = m.inverse();
@@ -3390,9 +3436,9 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
         maskAcc.clear();
         // targets o of the trapped voxels
         std::vector<std::pair<Deferred, Coord>> moves; // claim of q, target o
-        std::map<Coord, Deferred> adds;
+        std::unordered_map<Coord, Deferred, lsmo_internal::CoordHash> adds;
         for (const Deferred& c : trapped) {
-            const Object& obj = objects[claimObject[c.ijk]];
+            const Object& obj = objects[claimObject.at(c.ijk)];
             const Vec3d xq = xform.indexToWorld(c.ijk);
             Vec3d g;
             for (int a = 0; a < 3; ++a) {
@@ -3453,8 +3499,12 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
         bool changed = false;
         // 1. o joins the protected label (simple-point test)
         if (!adds.empty()) {
+            // in coordinate order (the colored passes apply in list order)
             std::vector<std::vector<Deferred>> addList(1);
+            addList[0].reserve(adds.size());
             for (const auto& kv : adds) addList[0].push_back(kv.second);
+            std::sort(addList[0].begin(), addList[0].end(),
+                [](const Deferred& a, const Deferred& b) { return a.ijk < b.ijk; });
             this->coloredPasses(addList, labels,
                 [&](const Deferred& c) {
                     phiAcc.touchLeaf(c.ijk);
@@ -3479,7 +3529,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
                 claimList[0].push_back(mv.first);
             }
         }
-        std::set<Coord> claimed;
+        std::unordered_set<Coord, lsmo_internal::CoordHash> claimed;
         this->coloredPasses(claimList, labels,
             [&](const Deferred& c) {
                 claim(c.ijk, c.to, c.phi);
