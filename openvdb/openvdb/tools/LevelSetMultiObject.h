@@ -2278,7 +2278,9 @@ namespace lsmo_internal {
 
 /// @brief Whether a speed functor is split: it provides
 /// hyperbolic(ijk, label, stencil) and parabolic(ijk, label, stencil)
-/// besides operator().
+/// besides operator() (parabolicStableDt is optional, see
+/// HasParabolicStableDt). The members are detected by their address, so an
+/// overloaded or template hyperbolic or parabolic makes the trait false.
 template<typename SpeedT, typename = void>
 struct IsSplitSpeed: std::false_type {};
 template<typename SpeedT>
@@ -2491,8 +2493,9 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// provides hyperbolic() and parabolic(), see SpeedT concept) and
 /// setSplitting(true) (the default), a step is split only when the
 /// curvature limit binds: when parabolicStableDt < min(maxDt,
-/// 0.5*cfl*dx/max|F_h|), with F_h the hyperbolic speeds on the state at the
-/// start of the step (evaluated only if parabolicStableDt < maxDt).
+/// 0.5*cfl*dx/max|F_h|) and the kinematic limit, with F_h the hyperbolic
+/// speeds on the state at the start of the step (evaluated only if
+/// parabolicStableDt < maxDt).
 /// Otherwise it is the unsplit update above, unchanged. A split step is a
 /// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2), with
 /// dt = min(maxDt, 0.5*cfl*dx/max|F_h|) (and the kinematic limit), so the
@@ -2558,12 +2561,14 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// bool  isFixed(int32_t label) const;
 /// bool  isActive(int32_t label) const;
 /// float stableDt(float dx) const; // +inf if none
-/// // optional, all three for operator splitting (operator() = their sum):
+/// // optional, for operator splitting (operator() = their sum): both
+/// // hyperbolic() and parabolic(), non-overloaded and non-template
+/// // (lsmo_internal::IsSplitSpeed); parabolicStableDt() optional
 /// float hyperbolic(const Coord& ijk, int32_t label,
 ///                  const LabelAwareStencil<MultiLevelSetT>& s) const;
 /// float parabolic(const Coord& ijk, int32_t label,
 ///                 const LabelAwareStencil<MultiLevelSetT>& s) const;
-/// float parabolicStableDt(float dx) const; // +inf if none (else stableDt)
+/// float parabolicStableDt(float dx) const; // +inf if none; absent: stableDt
 /// @endcode
 /// operator(), hyperbolic() and parabolic() must be thread-safe; parabolic()
 /// is not called for inactive labels (their retreat is hyperbolic). All
@@ -2616,11 +2621,13 @@ public:
     /// @brief Strang splitting of a split speed functor's hyperbolic and
     /// parabolic parts (default true; see the class documentation): a step
     /// is split only when speed.parabolicStableDt(dx) is below the
-    /// hyperbolic dt min(maxDt, 0.5*cfl*dx/max|F_h|); otherwise it is the
+    /// hyperbolic dt min(maxDt, 0.5*cfl*dx/max|F_h|, kinematic limit);
+    /// otherwise it is the
     /// unsplit update. Ignored for a functor that only provides operator().
     void setSplitting(bool on) { mSplitting = on; }
-    /// Whether steps are split: setSplitting() is on and the speed functor
-    /// is split (a step is then split if its parabolicStableDt is finite).
+    /// Whether steps may be split: setSplitting() is on and the speed
+    /// functor is split. A step is then split only when the parabolic limit
+    /// binds (parabolicStableDt below the hyperbolic dt, see setSplitting()).
     bool splitting() const { return mSplitting && kSplitSpeed; }
     /// @brief Labels whose digital topology is preserved (default
     /// none): a label change a -> b at a voxel is applied only if the voxel is
@@ -3241,9 +3248,8 @@ private:
     /// Steps 4-6 with time step @a dt, on the last evaluate(); kinematic
     /// labels are stamped at @a stampTime if @a stamp.
     void update(float dt, bool any, bool stamp, double stampTime);
-    /// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2), with
-    /// @a h the hyperbolic evaluation of the current state.
-    float splitStep(float maxDt, const Evaluation& h);
+    /// Strang step of @a dt: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2).
+    float splitStep(float dt);
     /// Sub-updates of @a term over @a duration, each of at most @a target
     /// (and the motion limit); the last stamps the kinematic labels at
     /// @a stampTime if @a stampAtEnd. If @a interruptible, the interrupter
@@ -3343,8 +3349,9 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         const float pStable = this->parabolicStableDt();
         if (pStable > 0.0f && pStable < maxDt) { // false for +inf
             const Evaluation h = this->evaluate(Term::Hyperbolic);
-            if (h.any && pStable < this->motionLimit(h, maxDt)) {
-                return this->splitStep(maxDt, h);
+            if (h.any) {
+                const float dt = this->kinematicLimit(this->motionLimit(h, maxDt));
+                if (pStable < dt) return this->splitStep(dt);
             }
         }
     }
@@ -3562,11 +3569,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 float
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitStep(
-    float maxDt, const Evaluation& h)
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitStep(float dt)
 {
-    OPENVDB_ASSERT(h.any);
-    const float dt = this->kinematicLimit(this->motionLimit(h, maxDt));
     const double t1 = mTime + double(dt);
     // parabolic halves: n equal substeps of at most the parabolic stable dt
     const double half = 0.5 * double(dt);
@@ -3609,6 +3613,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitPhase(
             break;
         }
     }
+    OPENVDB_ASSERT(interrupted || !(remaining > eps)); // the phase covered its duration
     return std::max(0.0, duration - remaining);
 }
 

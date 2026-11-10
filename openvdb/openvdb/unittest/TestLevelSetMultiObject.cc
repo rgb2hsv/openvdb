@@ -2575,11 +2575,27 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
 {
     // Constant pressure field: dpsi_1/dt = -|grad psi_1|, unit growth.
     FloatGrid::Ptr pressure = FloatGrid::create(1.0f);
+    // Curvature weight 0.5: the parabolic limit dx^2/(6*0.5) = 1/3 is below
+    // the hyperbolic dt (about 0.5*cfl*dx). An unsplit step is at most
+    // stableDt = 1/3, so a step longer than 1/3 was split.
+    const float weight = 0.5f;
+    const float pStable = 1.0f / (6.0f * weight);
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    auto contactCount = [&](const MLS& m) {
+        Index64 contact = 0;
+        for (auto it = m.labels()->tree().cbeginValueOn(); it; ++it) {
+            if (*it != 1) continue;
+            for (int f = 0; f < 6; ++f) {
+                contact += m.labels()->tree().getValue(it.getCoord() + offs[f]) == 2;
+            }
+        }
+        return contact;
+    };
 
     {
-        // FixedLabels with curvature + pressure, split (curvature limit 1/3
-        // below the hyperbolic dt 0.4995): the fixed label's voxels are
-        // bit-identical and the moving label reaches it.
+        // FixedLabels with curvature + pressure, split: the fixed label's
+        // voxels are bit-identical and the moving label reaches it; the
+        // first step and the steps around first contact are split.
         auto m = makeTwoSpheres(1.0);
         std::map<Coord, float> before;
         for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
@@ -2588,14 +2604,29 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
         ASSERT_FALSE(before.empty());
         Forces forces;
         forces.setPressure(pressure, 1.0f);
-        forces.setCurvatureWeight(0.5f);
+        forces.setCurvatureWeight(weight);
         forces.setFixedLabels({2});
+        ASSERT_EQ(forces.parabolicStableDt(1.0f), pStable);
         tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
         ASSERT_TRUE(lsmo.splitting());
+        std::vector<float> dts;
+        int firstContact = -1;
         for (int n = 0; n < 30; ++n) {
-            ASSERT_GT(lsmo.step(0.75f), 0.0f);
+            const float dt = lsmo.step(0.75f);
+            ASSERT_GT(dt, 0.0f);
+            dts.push_back(dt);
             std::string msg;
             ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+            if (firstContact < 0 && contactCount(*m) > 0) firstContact = n;
+        }
+        std::cout << "SplittingFixedAndPassive: fixed: first contact after step " << firstContact
+                  << ", dt:";
+        for (float dt : dts) std::cout << " " << dt;
+        std::cout << std::endl;
+        ASSERT_GE(firstContact, 1);
+        EXPECT_GT(dts[0], pStable) << "the first step is not split";
+        for (int n = firstContact - 1; n <= std::min(firstContact + 1, 29); ++n) {
+            EXPECT_GT(dts[n], pStable) << "step " << n << " (around first contact) is not split";
         }
         Index64 changed = 0;
         for (const auto& kv : before) {
@@ -2605,36 +2636,49 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
                 || std::memcmp(&phi, &kv.second, sizeof(float)) != 0) ++changed;
         }
         EXPECT_EQ(changed, Index64(0));
-        const Coord* offs = tools::lsmo_internal::faceOffsets();
-        Index64 contact = 0;
-        for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
-            if (*it != 1) continue;
-            for (int f = 0; f < 6; ++f) {
-                contact += m->labels()->tree().getValue(it.getCoord() + offs[f]) == 2;
-            }
-        }
-        EXPECT_GT(contact, Index64(0));
+        EXPECT_GT(contactCount(*m), Index64(0));
         EXPECT_EQ(countOrphans(*m), Index64(0));
     }
     {
-        // PressureGrowth with a curvature weight of 0.01 against passive
-        // label 0: grows within the PressureGrowth gate (its curvature limit
-        // dx^2/0.06 is above every step, so its steps are not split).
+        // PressureGrowth with curvature, split, against passive label 0:
+        // dr/dt = 1 - w/r; the radius at t = 6 is within the PressureGrowth
+        // gate (0.5*dx) of that ODE's solution.
         auto m = makeSphere(8.0);
         const double dx = m->voxelSize();
         Forces forces;
         forces.setPressure(pressure, 1.0f);
-        forces.setCurvatureWeight(0.01f);
+        forces.setCurvatureWeight(weight);
         tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
         ASSERT_TRUE(lsmo.splitting());
-        const size_t steps = lsmo.advect(0.0, 6.0);
-        EXPECT_GE(steps, size_t(6));
+        const double tEnd = 6.0;
+        std::vector<float> dts;
+        double t = 0.0;
+        while (tEnd - t > 1e-6) {
+            const float dt = lsmo.step(float(tEnd - t));
+            ASSERT_GT(dt, 0.0f);
+            dts.push_back(dt);
+            t += dt;
+        }
+        size_t split = 0;
+        for (float dt : dts) split += dt > pStable;
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << msg;
+        double exact = 8.0; // dr/dt = 1 - w/r, RK4
+        const int kOdeSteps = 6000;
+        const double h = tEnd / kOdeSteps;
+        auto f = [&](double r) { return 1.0 - double(weight) / r; };
+        for (int i = 0; i < kOdeSteps; ++i) {
+            const double k1 = f(exact), k2 = f(exact + 0.5 * h * k1),
+                k3 = f(exact + 0.5 * h * k2), k4 = f(exact + h * k3);
+            exact += h * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+        }
         const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
-        std::cout << "SplittingFixedAndPassive: steps " << steps << " mean radius " << r
-                  << " (expected about 14)" << std::endl;
-        EXPECT_NEAR(r, 8.0 + 6.0, 0.5 * dx);
+        std::cout << "SplittingFixedAndPassive: growth: steps " << dts.size() << " (split "
+                  << split << ") mean radius " << r << " (expected " << exact << ")"
+                  << std::endl;
+        EXPECT_GT(dts[0], pStable) << "the first step is not split";
+        EXPECT_GE(split + 1, dts.size()); // all but possibly a short last step
+        EXPECT_NEAR(r, exact, 0.5 * dx);
     }
 }
 
