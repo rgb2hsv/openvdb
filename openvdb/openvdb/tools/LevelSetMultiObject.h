@@ -2489,12 +2489,15 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///
 /// <b>Operator splitting.</b> With a split speed functor (one that also
 /// provides hyperbolic() and parabolic(), see SpeedT concept) and
-/// setSplitting(true) (the default), a step whose parabolicStableDt is
-/// finite is a Strang step: parabolic(dt/2), hyperbolic(dt),
-/// parabolic(dt/2). Its dt = min(maxDt, 0.5*cfl*dx/max|F_h|) (and the
-/// kinematic limit), with F_h the hyperbolic speeds on the state at the
-/// start of the step, so the hyperbolic terms (advection, pressure,
-/// inactive-label retreat) are not held to the much smaller curvature limit.
+/// setSplitting(true) (the default), a step is split only when the
+/// curvature limit binds: when parabolicStableDt < min(maxDt,
+/// 0.5*cfl*dx/max|F_h|), with F_h the hyperbolic speeds on the state at the
+/// start of the step (evaluated only if parabolicStableDt < maxDt).
+/// Otherwise it is the unsplit update above, unchanged. A split step is a
+/// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2), with
+/// dt = min(maxDt, 0.5*cfl*dx/max|F_h|) (and the kinematic limit), so the
+/// hyperbolic terms (advection, pressure, inactive-label retreat) are not
+/// held to the much smaller curvature limit.
 /// Each parabolic half takes n = ceil((dt/2)/parabolicStableDt) equal
 /// substeps. Every substep and the hyperbolic part are full updates as
 /// above (steps 1-6: projection with passive label 0 and fixed walls,
@@ -2503,10 +2506,17 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// one left and each limited to half a voxel of motion: if its own speeds
 /// require it, an update takes a shorter time step and the part continues
 /// with more updates until its time is covered. An update whose speeds are
-/// all zero is skipped. Kinematic labels are stamped once per step, at
-/// t_{n+1}, by its last update (the earlier ones treat them as walls at
-/// their t_n position). A step with no parabolic part (parabolicStableDt
-/// +inf, e.g. curvature weight 0) is an unsplit step as above, unchanged.
+/// all zero is skipped. (If the first parabolic half raises max|F_h|, the
+/// hyperbolic part takes more than one update, so that step is slightly
+/// asymmetric.) Kinematic labels are stamped once per step, at t_{n+1}, by
+/// its last update (the earlier ones treat them as walls at their t_n
+/// position). A step with no parabolic part (parabolicStableDt +inf, e.g.
+/// curvature weight 0) is never split. The interrupter is checked between
+/// parabolic substeps and before and after the hyperbolic part; on
+/// interrupt the step ends after the current update with a valid state,
+/// kinematic labels stamped at the time reached, and returns the time
+/// advanced: the parabolic time done if the hyperbolic part has not run,
+/// else dt (the parabolic part then lags by less than dt/2).
 ///
 /// <b>Kinematic labels</b> (setKinematicLabel()) are rigid obstacles whose
 /// region is prescribed: a signed distance grid of the object in its rest
@@ -2604,8 +2614,10 @@ public:
     void setFullRedistance(bool on) { mFullRedistance = on; }
     bool fullRedistance() const { return mFullRedistance; }
     /// @brief Strang splitting of a split speed functor's hyperbolic and
-    /// parabolic parts (default true; see the class documentation).
-    /// Ignored for a functor that only provides operator().
+    /// parabolic parts (default true; see the class documentation): a step
+    /// is split only when speed.parabolicStableDt(dx) is below the
+    /// hyperbolic dt min(maxDt, 0.5*cfl*dx/max|F_h|); otherwise it is the
+    /// unsplit update. Ignored for a functor that only provides operator().
     void setSplitting(bool on) { mSplitting = on; }
     /// Whether steps are split: setSplitting() is on and the speed functor
     /// is split (a step is then split if its parabolicStableDt is finite).
@@ -2745,12 +2757,14 @@ public:
     /// @brief One forward Euler step of at most @a maxDt (world time), or
     /// one Strang-split step (see the class documentation).
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
-    /// changes if nothing can move, 0 if @a maxDt <= 0.
+    /// changes if nothing can move, 0 if @a maxDt <= 0; less than the step
+    /// if a split step was interrupted (see the class documentation).
     float step(float maxDt);
 
     /// @brief Step from @a t0 to @a t1, checking the interrupter before each
-    /// step. On interrupt the state after the last completed step is kept
-    /// (it is valid).
+    /// step (and within split steps). On interrupt the state after the last
+    /// completed step or sub-update is kept (it is valid) and time() is the
+    /// time reached.
     /// @return the number of steps taken.
     size_t advect(double t0, double t1)
     {
@@ -2766,6 +2780,7 @@ public:
             if (!(dt > 0.0f)) break;
             t += dt;
             ++n;
+            if (mInterrupted) break; // a split step stopped early
         }
         if (mInterrupter) mInterrupter->end();
         return n;
@@ -3216,15 +3231,6 @@ private:
             return mSpeed.stableDt(dx);
         }
     }
-    /// Whether step() takes a split step: splitting() and a finite
-    /// parabolic stable time step (a functor without a parabolic limit has
-    /// no parabolic part to split off).
-    bool splitStepActive() const
-    {
-        return this->splitting() && std::isfinite(this->parabolicStableDt())
-            && this->parabolicStableDt() > 0.0f;
-    }
-
     /// Steps 1-2 of the class documentation on the current state: freeze
     /// mask, projected set, candidates and their @a term speeds (scratch).
     Evaluation evaluate(Term term);
@@ -3235,13 +3241,20 @@ private:
     /// Steps 4-6 with time step @a dt, on the last evaluate(); kinematic
     /// labels are stamped at @a stampTime if @a stamp.
     void update(float dt, bool any, bool stamp, double stampTime);
-    /// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2).
-    float splitStep(float maxDt);
+    /// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2), with
+    /// @a h the hyperbolic evaluation of the current state.
+    float splitStep(float maxDt, const Evaluation& h);
     /// Sub-updates of @a term over @a duration, each of at most @a target
     /// (and the motion limit); the last stamps the kinematic labels at
-    /// @a stampTime if @a stampAtEnd.
-    void splitPhase(Term term, double duration, float target, bool stampAtEnd,
-        double stampTime);
+    /// @a stampTime if @a stampAtEnd. If @a interruptible, the interrupter
+    /// is checked after every sub-update but the last (and after the last
+    /// too if @a checkAfterLast); on interrupt @a interrupted is set and the
+    /// phase stops. @return the time covered.
+    double splitPhase(Term term, double duration, float target, bool stampAtEnd,
+        double stampTime, bool interruptible, bool checkAfterLast, bool& interrupted);
+    /// End a split step interrupted after @a elapsed: stamp the kinematic
+    /// labels at mTime + @a elapsed, advance the time. @return @a elapsed.
+    float finishInterrupted(float elapsed);
 
     /// Two-smallest projection of @a e (own label @a own, time-n
     /// @a phiN) with candidates @a cand; false if @a e has no non-zero
@@ -3306,6 +3319,8 @@ private:
     float mTolerance;
     bool mFullRedistance = false;
     bool mSplitting = true;
+    /// whether the last step() stopped early on an interrupt
+    bool mInterrupted = false;
     int mRedistanceIterations = 0;
     size_t mRedistanceCapHits = 0;
     /// whether the pair was last redistanced by this evolver (incremental
@@ -3320,9 +3335,19 @@ template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 float
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 {
+    mInterrupted = false;
     if (!(maxDt > 0.0f)) return 0.0f;
     mPeakScratchBytes = 0;
-    if (this->splitStepActive()) return this->splitStep(maxDt);
+    if (this->splitting()) {
+        // split only if the parabolic limit is below the hyperbolic dt
+        const float pStable = this->parabolicStableDt();
+        if (pStable > 0.0f && pStable < maxDt) { // false for +inf
+            const Evaluation h = this->evaluate(Term::Hyperbolic);
+            if (h.any && pStable < this->motionLimit(h, maxDt)) {
+                return this->splitStep(maxDt, h);
+            }
+        }
+    }
 
     // 1-2. projected set, candidates and speeds, all on time-n data
     const Evaluation e = this->evaluate(Term::Full);
@@ -3537,34 +3562,36 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 float
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitStep(float maxDt)
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitStep(
+    float maxDt, const Evaluation& h)
 {
-    // the time step of the hyperbolic part, on the current state
-    const Evaluation h = this->evaluate(Term::Hyperbolic);
-    const float dx = float(mMls.voxelSize());
-    if (!h.any && mKinematic.empty()) {
-        const float dt = std::min(maxDt, mSpeed.stableDt(dx));
-        mTime += dt;
-        return dt; // no non-zero candidate anywhere: nothing moves
-    }
+    OPENVDB_ASSERT(h.any);
     const float dt = this->kinematicLimit(this->motionLimit(h, maxDt));
     const double t1 = mTime + double(dt);
     // parabolic halves: n equal substeps of at most the parabolic stable dt
     const double half = 0.5 * double(dt);
     const double n = std::max(1.0, std::ceil(half / double(this->parabolicStableDt())));
     const float sub = float(half / n);
-    this->splitPhase(Term::Parabolic, half, sub, /*stampAtEnd=*/false, t1);
-    this->splitPhase(Term::Hyperbolic, double(dt), dt, /*stampAtEnd=*/false, t1);
-    this->splitPhase(Term::Parabolic, half, sub, /*stampAtEnd=*/true, t1);
+    bool interrupted = false;
+    const double p1 = this->splitPhase(Term::Parabolic, half, sub, /*stampAtEnd=*/false, t1,
+        /*interruptible=*/true, /*checkAfterLast=*/true, interrupted);
+    if (interrupted) return this->finishInterrupted(float(p1));
+    this->splitPhase(Term::Hyperbolic, double(dt), dt, /*stampAtEnd=*/false, t1,
+        /*interruptible=*/false, /*checkAfterLast=*/false, interrupted);
+    if (util::wasInterrupted(mInterrupter)) return this->finishInterrupted(dt);
+    this->splitPhase(Term::Parabolic, half, sub, /*stampAtEnd=*/true, t1,
+        /*interruptible=*/true, /*checkAfterLast=*/false, interrupted);
+    if (interrupted) return this->finishInterrupted(dt);
     mTime += dt;
     return dt;
 }
 
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
-void
+double
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitPhase(
-    Term term, double duration, float target, bool stampAtEnd, double stampTime)
+    Term term, double duration, float target, bool stampAtEnd, double stampTime,
+    bool interruptible, bool checkAfterLast, bool& interrupted)
 {
     const double eps = lsmo_internal::kSplitPhaseRelativeEpsilon * duration;
     double remaining = duration;
@@ -3573,10 +3600,31 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitPhase(
         const float dt = this->motionLimit(e, std::min(target, float(remaining)));
         if (!(dt > 0.0f)) break;
         remaining -= double(dt);
-        const bool stamp = stampAtEnd && !(remaining > eps) && !mKinematic.empty();
+        const bool last = !(remaining > eps);
+        const bool stamp = stampAtEnd && last && !mKinematic.empty();
         // a sub-update in which nothing moves is skipped
         if ((e.any && e.maxSpeed > 0.0f) || stamp) this->update(dt, e.any, stamp, stampTime);
+        if (interruptible && (!last || checkAfterLast) && util::wasInterrupted(mInterrupter)) {
+            interrupted = true;
+            break;
+        }
     }
+    return std::max(0.0, duration - remaining);
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+float
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::finishInterrupted(float elapsed)
+{
+    if (!mKinematic.empty()) {
+        // kinematic labels at the time reached; no projection (dt 0)
+        this->evaluate(Term::Parabolic);
+        this->update(0.0f, /*any=*/false, /*stamp=*/true, mTime + double(elapsed));
+    }
+    mInterrupted = true;
+    mTime += elapsed;
+    return elapsed;
 }
 
 

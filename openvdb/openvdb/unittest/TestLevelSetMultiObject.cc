@@ -2163,6 +2163,27 @@ TEST_F(TestLevelSetMultiObject, InterruptMidAdvect)
     EXPECT_TRUE(m->validate(&msg)) << msg;
 }
 
+TEST_F(TestLevelSetMultiObject, SplitStepInterrupt)
+{
+    // Pure curvature flow: one split step would cover t = 30 (no hyperbolic
+    // speed), in parabolic substeps of dx^2/6. The interrupter fires on its
+    // third check: advect's check before the step, then after each of the
+    // first two substeps.
+    auto m = makeSphere(10.0);
+    Forces forces;
+    forces.setCurvatureWeight(1.0f);
+    CountingInterrupter interrupter;
+    tools::LevelSetMultiObject<MLS, Forces, CountingInterrupter> lsmo(*m, forces, &interrupter);
+    const size_t steps = lsmo.advect(0.0, 30.0);
+    EXPECT_EQ(steps, size_t(1));
+    EXPECT_EQ(interrupter.calls, 3);
+    EXPECT_GT(lsmo.time(), 0.0);
+    EXPECT_LT(lsmo.time(), 30.0);
+    EXPECT_NEAR(lsmo.time(), 2.0 / 6.0, 1e-5); // two substeps of dx^2/6
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+}
+
 TEST_F(TestLevelSetMultiObject, ThinFeatureVanishes)
 {
     // 1-voxel-thick slab of label 1 inside a 16^3 block of label 2
@@ -2556,8 +2577,9 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
     FloatGrid::Ptr pressure = FloatGrid::create(1.0f);
 
     {
-        // FixedLabels with curvature + pressure, split: the fixed label's
-        // voxels are bit-identical and the moving label reaches it.
+        // FixedLabels with curvature + pressure, split (curvature limit 1/3
+        // below the hyperbolic dt 0.4995): the fixed label's voxels are
+        // bit-identical and the moving label reaches it.
         auto m = makeTwoSpheres(1.0);
         std::map<Coord, float> before;
         for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
@@ -2595,8 +2617,9 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
         EXPECT_EQ(countOrphans(*m), Index64(0));
     }
     {
-        // PressureGrowth with a curvature weight of 0.01, split, against
-        // passive label 0: grows within the PressureGrowth gate.
+        // PressureGrowth with a curvature weight of 0.01 against passive
+        // label 0: grows within the PressureGrowth gate (its curvature limit
+        // dx^2/0.06 is above every step, so its steps are not split).
         auto m = makeSphere(8.0);
         const double dx = m->voxelSize();
         Forces forces;
@@ -3415,11 +3438,8 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
     // Hashes of the phi and label trees recorded with the ordered containers
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
-    // grain size. (A legitimate numerical change elsewhere re-records them:
-    // the vortex, curvature weight 0.003, was re-recorded when its steps
-    // became Strang-split; with setSplitting(false) it still gives
-    // 0x91492b1ffb06703d.)
-    constexpr uint64_t kVortexHash = 0xbb2ca5ae036068fcull;
+    // grain size. (A legitimate numerical change elsewhere re-records them.)
+    constexpr uint64_t kVortexHash = 0x91492b1ffb06703dull;
     constexpr uint64_t kCubeHash[2] = {0x8b7ce4b2a0056e19ull, 0xb246f92014f05228ull}; // FG26, FG6
     constexpr uint64_t kPartitionHash = 0x9b3bc454962e6cbeull;
     // end times of the recorded cube runs and of the serial vs parallel check
