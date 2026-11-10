@@ -60,6 +60,26 @@
 
 ---
 
+### Task 12: Topology debug utilities + orbiting spheres in the cube test (user requests) — run after Task 2, before Task 3
+
+**Files:** Modify `openvdb/openvdb/tools/LevelSetMultiObject.h` (per-label advection in `MultiObjectForces`), `openvdb/openvdb/unittest/LevelSetMultiObjectTopology.h` (debug utilities), `TestLevelSetMultiObject.cc`, `TestLevelSetMultiObjectMesh.cc`.
+
+**Interfaces:**
+- Produces (library): `void MultiObjectForces::setAdvection(int32_t label, Vec3SGrid::ConstPtr field, float weight)` — overrides the shared advection field for that label (null field throws `ValueError`); `void clearLabelAdvection(int32_t label)`. Labels without an override use the shared field (behaviour unchanged).
+- Produces (test-only, `lsmo_test` namespace): `struct MeshTopology { int components; int euler; bool closed; bool manifold; std::vector<Vec3s> boundaryEdgeMidpoints, nonManifoldEdgeMidpoints; }; MeshTopology meshTopology(const tools::LabelMesh&);` `struct TopologyReport { bool ok; std::string message; DigitalTopology region; MeshTopology mesh; };` `template<typename MLS> TopologyReport verifyLabelTopology(const MLS&, int32_t label, const CoordBBox& domain, tools::MultiObjectConnectivity, const std::string& tag, const DigitalTopology* expected = nullptr);` — checks mesh components == region components + cavities, χ(mesh) == 2·χ(region), closed and manifold, and `expected` if given; macro `EXPECT_TOPOLOGY_CONSISTENT(report)` (EXPECT_TRUE(report.ok) << report.message). Debug dump on failure, or always when env `OPENVDB_MOGAC_DEBUG_DIR` is set: `<dir>/<gtest test name>/<tag>/` gets `pair.vdb` (φ + labels, int16 grids registered via the existing helper if present, else written as Int32 copy), `label<L>.ply`, `report.txt` (per-component voxel counts and bboxes, cavity bboxes, boundary/non-manifold edge positions). `digitalTopology` is templated on the label grid type (O2).
+
+- [ ] **Step 1: Write failing tests:**
+  - `MeshTopologyUtility`: meshTopology on a closed sphere mesh (1 component, χ 2, closed, manifold) and on a mesh with one triangle removed (not closed, 3 boundary edges reported); verifyLabelTopology on the existing torus/hollow-sphere fixtures returns ok with the expected numbers; a deliberately wrong `expected` makes ok false, the message names the mismatch, and with OPENVDB_MOGAC_DEBUG_DIR set the three dump files exist.
+  - `PerLabelAdvection`: two spheres, label 1 with the shared field (1,0,0), label 2 with override (0,1,0): after t = 5 the centroids moved by (5,0,0) and (0,5,0) ± 0.5·dx; null override throws.
+  - Rewrite `TopologyCubeThroughSpheres` (and its control): the three spheres (radius 4, same initial positions) are ordinary labels (no longer fixed) advected by a per-label rigid rotation about the axis parallel to x through their common centroid, in the plane orthogonal to the cube's motion, with angular speed ω = 2π / 84 (one revolution over the run; tangential speed ≤ 0.25·dx per unit time at the spheres' radius); the cube (label 1, protected, FG26_BG6) keeps velocity (1,0,0) and travel 84. Every chunk: `EXPECT_TOPOLOGY_CONSISTENT(verifyLabelTopology(..., expected (1,0,1)))` for the cube; `validate()`, partition invariant; each sphere stays one component. End: cube leading face moved 84 ± 2·dx; each sphere centroid within 2·dx of its analytically rotated position; sphere volume loss ≤ 1.1 × OpenVDB `LevelSetAdvection` (FIRST_BIAS/TVD_RK1) loss for the same sphere in the same rotation over the same time + 2%. Control (cube unprotected): its topology changes at some chunk (report via verifyLabelTopology with dump), as before.
+  - Replace the inline topology checks in the mesh topology tests and DigitalTopologyHelper with `verifyLabelTopology` / `meshTopology` (no duplicated logic).
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** `TestLevelSetMultiObject*` — pass.
+- [ ] **Step 5: Commit** — `"MOGAC: topology debug utilities, per-label advection, orbiting spheres in the cube test"`
+
+---
+
 ### Task 3: Incremental redistancing (S2)
 
 **Files:** Modify `LevelSetMultiObject.h` (`MultiLevelSetRedistance`: new `redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)` overload; evolver builds the dirty mask); Test `TestLevelSetMultiObject.cc`.
