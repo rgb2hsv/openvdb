@@ -1146,13 +1146,14 @@ contourMultiObject(const MultiLevelSetT& mls, const std::vector<int32_t>& labels
     std::vector<LabelT> requested;
     for (int32_t l : labels) {
         if (l == 0) continue;
-        requested.push_back(LabelT(l));
         result[l];
+        // a label the tree cannot hold has an empty mesh (never truncated)
+        if (lsmo_internal::labelFits<LabelT>(l)) requested.push_back(LabelT(l));
     }
     std::sort(requested.begin(), requested.end());
     requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
     const bool all = labels.empty();
-    if (!all && requested.empty()) return result; // only label 0 was requested
+    if (!all && requested.empty()) return result; // nothing the label tree can hold
 
     // blocks: every leaf of the label tree and its lower neighbors (cells
     // whose minimum corner is one voxel below a leaf have corners in it)

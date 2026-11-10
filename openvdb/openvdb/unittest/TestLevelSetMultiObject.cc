@@ -47,6 +47,7 @@ namespace {
 
 using namespace openvdb;
 using MLS = lsmo_test::MLS;
+using LabelTree = lsmo_test::LabelTree;
 using lsmo_test::contactPairs;
 using lsmo_test::junctionSet;
 using lsmo_test::labelVoxelCounts;
@@ -56,12 +57,14 @@ using lsmo_test::Vortex;
 using lsmo_test::TripleJunction;
 
 // 16^3 block: label 1 for x<8, 2 for x>=8, phi = |x - 7.5|*dx clamped to 3*dx.
-MLS::Ptr
+template<typename MultiLevelSetT = MLS>
+typename MultiLevelSetT::Ptr
 makePair(double dx = 1.0)
 {
+    using LabelGridT = typename MultiLevelSetT::LabelGridT;
     auto xform = math::Transform::createLinearTransform(dx);
     FloatGrid::Ptr phi = FloatGrid::create(float(3.0 * dx));
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    typename LabelGridT::Ptr lab = LabelGridT::create(0);
     phi->setTransform(xform);
     lab->setTransform(xform->copy());
     auto pa = phi->getAccessor();
@@ -74,7 +77,7 @@ makePair(double dx = 1.0)
                 pa.setValue(c, d);
                 la.setValue(c, i < 8 ? 1 : 2);
             }
-    return MLS::Ptr(new MLS(phi, lab, 3));
+    return typename MultiLevelSetT::Ptr(new MultiLevelSetT(phi, lab, 3));
 }
 
 } // anonymous namespace
@@ -135,7 +138,7 @@ TEST_F(TestLevelSetMultiObject, HolderValidate)
 TEST_F(TestLevelSetMultiObject, HolderThrows)
 {
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     phi->setTransform(math::Transform::createLinearTransform(1.0));
     lab->setTransform(math::Transform::createLinearTransform(0.5));
     EXPECT_THROW(MLS(phi, lab, 3), ValueError);
@@ -149,7 +152,7 @@ TEST_F(TestLevelSetMultiObject, HolderThrows)
 
     auto nonUniform = math::Transform::Ptr(new math::Transform(math::MapBase::Ptr(new math::ScaleMap(Vec3d(1.0, 2.0, 1.0)))));
     FloatGrid::Ptr phi2 = FloatGrid::create(3.0f);
-    Int32Grid::Ptr lab2 = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab2 = MLS::LabelGridT::create(0);
     phi2->setTransform(nonUniform);
     lab2->setTransform(nonUniform->copy());
     EXPECT_THROW(MLS(phi2, lab2, 3), ValueError);
@@ -160,7 +163,7 @@ TEST_F(TestLevelSetMultiObject, HolderInvariantThrows)
     auto pair = [](float bg, int32_t labelBg, double dx = 0.5) {
         auto xform = math::Transform::createLinearTransform(dx);
         FloatGrid::Ptr phi = FloatGrid::create(bg);
-        Int32Grid::Ptr lab = Int32Grid::create(labelBg);
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(labelBg);
         phi->setTransform(xform);
         lab->setTransform(xform->copy());
         phi->tree().setValueOn(Coord(0, 0, 0), 0.25f);
@@ -285,16 +288,147 @@ runWithLabelTree()
 TEST_F(TestLevelSetMultiObject, OtherLabelTreeTypes)
 {
     // The distance tree must hold floats (a static_assert); the label tree
-    // may hold any integer type. Int64 and UInt32 labels give results
-    // identical to Int32 labels.
+    // may hold any integer type. Int16 (the default), Int64 and UInt32 labels
+    // give results identical to Int32 labels.
     const auto ref = runWithLabelTree<Int32Tree>();
+    const auto i16 = runWithLabelTree<tools::Int16LabelTree>();
     const auto i64 = runWithLabelTree<Int64Tree>();
     const auto u32 = runWithLabelTree<UInt32Tree>();
     ASSERT_GT(ref.second->activeVoxelCount(), Index64(0));
+    EXPECT_EQ(treeDifferences(*ref.first, *i16.first), Index64(0));
+    EXPECT_EQ(treeDifferences(ref.second->tree(), i16.second->tree()), Index64(0));
     EXPECT_EQ(treeDifferences(*ref.first, *i64.first), Index64(0));
     EXPECT_EQ(treeDifferences(*ref.first, *u32.first), Index64(0));
     EXPECT_EQ(treeDifferences(ref.second->tree(), i64.second->tree()), Index64(0));
     EXPECT_EQ(treeDifferences(ref.second->tree(), u32.second->tree()), Index64(0));
+}
+
+TEST_F(TestLevelSetMultiObject, Int16LabelsDefault)
+{
+    // The default label tree holds 16-bit labels: half the label bytes of
+    // the Int32 variant for the same pair.
+    static_assert(std::is_same<MLS::LabelGridT::TreeType, tools::Int16LabelTree>::value,
+        "the default label tree is Int16LabelTree");
+    static_assert(std::is_same<tools::Int16LabelGrid, Grid<tools::Int16LabelTree>>::value,
+        "Int16LabelGrid is the grid of Int16LabelTree");
+    using MLS32 = tools::MultiLevelSet<FloatTree, Int32Tree>;
+    auto m16 = makeTwoSpheres(0.1);
+    auto m32 = makeTwoSpheres<MLS32>(0.1);
+    std::cout << "Int16LabelsDefault: two-sphere labels memUsage int16 "
+              << m16->labels()->memUsage() << " B, int32 " << m32->labels()->memUsage()
+              << " B" << std::endl;
+    EXPECT_LT(m16->labels()->memUsage(), m32->labels()->memUsage());
+    // same pair, same labels
+    EXPECT_EQ(treeDifferences(m16->phi()->tree(), m32->phi()->tree()), Index64(0));
+    EXPECT_TRUE(m16->labels()->tree().hasSameTopology(m32->labels()->tree()));
+    tree::ValueAccessor<const Int32Tree> acc32(m32->labels()->tree());
+    for (auto it = m16->labels()->tree().cbeginValueAll(); it; ++it) {
+        ASSERT_EQ(int32_t(*it), acc32.getValue(it.getCoord())) << it.getCoord();
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, Int16RangeThrows)
+{
+    // Labels are int32_t in the API; storing one outside the range of the
+    // 16-bit label tree throws instead of truncating.
+    constexpr int32_t kTooLarge = 40000, kTooSmall = -32769;
+    constexpr int32_t kMinInt16 = std::numeric_limits<int16_t>::min();
+    constexpr int32_t kMaxInt16 = std::numeric_limits<int16_t>::max();
+    auto blockLabels = [](int32_t a, int32_t b) {
+        Int32Grid::Ptr g = Int32Grid::create(0);
+        auto acc = g->getAccessor();
+        for (auto p = CoordBBox(Coord(0), Coord(7)).begin(); p; ++p) {
+            acc.setValue(*p, (*p)[0] < 4 ? a : b);
+        }
+        return g;
+    };
+    // fromLabelGrid, active voxel out of range (both directions)
+    EXPECT_THROW(MLS::fromLabelGrid(*blockLabels(1, kTooLarge)), ValueError);
+    EXPECT_THROW(MLS::fromLabelGrid(*blockLabels(kTooSmall, 1)), ValueError);
+    // ... an inactive voxel and an inactive tile out of range
+    {
+        Int32Grid::Ptr g = blockLabels(1, 2);
+        g->tree().setValueOff(Coord(100, 0, 0), kTooLarge);
+        EXPECT_THROW(MLS::fromLabelGrid(*g), ValueError);
+        Int32Grid::Ptr t = blockLabels(1, 2);
+        t->tree().addTile(1, Coord(256, 0, 0), kTooLarge, false);
+        EXPECT_THROW(MLS::fromLabelGrid(*t), ValueError);
+    }
+    // the extremes of the range are accepted and kept exactly
+    {
+        auto m = MLS::fromLabelGrid(*blockLabels(kMinInt16, kMaxInt16));
+        std::string msg;
+        EXPECT_TRUE(m->validate(&msg)) << msg;
+        EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{kMinInt16, kMaxInt16}));
+    }
+    // the Int32 variant keeps large labels
+    {
+        using MLS32 = tools::MultiLevelSet<FloatTree, Int32Tree>;
+        auto m = MLS32::fromLabelGrid(*blockLabels(1, kTooLarge));
+        EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, kTooLarge}));
+    }
+    // fromSignedGrids, a key out of range
+    {
+        std::map<int32_t, FloatGrid::ConstPtr> in;
+        in[1] = tools::createLevelSetSphere<FloatGrid>(4.0f, Vec3f(-6, 0, 0), 1.0f);
+        in[kTooLarge] = tools::createLevelSetSphere<FloatGrid>(4.0f, Vec3f(6, 0, 0), 1.0f);
+        EXPECT_THROW(MLS::fromSignedGrids(in), ValueError);
+    }
+    // the evolver's kinematic label is stored into the label tree
+    {
+        auto m = makeTwoSpheres(1.0);
+        lsmo_test::Forces forces;
+        tools::LevelSetMultiObject<MLS, lsmo_test::Forces> lsmo(*m, forces);
+        FloatGrid::Ptr sdf = tools::createLevelSetSphere<FloatGrid>(3.0f, Vec3f(0), 1.0f);
+        auto still = [](double) { return math::Mat4d::identity(); };
+        EXPECT_THROW(lsmo.setKinematicLabel(kTooLarge, sdf, still), ValueError);
+        EXPECT_NO_THROW(lsmo.setKinematicLabel(kMaxInt16, sdf, still));
+    }
+    // reading a label the tree cannot hold finds nothing (no aliasing:
+    // 65537 truncates to 1 in 16 bits)
+    {
+        auto m = makeTwoSpheres(1.0);
+        constexpr int32_t kAliasOfOne = 65537;
+        EXPECT_EQ(m->extractSignedDistance(kAliasOfOne)->activeVoxelCount(), Index64(0));
+        EXPECT_GT(m->extractSignedDistance(1)->activeVoxelCount(), Index64(0));
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, Int16GridIO)
+{
+    // OpenVDB does not register int16 grids; registerMultiLevelSetGridTypes()
+    // does (idempotent), so the pair round-trips through a .vdb file.
+    tools::registerMultiLevelSetGridTypes();
+    tools::registerMultiLevelSetGridTypes();
+    EXPECT_TRUE(tools::Int16LabelGrid::isRegistered());
+    auto m = makeTwoSpheres(0.25);
+    m->phi()->setName("phi");
+    m->labels()->setName("labels");
+    lsmo_test::ScopedDebugDir dir;
+    const std::string path = (dir.path() / "int16_pair.vdb").string();
+    {
+        io::File file(path);
+        file.write(GridPtrVec{m->phi(), m->labels()});
+        file.close();
+    }
+    io::File file(path);
+    file.open();
+    FloatGrid::Ptr phi = gridPtrCast<FloatGrid>(file.readGrid("phi"));
+    tools::Int16LabelGrid::Ptr labels =
+        gridPtrCast<tools::Int16LabelGrid>(file.readGrid("labels"));
+    file.close();
+    ASSERT_TRUE(phi);
+    ASSERT_TRUE(labels);
+    MLS back(phi, labels, m->halfWidth());
+    std::string msg;
+    EXPECT_TRUE(back.validate(&msg)) << msg;
+    EXPECT_EQ(treeDifferences(m->phi()->tree(), phi->tree()), Index64(0));
+    EXPECT_TRUE(labels->tree().hasSameTopology(m->labels()->tree()));
+    tree::ValueAccessor<const tools::Int16LabelTree> acc(m->labels()->tree());
+    for (auto it = labels->tree().cbeginValueAll(); it; ++it) {
+        ASSERT_EQ(*it, acc.getValue(it.getCoord())) << it.getCoord();
+    }
+    EXPECT_EQ(back.labelSet(), m->labelSet());
 }
 
 TEST_F(TestLevelSetMultiObject, FactoriesSerialMatchParallel)
@@ -387,7 +521,8 @@ TEST_F(TestLevelSetMultiObject, HolderSignedDistance)
 
 TEST_F(TestLevelSetMultiObject, HolderLabelSet)
 {
-    auto m = makePair();
+    // labels beyond 16 bits: the Int32 variant
+    auto m = makePair<tools::MultiLevelSet<FloatTree, Int32Tree>>();
     EXPECT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2}));
     m->labels()->tree().setValueOn(Coord(0, 0, 0), -7);
     m->labels()->tree().setValueOn(Coord(1, 0, 0), 1 << 30);
@@ -420,7 +555,7 @@ TEST_F(TestLevelSetMultiObject, HolderDilateTieBreak)
 {
     for (int swap = 0; swap < 2; ++swap) {
         FloatGrid::Ptr phi = FloatGrid::create(3.0f);
-        Int32Grid::Ptr lab = Int32Grid::create(0);
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
         phi->tree().setValueOn(Coord(0, 0, 0), swap ? 0.2f : 0.5f);
         lab->tree().setValueOn(Coord(0, 0, 0), 1);
         phi->tree().setValueOn(Coord(2, 0, 0), swap ? 0.5f : 0.2f);
@@ -438,7 +573,7 @@ TEST_F(TestLevelSetMultiObject, HolderErodePrunesInactive)
     const double dx = 0.5;
     auto xform = math::Transform::createLinearTransform(dx);
     FloatGrid::Ptr phi = FloatGrid::create(float(3.0 * dx));
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     phi->setTransform(xform);
     lab->setTransform(xform->copy());
     const CoordBBox box(Coord(3, 5, 2), Coord(13, 12, 10)); // not leaf aligned
@@ -484,7 +619,7 @@ makePlanar(double dx, bool exact, int halo = 1)
     const int halfWidth = 3;
     auto xform = math::Transform::createLinearTransform(dx);
     FloatGrid::Ptr phi = FloatGrid::create(float(halfWidth * dx));
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     phi->setTransform(xform);
     lab->setTransform(xform->copy());
     auto pa = phi->getAccessor();
@@ -575,7 +710,7 @@ makeBall(double dx, const Vec3d& ctr, double R, int lo, int hi)
 {
     auto xform = math::Transform::createLinearTransform(dx);
     FloatGrid::Ptr phi = FloatGrid::create(float(3 * dx));
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     phi->setTransform(xform);
     lab->setTransform(xform->copy());
     auto pa = phi->getAccessor();
@@ -670,7 +805,7 @@ TEST_F(TestLevelSetMultiObject, RedistanceOrderIndependent)
         const double dx = 0.25;
         auto xform = math::Transform::createLinearTransform(dx);
         FloatGrid::Ptr phi = FloatGrid::create(float(3 * dx));
-        Int32Grid::Ptr lab = Int32Grid::create(0);
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
         phi->setTransform(xform);
         lab->setTransform(xform->copy());
         auto pa = phi->getAccessor();
@@ -824,7 +959,7 @@ expectNoSpuriousSeeds(const MLS& m, std::function<double(Vec3d)> distToInterface
 {
     const double dx = m.voxelSize();
     const Coord* offs = tools::lsmo_internal::faceOffsets();
-    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    tree::ValueAccessor<const LabelTree> lab(m.labels()->tree());
     Index64 nSeeds = 0, nBad = 0;
     for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) {
         const Coord p = it.getCoord();
@@ -1266,7 +1401,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
 {
     // 3^3 neighborhood, all label 1, so psi = -phi everywhere.
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     auto pa = phi->getAccessor();
     auto la = lab->getAccessor();
     float v[3][3][3]; // v[i+1][j+1][k+1] = psi
@@ -1481,7 +1616,7 @@ centroid(const std::vector<Vec3d>& pts)
 Index64
 countOrphans(const MLS& m)
 {
-    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    tree::ValueAccessor<const LabelTree> lab(m.labels()->tree());
     Index64 n = 0;
     for (auto it = m.labels()->tree().cbeginValueOn(); it; ++it) {
         const Coord p = it.getCoord();
@@ -1518,7 +1653,7 @@ partitionErrors(const MLS& m, Index64& overlaps, Index64& badCover)
     for (int32_t l : ls) sdf[l] = m.extractSignedDistance(l);
     const float eps = float(-1e-3 * dx);
     overlaps = badCover = 0;
-    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    tree::ValueAccessor<const LabelTree> lab(m.labels()->tree());
     for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) {
         const Coord p = it.getCoord();
         int inside = 0, deep = 0;
@@ -1685,7 +1820,7 @@ TEST_F(TestLevelSetMultiObject, KinematicLabelBasics)
     const CoordBBox domain(Coord(-20, 0, 0), Coord(40, 30, 30));
     auto count = [&](int32_t l) {
         Index64 n = 0;
-        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        tree::ValueAccessor<const LabelTree> acc(m->labels()->tree());
         for (auto p = domain.begin(); p; ++p) n += acc.getValue(*p) == l;
         return n;
     };
@@ -1695,7 +1830,7 @@ TEST_F(TestLevelSetMultiObject, KinematicLabelBasics)
         lsmo.advect(t, t + 2.0);
         const Vec3d c = c0 + Vec3d(t + 2.0, 0.0, 0.0);
         Index64 missing = 0, extra = 0, blockInside = 0;
-        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        tree::ValueAccessor<const LabelTree> acc(m->labels()->tree());
         for (auto p = domain.begin(); p; ++p) {
             const double d = ((*p).asVec3d() - c).length() - r;
             const int32_t l = acc.getValue(*p);
@@ -1956,7 +2091,7 @@ TEST_F(TestLevelSetMultiObject, BandMaintenance)
 TEST_F(TestLevelSetMultiObject, EmptyStep)
 {
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     {
         auto pa = phi->getAccessor();
         auto la = lab->getAccessor();
@@ -1969,7 +2104,7 @@ TEST_F(TestLevelSetMultiObject, EmptyStep)
     }
     MLS m(phi, lab, 3);
     const FloatTree phiBefore(m.phi()->tree());
-    const Int32Tree labBefore(m.labels()->tree());
+    const LabelTree labBefore(m.labels()->tree());
     ConstantSpeed speed;
     speed.s = -1.0f;
     tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(m, speed);
@@ -2911,7 +3046,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
     const double dx = m->voxelSize();
     auto labelCentroidX = [&]() {
         double sum = 0.0, n = 0.0;
-        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        tree::ValueAccessor<const LabelTree> acc(m->labels()->tree());
         for (auto p = domain.begin(); p; ++p) {
             if (acc.getValue(*p) == 1) { sum += (*p)[0]; n += 1.0; }
         }
@@ -2920,7 +3055,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
     const double x0 = labelCentroidX();
     auto labelMaxX = [&]() {
         int mx = std::numeric_limits<int>::min();
-        tree::ValueAccessor<const Int32Tree> acc(m->labels()->tree());
+        tree::ValueAccessor<const LabelTree> acc(m->labels()->tree());
         for (auto p = domain.begin(); p; ++p) {
             if (acc.getValue(*p) == 1) mx = std::max(mx, (*p)[0]);
         }
@@ -3091,8 +3226,8 @@ TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
         SCOPED_TRACE("grain " + std::to_string(grain));
         const CubeRunResult b = runCubeThroughSpheres(true, Conn::FG26_BG6, grain, 72.0);
         ASSERT_TRUE(b.state);
-        const Int32Tree& la = a.state->labels()->tree();
-        const Int32Tree& lb = b.state->labels()->tree();
+        const LabelTree& la = a.state->labels()->tree();
+        const LabelTree& lb = b.state->labels()->tree();
         const FloatTree& pa = a.state->phi()->tree();
         const FloatTree& pb = b.state->phi()->tree();
         ASSERT_TRUE(la.hasSameTopology(lb));
@@ -3123,7 +3258,8 @@ fnvMix(uint64_t& h, const T& v)
     for (unsigned char b : bytes) { h ^= uint64_t(b); h *= kFnvPrime; }
 }
 
-template<typename TreeT>
+// HashValueT is the type each value is hashed as (the tree's own by default).
+template<typename TreeT, typename HashValueT = typename TreeT::ValueType>
 void
 fnvMixTree(uint64_t& h, const TreeT& tree)
 {
@@ -3132,20 +3268,22 @@ fnvMixTree(uint64_t& h, const TreeT& tree)
         fnvMix(h, p.x());
         fnvMix(h, p.y());
         fnvMix(h, p.z());
-        fnvMix(h, *it);
+        fnvMix(h, HashValueT(*it));
         fnvMix(h, uint8_t(it.isValueOn()));
         fnvMix(h, it.getVoxelCount());
     }
 }
 
 // FNV-1a hash of every value (coordinate, bits, activity, voxel count) of
-// the phi and label trees of @a m.
+// the phi and label trees of @a m. Labels are hashed as int32_t, so the hash
+// does not depend on the label tree's value type (the recorded hashes date
+// from 32-bit label trees).
 uint64_t
 stateHash(const MLS& m)
 {
     uint64_t h = kFnvOffsetBasis;
     fnvMixTree(h, m.phi()->tree());
-    fnvMixTree(h, m.labels()->tree());
+    fnvMixTree<LabelTree, int32_t>(h, m.labels()->tree());
     return h;
 }
 
@@ -3233,15 +3371,33 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
         }
     };
 
-    check("vortex", stateHash(*Vortex().endState()), kVortexHash);
+    // label grid memory (informational): the 16-bit labels against the same
+    // labels in a 32-bit grid
+    auto printLabelMemory = [](const std::string& what, const MLS& m) {
+        Int32Grid::Ptr wide = Int32Grid::create(
+            Int32Tree::Ptr(new Int32Tree(m.labels()->tree())));
+        wide->setTransform(m.labels()->transform().copy());
+        for (auto meta = m.labels()->beginMeta(); meta != m.labels()->endMeta(); ++meta) {
+            wide->insertMeta(meta->first, *meta->second);
+        }
+        std::cout << "LabelMemory: " << what << " labels()->memUsage() int16 "
+                  << m.labels()->memUsage() << " B, as int32 " << wide->memUsage() << " B"
+                  << std::endl;
+    };
+
+    const MLS::Ptr vortex = Vortex().endState();
+    printLabelMemory("vortex", *vortex);
+    check("vortex", stateHash(*vortex), kVortexHash);
 
     const Conn rules[2] = {Conn::FG26_BG6, Conn::FG6_BG26};
     for (int r = 0; r < 2; ++r) {
         // protected cube through the kinematic spheres, well past first
         // contact; serial runs match grain 64 (TopologySerialMatchesParallel,
         // FG26_BG6; the serial runs of both rules matched when recording)
-        check(("cube " + lsmo_test::connectivityName(rules[r])).c_str(),
-            stateHash(*evolveCubeThroughSpheres(rules[r], 64, kCubeHashEnd)), kCubeHash[r]);
+        const std::string name = "cube " + lsmo_test::connectivityName(rules[r]);
+        const MLS::Ptr cube = evolveCubeThroughSpheres(rules[r], 64, kCubeHashEnd);
+        printLabelMemory(name, *cube);
+        check(name.c_str(), stateHash(*cube), kCubeHash[r]);
     }
     // serial vs parallel for FG6_BG26 (TopologySerialMatchesParallel covers
     // FG26_BG6), bit for bit: a hash of every value and activity bit

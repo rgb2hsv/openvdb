@@ -30,6 +30,8 @@
 namespace lsmo_test {
 
 using MLS = openvdb::tools::MultiLevelSet<>;
+/// Label tree of the default MultiLevelSet (16-bit labels).
+using LabelTree = MLS::LabelGridT::TreeType;
 using Forces = openvdb::tools::MultiObjectForces<MLS>;
 
 
@@ -37,8 +39,10 @@ using Forces = openvdb::tools::MultiObjectForces<MLS>;
 // Two spheres
 
 /// Spheres of radius 10*dx at (-+15*dx, 0, 0), labels 1 and 2, via
-/// fromSignedGrids.
-inline MLS::Ptr
+/// fromSignedGrids, as a @c MultiLevelSetT (the default MultiLevelSet unless
+/// given).
+template<typename MultiLevelSetT = MLS>
+inline typename MultiLevelSetT::Ptr
 makeTwoSpheres(double dx)
 {
     using namespace openvdb;
@@ -46,7 +50,7 @@ makeTwoSpheres(double dx)
     std::map<int32_t, FloatGrid::ConstPtr> in;
     in[1] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(-cx), 0, 0), float(dx));
     in[2] = tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(float(cx), 0, 0), float(dx));
-    return MLS::fromSignedGrids(in);
+    return MultiLevelSetT::fromSignedGrids(in);
 }
 
 
@@ -123,7 +127,7 @@ struct TripleJunction
         const int halfWidth = 3;
         auto xform = math::Transform::createLinearTransform(dx);
         FloatGrid::Ptr phi = FloatGrid::create(float(halfWidth * dx));
-        Int32Grid::Ptr lab = Int32Grid::create(0);
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
         phi->setTransform(xform);
         lab->setTransform(xform->copy());
         auto pa = phi->getAccessor();
@@ -201,25 +205,28 @@ makeVelocity(const openvdb::CoordBBox& box, double dx,
 
 /// Voxel count per label over the whole label tree (active and inactive
 /// voxels, tiles counted by their voxel count; label 0 excluded).
+template<typename MultiLevelSetT>
 inline std::map<int32_t, openvdb::Index64>
-labelVoxelCounts(const MLS& m)
+labelVoxelCounts(const MultiLevelSetT& m)
 {
     std::map<int32_t, openvdb::Index64> n;
     for (auto it = m.labels()->tree().cbeginValueAll(); it; ++it) {
         if (*it == 0) continue;
-        n[*it] += it.getVoxelCount();
+        n[int32_t(*it)] += it.getVoxelCount();
     }
     return n;
 }
 
 /// Distinct unordered label pairs (a, b), a != b, both non-zero, with
 /// face-adjacent voxels (one of them active).
+template<typename MultiLevelSetT>
 inline std::set<std::pair<int32_t, int32_t>>
-contactPairs(const MLS& m)
+contactPairs(const MultiLevelSetT& m)
 {
     using namespace openvdb;
+    using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
     std::set<std::pair<int32_t, int32_t>> pairs;
-    tree::ValueAccessor<const Int32Tree> lab(m.labels()->tree());
+    tree::ValueAccessor<const LabelTreeT> lab(m.labels()->tree());
     const Coord* offs = tools::lsmo_internal::faceOffsets();
     for (auto it = m.labels()->tree().cbeginValueOn(); it; ++it) {
         const int32_t a = *it;

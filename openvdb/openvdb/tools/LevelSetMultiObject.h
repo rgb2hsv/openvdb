@@ -39,6 +39,10 @@
 /// FloatGrid::Ptr psi1 = mls->extractSignedDistance(1);
 /// // ... or closed manifold meshes for all labels at once
 /// std::map<int32_t, tools::LabelMesh> meshes = tools::multiObjectToMesh(*mls);
+///
+/// // labels are 16-bit by default; register that grid type before file I/O
+/// tools::registerMultiLevelSetGridTypes();
+/// io::File("pair.vdb").write({mls->phi(), mls->labels()});
 /// @endcode
 ///
 /// @par References
@@ -66,6 +70,8 @@
 #include <openvdb/Types.h>
 #include <openvdb/Exceptions.h>
 #include <openvdb/Grid.h>
+#include <openvdb/codecs/ScalarCodec.h>// for registerMultiLevelSetGridTypes
+#include <openvdb/io/Codec.h>
 #include <openvdb/math/Transform.h>
 #include <openvdb/tree/LeafManager.h>
 #include <openvdb/tree/ValueAccessor.h>
@@ -86,6 +92,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -192,7 +199,49 @@ struct CoordHash
     }
 };
 
+/// @brief True if the integer @a v is representable as a @c LabelT (any
+/// mix of signed and unsigned types and widths).
+template<typename LabelT, typename ValueT>
+inline bool labelFits(ValueT v)
+{
+    static_assert(std::is_integral<LabelT>::value && std::is_integral<ValueT>::value,
+        "labelFits: integer types only");
+    using Limits = std::numeric_limits<LabelT>;
+    if constexpr (std::is_signed<ValueT>::value) {
+        if (v < 0) {
+            return std::is_signed<LabelT>::value && int64_t(v) >= int64_t(Limits::min());
+        }
+    }
+    return uint64_t(v) <= uint64_t(Limits::max());
+}
+
 } // namespace lsmo_internal
+
+
+/// @brief Label tree of 16-bit labels, the default label tree of
+/// MultiLevelSet (labels in [-32768, 32767]).
+using Int16LabelTree = tree::Tree4<int16_t, 5, 4, 3>::Type;
+/// @brief Grid of Int16LabelTree.
+using Int16LabelGrid = Grid<Int16LabelTree>;
+
+/// @brief Register the grid types of the multi-object tools that OpenVDB
+/// does not register itself (Int16LabelGrid, with its I/O codec), so that
+/// their grids can be read from and written to files.
+/// @details Call it after openvdb::initialize() (and again after any
+/// openvdb::uninitialize(), which clears the registries) and before file
+/// I/O of a default MultiLevelSet's label grid. Idempotent and thread-safe
+/// among its own callers: a type or codec already registered is left as it
+/// is.
+inline void registerMultiLevelSetGridTypes()
+{
+    using CodecT = codecs::ScalarCodec<Int16LabelGrid>;
+    static std::mutex registryMutex;
+    std::lock_guard<std::mutex> lock(registryMutex);
+    if (!Int16LabelGrid::isRegistered()) Int16LabelGrid::registerGrid();
+    if (!io::CodecRegistry::isRegistered(CodecT::name())) {
+        io::CodecRegistry::registerCodec<CodecT>();
+    }
+}
 
 /// @brief Holder for a pair of grids describing several disjoint objects:
 /// an unsigned distance grid @c phi (distance to the nearest object
@@ -205,9 +254,14 @@ struct CoordHash
 ///
 /// @note The distance tree must hold @c float values (FloatTree or another
 /// tree configuration with a float ValueType); this is checked at compile
-/// time. The label tree may hold any integer type (Int32Tree by default;
-/// Int64Tree and UInt32Tree also work).
-template<typename FloatTreeT = FloatTree, typename LabelTreeT = Int32Tree>
+/// time. The label tree may hold any integer type: Int16LabelTree (16-bit
+/// labels) by default; use e.g. Int32Tree for label ids beyond 16 bits
+/// (Int64Tree and UInt32Tree also work). Labels are int32_t in the
+/// interface; where one is stored into the label tree (the factories,
+/// LevelSetMultiObject::setKinematicLabel), a label the tree's value type
+/// cannot represent throws ValueError rather than being truncated. File I/O
+/// of an Int16LabelGrid needs registerMultiLevelSetGridTypes().
+template<typename FloatTreeT = FloatTree, typename LabelTreeT = Int16LabelTree>
 class MultiLevelSet
 {
     static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
@@ -266,11 +320,17 @@ public:
     /// voxel staircase. Voxels left with phi >= halfWidth*dx are deactivated.
     /// Every inactive voxel kept in the trees holds its label from @a labels,
     /// so the label of a region's interior is known just outside the band.
+    /// @a labels may hold any integer type (e.g. an Int32Grid for this
+    /// object's 16-bit default label tree) with the node configuration of
+    /// the label tree; every value (active or not, tiles included) must be
+    /// representable as a @c LabelT.
     /// @param grainSize TBB grain size in leaves; zero or negative runs
     /// serially. The result does not depend on it.
-    /// @throw ValueError if @a halfWidth < 2, the voxel size is not uniform
-    /// or the label background is not 0.
-    static Ptr fromLabelGrid(const LabelGridT& labels, int halfWidth = 3, int grainSize = 1);
+    /// @throw ValueError if @a halfWidth < 2, the voxel size is not uniform,
+    /// the label background is not 0, or a label of @a labels is outside the
+    /// range of @c LabelT.
+    template<typename InputGridT>
+    static Ptr fromLabelGrid(const InputGridT& labels, int halfWidth = 3, int grainSize = 1);
 
     /// @brief Build a multi-object level set from signed distance grids, one
     /// per non-zero label.
@@ -294,8 +354,8 @@ public:
     /// @param grainSize TBB grain size in leaves; zero or negative runs
     /// serially. The result does not depend on it.
     /// @throw ValueError if the map is empty, a grid is null or not a
-    /// GRID_LEVEL_SET, a key is 0, the transforms differ or are not a uniform
-    /// scale, or @a halfWidth < 2.
+    /// GRID_LEVEL_SET, a key is 0 or outside the range of @c LabelT, the
+    /// transforms differ or are not a uniform scale, or @a halfWidth < 2.
     static Ptr fromSignedGrids(
         const std::map<int32_t, typename FloatGridT::ConstPtr>& grids, int halfWidth = 3,
         int grainSize = 1);
@@ -353,7 +413,8 @@ public:
     /// voxels not yet reached hold the background value.
     /// @return a GRID_LEVEL_SET grid with background halfWidth*dx and this
     /// object's transform; it has no active voxels if @a label has no
-    /// boundary in the band (e.g. it does not occur).
+    /// boundary in the band (e.g. it does not occur, or is outside the range
+    /// of @c LabelT).
     /// @throw ValueError if @a halfWidth is not -1 and less than 2.
     template<typename InterruptT = util::NullInterrupter>
     typename FloatGridT::Ptr extractSignedDistance(int32_t label, int halfWidth = -1,
@@ -1303,7 +1364,8 @@ struct LabelGridSampler
     LabelGridSampler(const LabelGridSampler& o)
         : acc(o.acc.tree()), half(o.half), background(o.background) {}
 
-    int32_t label(const Coord& p) { return static_cast<int32_t>(acc.getValue(p)); }
+    /// The input label, in the input's own type (range-checked by the caller).
+    typename LabelTreeT::ValueType label(const Coord& p) { return acc.getValue(p); }
     float phi(const Coord& p)
     {
         const auto l = acc.getValue(p);
@@ -1406,7 +1468,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
                 for (auto leaf = range.begin(); leaf; ++leaf) {
                     for (auto it = leaf->beginValueOn(); it; ++it) {
                         const Coord p = it.getCoord();
-                        const int32_t l = s.label(p);
+                        const auto l = s.label(p);
                         bool iface = false;
                         for (int f = 0; f < 6 && !iface; ++f) {
                             iface = s.label(p + offs[f]) != l;
@@ -1501,6 +1563,13 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     const LabelTreeT& labels = mLabels->tree();
     const double dx = this->voxelSize();
     const float bg = float(halfWidth * dx);
+    if (!lsmo_internal::labelFits<LabelT>(label)) {
+        // no voxel can hold the label: all outside, without truncating it
+        typename FloatGridT::Ptr grid = FloatGridT::create(bg);
+        grid->setTransform(mPhi->transform().copy());
+        grid->setGridClass(GRID_LEVEL_SET);
+        return grid;
+    }
     const LabelT inLabel = LabelT(label);
     const Coord* offs = lsmo_internal::faceOffsets();
     // Seeds must be active in phi (the pair holds distances only there);
@@ -1593,10 +1662,15 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
 
 
 template<typename FloatTreeT, typename LabelTreeT>
+template<typename InputGridT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::Ptr
-MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, int halfWidth,
+MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const InputGridT& labels, int halfWidth,
     int grainSize)
 {
+    using InputTreeT = typename InputGridT::TreeType;
+    using InputT = typename InputTreeT::ValueType;
+    static_assert(std::is_integral<InputT>::value,
+        "MultiLevelSet::fromLabelGrid: the input grid must have integer values");
     if (halfWidth < 2) {
         OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: halfWidth must be at least 2");
     }
@@ -1604,8 +1678,14 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, i
         OPENVDB_THROW(ValueError,
             "MultiLevelSet::fromLabelGrid: transform must have uniform voxel size");
     }
-    if (labels.background() != LabelT(0)) {
+    if (labels.background() != InputT(0)) {
         OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: label background must be 0");
+    }
+    for (auto it = labels.tree().cbeginValueAll(); it; ++it) {
+        if (!lsmo_internal::labelFits<LabelT>(*it)) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet::fromLabelGrid: label " << +*it << " at "
+                << it.getCoord() << " is outside the range of the label tree's value type");
+        }
     }
     const double dx = labels.transform().voxelSize()[0];
 
@@ -1618,7 +1698,7 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromLabelGrid(const LabelGridT& labels, i
     tools::dilateActiveValues(candidates, 1, NN_FACE, IGNORE_TILES);
 
     return build(labels.transform(), lab, candidates,
-        lsmo_internal::LabelGridSampler<LabelTreeT>(labels.tree(), dx, float(halfWidth * dx)),
+        lsmo_internal::LabelGridSampler<InputTreeT>(labels.tree(), dx, float(halfWidth * dx)),
         halfWidth, /*reseed=*/false, grainSize);
 }
 
@@ -1644,6 +1724,10 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::fromSignedGrids(
         if (kv.first == 0) {
             OPENVDB_THROW(ValueError,
                 "MultiLevelSet::fromSignedGrids: label 0 is reserved for the background");
+        }
+        if (!lsmo_internal::labelFits<LabelT>(kv.first)) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet::fromSignedGrids: label " << kv.first
+                << " is outside the range of the label tree's value type");
         }
         if (kv.second->getGridClass() != GRID_LEVEL_SET) {
             OPENVDB_THROW(ValueError,
@@ -2482,12 +2566,17 @@ public:
     /// lie in or near the object at the first step are re-stamped by it.
     /// Kinematic voxels never take voxels of fixed or other kinematic
     /// labels, nor change their phi.
-    /// @throw ValueError if @a label is 0, @a sdf is null, @a motion is
-    /// empty, @a label is topology-preserving or label 0 is.
+    /// @throw ValueError if @a label is 0 or outside the range of the label
+    /// tree's value type, @a sdf is null, @a motion is empty, @a label is
+    /// topology-preserving or label 0 is.
     void setKinematicLabel(int32_t label, FloatGrid::ConstPtr sdf,
         std::function<math::Mat4d(double)> motion)
     {
         if (label == 0) OPENVDB_THROW(ValueError, "LevelSetMultiObject: kinematic label 0");
+        if (!lsmo_internal::labelFits<LabelT>(label)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: kinematic label " << label
+                << " is outside the range of the label tree's value type");
+        }
         if (!sdf) OPENVDB_THROW(ValueError, "LevelSetMultiObject: null kinematic sdf");
         if (this->isProtected(label)) {
             OPENVDB_THROW(ValueError, "LevelSetMultiObject: topology-preserving label " << label

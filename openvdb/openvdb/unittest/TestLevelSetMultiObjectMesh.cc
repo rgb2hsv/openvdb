@@ -460,11 +460,14 @@ closedManifold(const LabelMesh& m, double dx)
 // patch's vector area; a tube (an annulus around the body diagonal of two
 // in-corners or two out-corners) must have every normal pointing away from
 // (in-tube) or towards (out-tube) the diagonal.
+template<typename MultiLevelSetT>
 size_t
-countFolded(const LabelMesh& m, const MLS& mls, int32_t label, size_t* tubes = nullptr)
+countFolded(const LabelMesh& m, const MultiLevelSetT& mls, int32_t label,
+    size_t* tubes = nullptr)
 {
+    using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
     const math::Transform& xf = mls.phi()->transform();
-    tree::ValueAccessor<const Int32Tree> lab(mls.labels()->tree());
+    tree::ValueAccessor<const LabelTreeT> lab(mls.labels()->tree());
     std::map<Coord, std::vector<size_t>> cells;
     for (size_t i = 0; i < m.triangles.size(); ++i) {
         const Vec3I& t = m.triangles[i];
@@ -550,7 +553,7 @@ makeRandomLabels(uint32_t seed, int n, int nLabels, int block, bool randomPhi)
         for (int a = 0; a < 3; ++a) if (c[a] < 0 || c[a] >= n) return 0;
         return blocks[(size_t(c[0] / block) * nb + c[1] / block) * nb + c[2] / block];
     };
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     lab->setTransform(xform);
     auto la = lab->getAccessor();
     if (!randomPhi) {
@@ -579,8 +582,10 @@ makeRandomLabels(uint32_t seed, int n, int nLabels, int block, bool randomPhi)
 const uint32_t kRandomSeeds[5] = {11u, 22u, 33u, 44u, 55u};
 const int kRandomBlock[5] = {1, 1, 1, 2, 3};
 
-// fromLabelGrid on a label grid filled by a predicate over [lo, hi]^3.
-MLS::Ptr
+// fromLabelGrid on a label grid filled by a predicate over [lo, hi]^3, as a
+// MultiLevelSetT (the default MultiLevelSet unless given).
+template<typename MultiLevelSetT = MLS>
+typename MultiLevelSetT::Ptr
 labelFixture(const CoordBBox& box, const std::function<int32_t(const Coord&)>& f)
 {
     Int32Grid::Ptr g = Int32Grid::create(0);
@@ -590,7 +595,7 @@ labelFixture(const CoordBBox& box, const std::function<int32_t(const Coord&)>& f
         const int32_t l = f(*it);
         if (l != 0) acc.setValue(*it, l);
     }
-    return MLS::fromLabelGrid(*g, 3);
+    return MultiLevelSetT::fromLabelGrid(*g, 3);
 }
 
 std::map<int32_t, LabelMesh>
@@ -934,7 +939,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshTubeNoRepeatedChord)
         {Coord(0, 1, 1), 0.001f},     {Coord(1, 1, 1), 0.239218f}};
     auto xform = math::Transform::createLinearTransform(1.0);
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
-    Int32Grid::Ptr lab = Int32Grid::create(0);
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
     phi->setTransform(xform);
     lab->setTransform(xform->copy());
     auto pa = phi->getAccessor();
@@ -1066,7 +1071,7 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
     {
         auto xform = math::Transform::createLinearTransform(1.0);
         FloatGrid::Ptr phi = FloatGrid::create(3.0f);
-        Int32Grid::Ptr lab = Int32Grid::create(0);
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
         phi->setTransform(xform);
         lab->setTransform(xform->copy());
         MLS empty(phi, lab, 3);
@@ -1080,11 +1085,14 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
         EXPECT_TRUE(tools::multiObjectToMesh(bgOnly).empty());
         EXPECT_TRUE(tools::multiObjectToMesh(bgOnly, {0}).empty());
     }
+    // label ids beyond 16 bits: the Int32 variant
+    using MLS32 = tools::MultiLevelSet<FloatTree, Int32Tree>;
     const int32_t big = int32_t(1) << 30;
-    auto m = labelFixture(CoordBBox(Coord(0), Coord(11)), [big](const Coord& c) -> int32_t {
+    auto twoBoxes = [big](const Coord& c) -> int32_t {
         if (c[1] > 5 || c[2] > 5) return 0;
         return c[0] <= 5 ? -7 : big; // two touching boxes
-    });
+    };
+    auto m = labelFixture<MLS32>(CoordBBox(Coord(0), Coord(11)), twoBoxes);
     for (Conn conn : kAllConn) {
         tools::MultiObjectMeshSettings s;
         s.connectivity = conn;
@@ -1116,6 +1124,20 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
     EXPECT_FALSE(some.at(big).triangles.empty());
     EXPECT_TRUE(some.at(5).points.empty() && some.at(5).triangles.empty());
     EXPECT_TRUE(some.at(big).triangles == tools::multiObjectToMesh(*m).at(big).triangles);
+    // 16-bit labels: a requested label the tree cannot hold has an empty mesh
+    // (65537 would truncate to 1)
+    {
+        constexpr int32_t kAliasOfOne = 65537;
+        auto m16 = labelFixture(CoordBBox(Coord(0), Coord(11)), [](const Coord& c) -> int32_t {
+            if (c[1] > 5 || c[2] > 5) return 0;
+            return c[0] <= 5 ? 1 : 2;
+        });
+        const auto alias = tools::multiObjectToMesh(*m16, {kAliasOfOne, 1});
+        ASSERT_EQ(alias.size(), size_t(2));
+        EXPECT_TRUE(alias.at(kAliasOfOne).points.empty()
+            && alias.at(kAliasOfOne).triangles.empty());
+        EXPECT_FALSE(alias.at(1).triangles.empty());
+    }
 }
 
 
