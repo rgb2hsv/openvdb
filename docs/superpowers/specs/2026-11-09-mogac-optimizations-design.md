@@ -10,8 +10,8 @@ Contours (MOGAC)", MICCAI 2012.
 ## 1. Scope (from the user)
 
 Implement every speed and memory recommendation and every accuracy
-recommendation; closest-point junction reconstruction is optional (off by
-default); labels default to 16 bit. API restructuring (renames, header split)
+recommendation; closest-point junction reconstruction is optional and ON by
+default (user decision, 2026-11-09); labels default to 16 bit. API restructuring (renames, header split)
 is NOT in scope.
 
 | Id | Area | Item |
@@ -23,7 +23,7 @@ is NOT in scope.
 | S5 | speed | Direct field reads when transforms match; per-voxel field cache reused across candidates (exists) and across RK stages |
 | A1 | accuracy | HJWENO5 upwinding with a label-aware ±3 stencil, and TVD-RK2 with the projection at each stage |
 | A2 | accuracy | Speed extension: field-sampled speeds evaluated at the closest interface point |
-| A3 | accuracy | Optional closest-point reconstruction at triple-junction seeds (extraction and mesher) |
+| A3 | accuracy | Closest-point reconstruction at triple-junction seeds (extraction and mesher), on by default, can be turned off |
 | A4 | accuracy | Optional per-label volume constraint (Lagrange-multiplier pressure) |
 | M1 | memory | 16-bit labels by default |
 | M2 | memory | Pooled per-leaf scratch (candidate arrays, freeze/dirty masks) reused across steps |
@@ -115,11 +115,11 @@ is NOT in scope.
   distance property after evolution (ExtractAccuracyAfterEvolution) improves
   or stays within its gate.
 
-### A3 Closest-point junction reconstruction (optional)
+### A3 Closest-point junction reconstruction (on by default)
 
 - `ExtractSettings { int halfWidth = -1; int grainSize = 1; bool
-  closestPointJunctions = false; }` for `extractSignedDistance`, and
-  `MultiObjectMeshSettings::closestPointJunctions = false` for the mesher.
+  closestPointJunctions = true; }` for `extractSignedDistance`, and
+  `MultiObjectMeshSettings::closestPointJunctions = true` for the mesher.
 - When on, a not-l seed next to a third label gets ψ_l from the closest point
   on a local piecewise-planar reconstruction of ∂l built from l-side seeds
   (plane through p − φ_p·n_p with normal n_p from one-sided ψ_l differences

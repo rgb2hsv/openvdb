@@ -1,0 +1,192 @@
+# MOGAC Optimizations Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make the MOGAC tool faster (splitting, incremental redistance, aux buffers, direct field reads, optional full-voxel steps), more accurate (HJWENO5 + TVD-RK2, speed extension, closest-point junctions on by default, optional volume constraint) and leaner (16-bit labels by default, pooled scratch).
+
+**Architecture:** All changes stay in `tools/LevelSetMultiObject.h` (holder, redistancer, stencil, forces, evolver) and `tools/LevelSetMultiObjectMesh.h` (junction option). Refactors that must not change results come first and are proven bit-identical against the current suite; behaviour changes follow, each behind a setter with a documented default.
+
+**Tech Stack:** C++17, OpenVDB (`tree::LeafManager`, `math::` HJWENO5/TVD schemes, `BoxSampler`), TBB, GoogleTest, CMake.
+
+**Spec:** `docs/superpowers/specs/2026-11-09-mogac-optimizations-design.md` (addendum) on top of `docs/superpowers/specs/2026-11-08-multi-object-level-set-design.md`.
+
+## Global Constraints
+
+- Branch `feature/mogac-optimizations`; work in `/home/blake/workspace/openvdb`; never touch `/home/blake/workspace/openvdb-mogac-renders`.
+- Header-only; namespace `openvdb::OPENVDB_VERSION_NAME::tools`, internals in `tools::lsmo_internal`; errors via `OPENVDB_THROW(ValueError, …)`; asserts via `OPENVDB_ASSERT`; no existing OpenVDB header modified; lines ≤ 100 columns in the two tool headers; no references to rulings/spec/wedge in public header docs.
+- World units for φ, ψ, speeds; dt in world time; uniform voxel size.
+- TBB with settable grain size; ≤ 0 runs serially; results independent of grain size.
+- Defaults after this plan: spatial scheme `math::HJWENO5_BIAS`, temporal `math::TVD_RK2`, splitting on for split functors, incremental redistance on, max interface motion 0.5 voxel (1.0 only if Task 10's gates pass), speed extension on, closest-point junctions on, volume constraints off, label tree `Int16LabelTree`.
+- Existing tests: `SingleObject*` pin `FIRST_BIAS`/`TVD_RK1` (they compare against OpenVDB's first-order reference). All other existing tests run with the defaults and keep their current gates; a gate may change only by controller ruling.
+- Build: `cmake --build build --target vdb_test -j14 && build/openvdb/openvdb/unittest/vdb_test --gtest_filter='TestLevelSetMultiObject*'` (60 tests today, ~44 s). Strict build in `build-strict/` at Task 11.
+
+## Review Focus
+
+1. Loading a wide-label grid (Int32) with a label outside ±32767 into the 16-bit default → `ValueError`, not silent truncation. Pinned in Task 4.
+2. TVD-RK2 stages with topology protection, fixed walls and passive label 0 → protection holds at every stage (TopologyCubeThroughSpheres and FixedLabels pass with defaults). Pinned in Task 6.
+3. Splitting with fixed labels and passive background → fixed voxels bit-identical, growth at full speed. Pinned in Task 5.
+4. Volume constraint on a label that vanishes or has zero interface area → no NaN/inf, constraint skipped for that step. Pinned in Task 9.
+5. Velocity/pressure grids whose transform differs from the pair (offset or scale) → sampler path still used and results unchanged. Pinned in Task 2.
+
+---
+
+### Task 1: Aux buffers and pooled scratch (S4, M3, M2)
+
+**Files:** Modify `openvdb/openvdb/tools/LevelSetMultiObject.h` (evolver `step()` / `swapBuffers` / scratch); Test `openvdb/openvdb/unittest/TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Produces (evolver, private): per-step φ/label double buffering through one `tree::LeafManager` aux buffer per tree, swapped together; a `Scratch` member owning per-leaf candidate arrays and BoolTree masks, reused across steps and resized only when the leaf count grows. No public API change.
+
+- [ ] **Step 1: Write failing test `StepPeakMemory`:** a 64³-band sphere pair; record `phi()->memUsage() + labels()->memUsage()` before a step and the evolver's reported scratch/aux bytes via a new `size_t LevelSetMultiObject::scratchMemUsage() const`; assert `scratchMemUsage() ≤ 1.3 × pairBytes` (deep copies today make it ≥ 2×).
+- [ ] **Step 2: Run** `--gtest_filter='TestLevelSetMultiObject.StepPeakMemory'` — FAIL (method missing).
+- [ ] **Step 3: Implement** aux-buffer double buffering and the pooled scratch; add `scratchMemUsage()`.
+- [ ] **Step 4: Run all** `TestLevelSetMultiObject*` — all pass; additionally assert in the report that every printed numeric value of the existing tests is unchanged (diff the test output against the base commit, timing lines excluded).
+- [ ] **Step 5: Commit** — `git commit -m "MOGAC evolver: aux buffers and pooled scratch instead of per-step deep copies"`
+
+---
+
+### Task 2: Direct field reads (S5)
+
+**Files:** Modify `LevelSetMultiObject.h` (`MultiObjectForces` sampling, `LabelAwareStencil` field cache); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Produces: `MultiObjectForces` reads a velocity/pressure grid by direct accessor `getValue(ijk)` when `grid.transform() == pair transform` (index spaces coincide), else the existing `BoxSampler` path. No API change.
+
+- [ ] **Step 1: Write failing test `FieldDirectReadMatchesSampler`:** run UniformAdvection-like and pressure-growth-like scenarios twice — with the field grid on the pair's transform and with a copy whose transform is translated by (0.5, 0.25, 0)·dx and resampled — assert the aligned run's result is bit-identical to running with direct reads disabled via a test-only `MultiObjectForces::setForceSampling(true)`, and the misaligned run still matches its own sampler path (Review Focus 5).
+- [ ] **Step 2: Run** — FAIL (setter missing).
+- [ ] **Step 3: Implement** the aligned-transform fast path and `setForceSampling(bool)` (default false).
+- [ ] **Step 4: Run all** — pass, outputs unchanged.
+- [ ] **Step 5: Commit** — `"MOGAC forces: direct field reads on aligned transforms"`
+
+---
+
+### Task 3: Incremental redistancing (S2)
+
+**Files:** Modify `LevelSetMultiObject.h` (`MultiLevelSetRedistance`: new `redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)` overload; evolver builds the dirty mask); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Consumes: Task 1 scratch masks.
+- Produces: `int MultiLevelSetRedistance::redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)` — solves only active, non-frozen voxels in `dirty`; others keep values. Evolver: `void setFullRedistance(bool)` (default false = incremental). Dirty mask = dilate(projected ∪ label-changed ∪ newly activated, halfWidth) ∩ band. Warm start per spec §S2.
+
+- [ ] **Step 1: Write failing test `IncrementalRedistanceMatchesFull`:** for PressureGrowth, UniformAdvection, CurvatureFlow, Tornado and TopologyCubeThroughSpheres scenarios, run with `setFullRedistance(true)` and `(false)`; assert max |φ_full − φ_incr| ≤ 1e-4·dx over active voxels and identical label trees after every chunk.
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass; report per-step time before/after on the Tornado scenario.
+- [ ] **Step 5: Commit** — `"MOGAC: incremental redistancing over the dirty region"`
+
+---
+
+### Task 4: 16-bit labels by default (M1)
+
+**Files:** Modify `LevelSetMultiObject.h` (`Int16LabelTree`, default template argument, `registerMultiLevelSetGridTypes()`, factory range checks), `LevelSetMultiObjectMesh.h` if it names `Int32Tree`; Tests in both test files and `LevelSetMultiObjectFixtures.h`.
+
+**Interfaces:**
+- Produces: `using Int16LabelTree = tree::Tree4<int16_t, 5, 4, 3>::Type;`, `using Int16LabelGrid = Grid<Int16LabelTree>;`, `template<typename FloatTreeT = FloatTree, typename LabelTreeT = Int16LabelTree> class MultiLevelSet`, `inline void registerMultiLevelSetGridTypes();` (registers `Int16LabelGrid` if not registered; idempotent). `fromLabelGrid` accepts any integer label grid type (template on the input grid) and throws `ValueError` when a label is outside the target label type's range.
+
+- [ ] **Step 1: Write failing tests:** `Int16LabelsDefault` (`static_assert` default label tree is `Int16LabelTree`; a two-sphere pair's `labels()->memUsage()` < the Int32 variant's), `Int16RangeThrows` (Int32 label grid with label 40000 → `ValueError`; label −32768 accepted) (Review Focus 1), `Int16GridIO` (`registerMultiLevelSetGridTypes()`, write φ+labels to a temp .vdb with `io::File`, read back, `validate()` and labels identical). Switch tests that use labels like `1<<30` to an explicit `MultiLevelSet<FloatTree, Int32Tree>`.
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass with unchanged numeric outputs (labels small in all scenarios).
+- [ ] **Step 5: Commit** — `"MOGAC: 16-bit labels by default; register int16 label grids for I/O"`
+
+---
+
+### Task 5: Operator splitting (S1)
+
+**Files:** Modify `LevelSetMultiObject.h` (speed concept trait, `MultiObjectForces::hyperbolic/parabolic`, evolver Strang step, `setSplitting`); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Produces: in `MultiObjectForces`: `float hyperbolic(const Coord&, int32_t, const StencilT&) const` (advection + pressure + inactive-label speed), `float parabolic(const Coord&, int32_t, const StencilT&) const` (curvature term incl. interface correction and clamp), `float parabolicStableDt(float dx) const` (= dx²/(6w) or +inf); `operator()` = hyperbolic + parabolic. `lsmo_internal::IsSplitSpeed<SpeedT>` trait (true when both members exist). Evolver: `void setSplitting(bool)` (default true; ignored for non-split functors). Strang step: parabolic(dt/2, subcycled to parabolicStableDt) → hyperbolic(dt, motion cap) → parabolic(dt/2); each sub-update is a full MOGAC update (projection, protection, incremental redistance, band maintenance).
+
+- [ ] **Step 1: Write failing tests:** restore `SingleObjectCombined` to t = 15 (45 reference iterations, rotation 0.05·15, r² = r₀² − 2·15) with its existing gate, splitting on; add `SplittingFixedAndPassive` (FixedLabels scenario with curvature + pressure: fixed voxels bit-identical; PressureGrowth with a curvature weight of 0.01 grows within its gate) (Review Focus 3).
+- [ ] **Step 2: Run** — Combined FAILS at t = 15 without splitting (0.619 vs 0.605), new test FAILS (API).
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass; report Combined radius error at t = 10 and 15 and step counts before/after.
+- [ ] **Step 5: Commit** — `"MOGAC: Strang splitting of advection/pressure and curvature"`
+
+---
+
+### Task 6: HJWENO5 + TVD-RK2 (A1)
+
+**Files:** Modify `LevelSetMultiObject.h` (stencil radius 3, upwind HJWENO5 via `math::` operators, RK2 stages with per-stage projection, setters, defaults); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Produces: evolver `void setSpatialScheme(math::BiasedGradientScheme)` (FIRST_BIAS or HJWENO5_BIAS, default HJWENO5_BIAS; others throw `ValueError`), `void setTemporalScheme(math::TemporalIntegrationScheme)` (TVD_RK1 or TVD_RK2, default TVD_RK2); `LabelAwareStencil` gains radius-3 axis reads and `void upwindDifferencesWeno5(float dneg[3], float dpos[3]) const`. Requires halfWidth ≥ 3 for HJWENO5 (throw at construction/setter). `MultiObjectForces` uses the evolver-selected upwind differences (passed via the stencil).
+
+- [ ] **Step 1: Write failing tests:** pin `SingleObject*` to FIRST_BIAS/TVD_RK1 explicitly; `Weno5ReducesAdvectionError` (SingleObjectAdvection scenario: HJWENO5/RK2 symdiff vs analytic < 0.6 × FIRST_BIAS/RK1's); `Weno5ReducesTornadoLoss` (Tornado with defaults: worst per-label volume loss < 0.6 × the FIRST_BIAS/RK1 run's); `Rk2StagesRespectProtection` = TopologyCubeThroughSpheres and FixedLabels pass with defaults (Review Focus 2); `Weno5NeedsHalfWidth3` (halfWidth 2 + HJWENO5 → `ValueError`).
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass; non-SingleObject tests keep their gates with the new defaults (report any gate that needed a controller ruling instead of changing it).
+- [ ] **Step 5: Commit** — `"MOGAC: HJWENO5 upwinding and TVD-RK2 with per-stage projection"`
+
+---
+
+### Task 7: Speed extension (A2)
+
+**Files:** Modify `LevelSetMultiObject.h` (`MultiObjectForces` field sampling point); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Produces: `MultiObjectForces::setSpeedExtension(bool)` (default true): advection velocity and pressure are sampled at x_Γ = x − ψ·∇ψ/|∇ψ|² (world), falling back to x when |∇ψ|² < 1e-8; one sample per voxel reused across candidates and RK stages (Task 2/6 cache).
+
+- [ ] **Step 1: Write failing tests:** `SpeedExtensionKeepsDistance` — ExtractAccuracyAfterEvolution's advection case in a shear velocity field (v = (0.05·z, 0, 0)) with extension on vs off: interface max error on ≤ off, both ≤ 0.1·dx; CurvatureFlow and ExtractAccuracyAfterEvolution keep their gates.
+- [ ] **Step 2: Run** — FAIL (setter missing).
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass.
+- [ ] **Step 5: Commit** — `"MOGAC forces: sample fields at the closest interface point"`
+
+---
+
+### Task 8: Closest-point junction reconstruction, on by default (A3)
+
+**Files:** Modify `LevelSetMultiObject.h` (`ExtractSettings`, extraction overload, `lsmo_internal::closestPointPsi`), `LevelSetMultiObjectMesh.h` (`MultiObjectMeshSettings::closestPointJunctions`); Tests in both test files.
+
+**Interfaces:**
+- Produces: `struct ExtractSettings { int halfWidth = -1; int grainSize = 1; bool closestPointJunctions = true; };` and `template<typename InterruptT = util::NullInterrupter> typename FloatGridT::Ptr extractSignedDistance(int32_t label, const ExtractSettings&, InterruptT* = nullptr) const;` (the existing overload forwards to it). `lsmo_internal::closestPointPsi(const FloatTreeT& phi, const LabelTreeT& labels, const Coord& q, int32_t label, double dx) -> float` — ψ_l(q) from local planes through p − φ_p·n_p (n_p from one-sided ψ_l differences inside l) over l-side seeds in q's 5³ neighbourhood, clamped to [φ_q, min_p(|q−p| − φ_p)]. `MultiObjectMeshSettings::closestPointJunctions = true` (on by default, user decision).
+
+- [ ] **Step 1: Write failing tests:** `ClosestPointJunctions` over the existing 12-junction set: with the option on, worst interface error within 2 voxels of a junction line < the option-off worst (0.377·dx today) and far-field (≥ 2 voxels) ≤ 0.05·dx; off reproduces today's numbers exactly. Existing TripleJunction and mesh junction tests now run with the option on (default) and keep their gates. `MeshClosestPointJunctions`: mesher worst junction vertex error with the option < without; topology checks unchanged.
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass.
+- [ ] **Step 5: Commit** — `"MOGAC: closest-point reconstruction at triple junctions (default on)"`
+
+---
+
+### Task 9: Optional per-label volume constraint (A4)
+
+**Files:** Modify `LevelSetMultiObject.h` (evolver volume bookkeeping, λ_l added to the hyperbolic speed); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Produces: evolver `void setVolumeConstraint(int32_t label, double targetVolume)`, `void preserveInitialVolume(int32_t label)`, `void clearVolumeConstraints()`, `void setVolumeRelaxation(double)` (default 0.5), `double labelVolume(int32_t) const` (voxel count·dx³ + sub-voxel interface correction from φ). Per step: λ_l = relaxation·(V_l − V_target)/(A_l·dt), A_l from the interface voxels' |∇ψ|·dx² sum; skipped (λ_l = 0) when A_l·dt ≤ 1e-12 or V_l = 0.
+
+- [ ] **Step 1: Write failing tests:** `VolumeConstraintTornado` — Tornado with every label `preserveInitialVolume`: each label's volume within 2% of initial at the end, contacts ≥ 4; unconstrained labels in a mixed run behave as before. `VolumeConstraintVanishingLabel` — a label that vanishes under strong inward pressure with a constraint on another label: no NaN/inf, `validate()` holds (Review Focus 4).
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all** — pass.
+- [ ] **Step 5: Commit** — `"MOGAC: optional per-label volume constraint"`
+
+---
+
+### Task 10: Full-voxel interface motion (S3)
+
+**Files:** Modify `LevelSetMultiObject.h` (evolver projected set, ring-2 candidates via `closestPointPsi`); Test `TestLevelSetMultiObject.cc`.
+
+**Interfaces:**
+- Consumes: `lsmo_internal::closestPointPsi` (Task 8).
+- Produces: evolver `void setMaxInterfaceMotion(double voxels)` (0.5 or 1.0; other values throw `ValueError`). At 1.0: projected set = φ ≤ 1.5·dx or within one voxel of a different label; ring-2 candidates from the 26-neighbourhood with ψ_l = `closestPointPsi`.
+
+- [ ] **Step 1: Write failing tests:** `FullVoxelMotion` — run ContactNoCascade (probe geometry: label-2 extent growth ≤ 1 voxel per step), PressureGrowth, UniformAdvection, CurvatureFlow, Tornado, TopologyCubeThroughSpheres and FixedLabels at motion 1.0 with their existing gates; also assert the step count is ≤ 0.6 × the 0.5 run's for PressureGrowth.
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run all.** If every gate passes at 1.0, make 1.0 the default and re-run everything; otherwise keep 0.5 as the default, keep `FullVoxelMotion` asserting only the gates that pass, and report the failing ones with numbers (controller rules).
+- [ ] **Step 5: Commit** — `"MOGAC: optional full-voxel interface motion per step"`
+
+---
+
+### Task 11: Benchmark, docs, strict build
+
+**Files:** Modify both tool headers (Doxygen for every new setter/default), `pendingchanges/multi_object_level_set.txt`; Test `TestLevelSetMultiObject.cc` (`StepBenchmark`).
+
+- [ ] **Step 1: Write `StepBenchmark`** (informational, prints only): Tornado and a ~1M-voxel sphere-growth scene; per-step time and steps for t = 10 with (a) FIRST_BIAS/RK1/no splitting/full redistance/0.5 motion — the pre-plan configuration — and (b) defaults; print both and the speedup.
+- [ ] **Step 2: Docs:** document every new setter, the new defaults, `registerMultiLevelSetGridTypes()` and the int16 range; update pendingchanges (wrapped like the other entries).
+- [ ] **Step 3: Run all** `TestLevelSetMultiObject*` in `build/`; rebuild `build-strict/` (OPENVDB_CXX_STRICT=ON) in the background and run the same filter there — no warnings.
+- [ ] **Step 4: Commit** — `"MOGAC optimizations: benchmark, docs, pending changes"`
