@@ -103,6 +103,80 @@ OPENVDB_USE_VERSION_NAMESPACE
 namespace OPENVDB_VERSION_NAME {
 namespace tools {
 
+namespace lsmo_internal {
+
+/// @name Named constants
+/// Tolerances and tuning values of the multi-object level set tools.
+/// "Fraction" and "voxels" values are multiples of the voxel size dx.
+/// @{
+
+/// Relative tolerance when checking that the phi background equals
+/// halfWidth * dx (dimensionless).
+constexpr double kBackgroundRelativeTolerance = 1e-6;
+/// Epsilon below which a face-neighbor distance difference is treated as
+/// zero when seeding the interface, as a fraction of dx.
+constexpr double kSeedEpsilonFraction = 1e-6;
+/// Default redistancing convergence tolerance, as a fraction of dx.
+constexpr double kDefaultRedistanceToleranceFraction = 1e-4;
+/// Extra iterations added to ceil(halfWidth * sqrt(3)) for the redistancing
+/// iteration count (dimensionless count).
+constexpr int kRedistanceExtraIterations = 2;
+/// Safety multiplier on the redistancing iteration count that gives the
+/// iteration cap (dimensionless).
+constexpr int kRedistanceIterationCapFactor = 4;
+/// Distance, in voxels, from a voxel to the interface it shares with a face
+/// neighbor of a different label (the midpoint between the two voxels).
+constexpr double kHalfVoxelDistance = 0.5;
+/// Maximum interface motion per step, in voxels. Also the width of the
+/// candidate band (phi <= this) in which a voxel may change label.
+constexpr double kMaxInterfaceMotionVoxels = 0.5;
+/// Default CFL number: fraction of the maximum interface motion a step may
+/// use (dimensionless).
+constexpr float kDefaultCfl = 0.999f;
+/// Speed given to labels the speed functor reports as inactive: they retreat
+/// at this fraction of the CFL-limited motion (dimensionless, near 1).
+constexpr float kInactiveLabelSpeed = 0.999f;
+/// Default cap on the magnitude of the curvature force (dimensionless).
+constexpr float kDefaultMaxCurvatureForce = 10.0f;
+/// Divisor in the explicit curvature time-step limit dx^2 / (6 w).
+constexpr float kCurvatureDtDivisor = 6.0f;
+/// Distance-field curvature correction 1 / (1 - psi*k) is applied only when
+/// |psi*k| is below this (dimensionless).
+constexpr float kCurvatureCorrectionMax = 0.5f;
+/// Smallest magnitude of a field extremum that is still used to rescale the
+/// field (field units).
+constexpr float kRescaleMinMagnitude = 1e-4f;
+/// Default minimum phi of protected-label voxels, as a fraction of dx.
+constexpr double kDefaultMinimumPhiFraction = 1e-3;
+/// Minimum phi of barrier and kinematic-stamp voxels, as a fraction of dx;
+/// keeps a voxel on an obstacle surface from having phi = 0.
+constexpr double kBarrierPhiFraction = 1e-3;
+/// Inner bound of the obstacle shell that may join a protected label, as a
+/// distance to the obstacle in voxels.
+constexpr double kObstacleShellInnerVoxels = 0.5;
+/// Outer bound (exclusive) of the same shell, in voxels.
+constexpr double kObstacleShellOuterVoxels = 1.5;
+/// Step, in voxels, of the search along the obstacle gradient for the
+/// voxel a trapped protected label wraps onto.
+constexpr double kWrapSearchStepVoxels = 0.5;
+/// Reach of that search, in multiples of the half-width (voxels per voxel of
+/// half-width).
+constexpr double kWrapSearchReachBands = 4.0;
+/// Most passes of the protected-label wrapping loop (count).
+constexpr int kMaxWrapPasses = 8;
+/// Safety factor applied to the kinematic step limit when shrinking dt
+/// (dimensionless).
+constexpr double kKinematicStepSafety = 0.99;
+/// Largest factor by which one shrink iteration reduces dt (dimensionless).
+constexpr double kKinematicStepShrinkMax = 0.5;
+/// Most dt shrink iterations when limiting kinematic displacement (count).
+constexpr int kMaxKinematicShrinkIterations = 32;
+/// Relative tolerance on the end time of advect(t0, t1) (dimensionless).
+constexpr double kAdvectTimeRelativeEpsilon = 1e-6;
+/// @}
+
+} // namespace lsmo_internal
+
 /// @brief Holder for a pair of grids describing several disjoint objects:
 /// an unsigned distance grid @c phi (distance to the nearest object
 /// interface, in world units) and a grid of integer @c labels.
@@ -387,12 +461,13 @@ private:
     static constexpr const char* kPhiMessage =
         "phi must be non-negative and finite at every active voxel";
 
-    /// phi background == halfWidth*dx (relative tolerance 1e-6), label background 0.
+    /// phi background == halfWidth*dx (relative tolerance
+    /// lsmo_internal::kBackgroundRelativeTolerance), label background 0.
     bool validateBackgrounds() const
     {
         const double expected = double(mHalfWidth) * this->voxelSize();
         const double bg = double(mPhi->tree().background());
-        return std::abs(bg - expected) <= 1e-6 * expected
+        return std::abs(bg - expected) <= lsmo_internal::kBackgroundRelativeTolerance * expected
             && mLabels->tree().background() == LabelT(0);
     }
 
@@ -465,7 +540,7 @@ void seedInterface(const FloatTreeT& snapshot, const DiffersOp& differs,
 
     tree::LeafManager<FloatTreeT> leafs(out);
     const float bg = snapshot.background();
-    const double eps = 1e-6 * dx;
+    const double eps = kSeedEpsilonFraction * dx;
     const Coord* offs = faceOffsets();
 
     auto body = [&](const typename tree::LeafManager<FloatTreeT>::LeafRange& range) {
@@ -891,7 +966,9 @@ public:
     using BoolTreeT = typename FloatTreeT::template ValueConverter<bool>::Type;
 
     explicit MultiLevelSetRedistance(MultiLevelSetT& mls, InterruptT* interrupt = nullptr)
-        : mMls(mls), mInterrupter(interrupt), mTolerance(float(1e-4 * mls.voxelSize()))
+        : mMls(mls), mInterrupter(interrupt)
+        , mTolerance(float(lsmo_internal::kDefaultRedistanceToleranceFraction
+                           * mls.voxelSize()))
     {
     }
 
@@ -993,7 +1070,9 @@ public:
     /// is then less converged (converged() is false).
     static int iterationCap(int halfWidth)
     {
-        return 4 * (int(std::ceil(halfWidth * std::sqrt(3.0))) + 2);
+        return lsmo_internal::kRedistanceIterationCapFactor
+            * (int(std::ceil(halfWidth * std::sqrt(3.0)))
+               + lsmo_internal::kRedistanceExtraIterations);
     }
     /// @brief Whether the last redistance(freeze) (or incremental form)
     /// reached the tolerance before iterationCap() or an interrupt.
@@ -1024,7 +1103,8 @@ private:
     {
         FloatTreeT& phi = mMls.phi()->tree();
         const double dx = mMls.voxelSize();
-        const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0))) + 2;
+        const int maxIter = int(std::ceil(mMls.halfWidth() * std::sqrt(3.0)))
+            + lsmo_internal::kRedistanceExtraIterations;
 
         if (mInterrupter) mInterrupter->start("Redistancing multi-object level set");
 
@@ -1156,7 +1236,7 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
     if (todo.empty()) return;
     for (const Coord& q : todo) acc.setValue(q, kUnknownDistance);
 
-    const float tol = float(1e-4 * dx);
+    const float tol = float(kDefaultRedistanceToleranceFraction * dx);
     std::vector<float> next(todo.size());
     for (int sweep = 0; sweep < 8; ++sweep) {
         float maxDelta = 0.0f;
@@ -1200,7 +1280,7 @@ template<typename LabelTreeT>
 struct LabelGridSampler
 {
     LabelGridSampler(const LabelTreeT& t, double dx, float bg)
-        : acc(t), half(float(0.5 * dx)), background(bg) {}
+        : acc(t), half(float(kHalfVoxelDistance * dx)), background(bg) {}
     LabelGridSampler(const LabelGridSampler& o)
         : acc(o.acc.tree()), half(o.half), background(o.background) {}
 
@@ -1453,8 +1533,10 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize,
         /*writeValues=*/false);
     lsmo_internal::rebuildJunctionSeeds(*out, seeds, labels, inLabel, dx);
-    const int maxIter = int(std::ceil(halfWidth * std::sqrt(3.0))) + 2;
-    lsmo_internal::solveOuterLayers(*out, seeds, sideOp, dx, float(1e-4 * dx), maxIter,
+    const int maxIter = int(std::ceil(halfWidth * std::sqrt(3.0)))
+        + lsmo_internal::kRedistanceExtraIterations;
+    const float tol = float(lsmo_internal::kDefaultRedistanceToleranceFraction * dx);
+    lsmo_internal::solveOuterLayers(*out, seeds, sideOp, dx, tol, maxIter,
         grainSize, interrupt);
     if (interrupt) interrupt->end();
 
@@ -1855,7 +1937,10 @@ public:
     /// Curvature weight w: speed w*kappa*|grad psi| (clamped), with kappa the
     /// interface mean curvature k_x/(1 - psi*k_x) (see the class note).
     void setCurvatureWeight(float w) { mCurvatureWeight = w; }
-    void setMaxCurvatureForce(float m = 10.0f) { mMaxCurvatureForce = m; }
+    void setMaxCurvatureForce(float m = lsmo_internal::kDefaultMaxCurvatureForce)
+    {
+        mMaxCurvatureForce = m;
+    }
 
     /// @brief Pressure force field. A deep copy is rescaled once, as in the
     /// reference implementation: values are shifted by @a target and the negative and
@@ -1878,8 +1963,10 @@ public:
             };
             visit(tree.background());
             for (auto it = tree.cbeginValueAll(); it; ++it) visit(*it);
-            const float normMin = (std::abs(minValue) > 1e-4f) ? 1.0f / std::abs(minValue) : 1.0f;
-            const float normMax = (std::abs(maxValue) > 1e-4f) ? 1.0f / std::abs(maxValue) : 1.0f;
+            const float normMin = (std::abs(minValue) > lsmo_internal::kRescaleMinMagnitude)
+                ? 1.0f / std::abs(minValue) : 1.0f;
+            const float normMax = (std::abs(maxValue) > lsmo_internal::kRescaleMinMagnitude)
+                ? 1.0f / std::abs(maxValue) : 1.0f;
             auto rescale = [&](float x) {
                 const float val = x - target;
                 return (val < 0.0f) ? val * normMin : val * normMax;
@@ -1935,7 +2022,7 @@ public:
     {
         OPENVDB_ASSERT(ijk == s.center());
         (void)ijk; // fields are sampled at s.center()
-        if (!isActive(label)) return 0.999f;
+        if (!isActive(label)) return lsmo_internal::kInactiveLabelSpeed;
         if (mFixed.count(label)) return 0.0f;
 
         float dneg[3], dpos[3];
@@ -1951,7 +2038,7 @@ public:
             const float g = s.gradient().length();
             if (g > 0.0f) {
                 const float pk = s.template getValue<0, 0, 0>() * kn / g; // psi*k_x
-                if (std::abs(pk) < 0.5f) kn /= (1.0f - pk);
+                if (std::abs(pk) < lsmo_internal::kCurvatureCorrectionMax) kn /= (1.0f - pk);
             }
             kappa = mCurvatureWeight * kn;
             kappa = std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
@@ -2001,13 +2088,14 @@ public:
     /// dx^2/(6 w) for curvature weight w > 0, else +infinity.
     float stableDt(float dx) const
     {
-        return mCurvatureWeight > 0.0f ? dx * dx / (6.0f * mCurvatureWeight)
+        return mCurvatureWeight > 0.0f
+            ? dx * dx / (lsmo_internal::kCurvatureDtDivisor * mCurvatureWeight)
                                        : std::numeric_limits<float>::infinity();
     }
 
 private:
     float mCurvatureWeight = 0.0f;
-    float mMaxCurvatureForce = 10.0f;
+    float mMaxCurvatureForce = lsmo_internal::kDefaultMaxCurvatureForce;
     FloatGrid::ConstPtr mPressure;
     float mPressureWeight = 0.0f;
     Vec3SGrid::ConstPtr mAdvection;
@@ -2280,7 +2368,7 @@ public:
     /// @a mls and @a speed must outlive the evolver.
     LevelSetMultiObject(MultiLevelSetT& mls, const SpeedT& speed, InterruptT* interrupt = nullptr)
         : mMls(mls), mSpeed(speed), mInterrupter(interrupt)
-        , mTolerance(float(1e-4 * mls.voxelSize()))
+        , mTolerance(float(lsmo_internal::kDefaultRedistanceToleranceFraction * mls.voxelSize()))
     {
     }
 
@@ -2438,7 +2526,8 @@ public:
         if (mInterrupter) mInterrupter->start("Evolving multi-object level set");
         size_t n = 0;
         double t = t0;
-        const double eps = 1e-6 * std::max(1.0, std::abs(t1));
+        const double eps = lsmo_internal::kAdvectTimeRelativeEpsilon
+            * std::max(1.0, std::abs(t1));
         while (t1 - t > eps) {
             if (util::wasInterrupted(mInterrupter)) break;
             mTime = t;
@@ -2861,7 +2950,7 @@ private:
     {
         float f;
         if (!mSpeed.isActive(label)) {
-            f = 0.999f; // inactive labels retreat
+            f = lsmo_internal::kInactiveLabelSpeed; // inactive labels retreat
         } else {
             s.moveTo(ijk, label);
             f = mSpeed(ijk, label, s);
@@ -2924,8 +3013,8 @@ private:
     std::map<int32_t, Kinematic> mKinematic;
     double mTime = 0.0;
     MultiObjectConnectivity mConnectivity = MultiObjectConnectivity::FG26_BG6;
-    double mMinPhiFraction = 1e-3;
-    float mCfl = 0.999f;
+    double mMinPhiFraction = lsmo_internal::kDefaultMinimumPhiFraction;
+    float mCfl = lsmo_internal::kDefaultCfl;
     int mGrainSize = 1;
     float mTolerance;
     bool mFullRedistance = false;
@@ -2947,7 +3036,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     FloatTreeT& phi = mMls.phi()->tree();
     LabelTreeT& labels = mMls.labels()->tree();
     const double dx = mMls.voxelSize();
-    const float halfDx = float(0.5 * dx);
+    const float halfDx = float(lsmo_internal::kMaxInterfaceMotionVoxels * dx);
     const Coord* offs = lsmo_internal::faceOffsets();
 
     // The label tree needs a leaf wherever phi has one (normally a no-op).
@@ -3036,15 +3125,19 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         return dt; // no non-zero candidate anywhere: nothing moves
     }
     if (any) {
-        if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
+        if (maxSpeed > 0.0f) {
+            dt = std::min(dt,
+                float(lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * dx / maxSpeed));
+        }
     }
     if (!mKinematic.empty()) {
-        // kinematic objects move at most 0.5*cfl*dx per step
-        const double limit = 0.5 * mCfl * dx;
-        for (int iter = 0; iter < 32; ++iter) {
+        // kinematic objects move at most kMaxInterfaceMotionVoxels*cfl*dx per step
+        const double limit = lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * dx;
+        for (int iter = 0; iter < lsmo_internal::kMaxKinematicShrinkIterations; ++iter) {
             const double d = this->kinematicDisplacement(mTime, mTime + double(dt));
             if (d <= limit) break;
-            dt = float(double(dt) * std::min(0.5, 0.99 * limit / d));
+            dt = float(double(dt) * std::min(lsmo_internal::kKinematicStepShrinkMax,
+                lsmo_internal::kKinematicStepSafety * limit / d));
         }
     }
 
@@ -3162,7 +3255,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     const float bg = phi.background();
     // phi of stamped voxels is at least this, so that a voxel on the
     // obstacle surface is not ambiguous (phi = 0)
-    const float minPhi = float(std::max(1e-3 * dx, this->phiFloor()));
+    const float minPhi = float(std::max(lsmo_internal::kBarrierPhiFraction * dx, this->phiFloor()));
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
@@ -3286,13 +3379,12 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
     // normal (psi(o) >= 0.5*dx, neither kinematic nor fixed): o joins the
     // protected label if that is simple, then the object claims q if that
     // is simple; repeated while anything changes, at most kMaxWrapPasses.
-    constexpr int kMaxWrapPasses = 8;
     auto psiAt = [&](const Object& o, const Vec3d& world) {
         tree::ValueAccessor<const FloatTree> acc(o.sdf->tree());
         return double(tools::BoxSampler::sample(acc,
             o.sdf->transform().worldToIndex(o.inv.transform(world))));
     };
-    for (int pass = 0; pass < kMaxWrapPasses && !trapped.empty(); ++pass) {
+    for (int pass = 0; pass < lsmo_internal::kMaxWrapPasses && !trapped.empty(); ++pass) {
         phiAcc.clear();
         labAcc.clear();
         maskAcc.clear();
@@ -3312,13 +3404,16 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
             g.normalize();
             bool found = false;
             Coord o;
-            for (int n = 1; n <= 4 * mMls.halfWidth() * 2 && !found; ++n) {
-                const Vec3d x = xq + g * (0.5 * dx * n);
+            const int nSteps = int(lsmo_internal::kWrapSearchReachBands * mMls.halfWidth()
+                                   / lsmo_internal::kWrapSearchStepVoxels);
+            for (int n = 1; n <= nSteps && !found; ++n) {
+                const Vec3d x = xq + g * (lsmo_internal::kWrapSearchStepVoxels * dx * n);
                 o = Coord::round(xform.worldToIndex(x));
                 if (o == c.ijk) continue;
                 const int32_t lo = static_cast<int32_t>(labAcc.getValue(o));
                 if (this->isFixed(lo)) continue;
-                if (psiAt(obj, xform.indexToWorld(o)) < 0.5 * dx) continue;
+                if (psiAt(obj, xform.indexToWorld(o))
+                    < lsmo_internal::kObstacleShellInnerVoxels * dx) continue;
                 if (lo != c.from && this->isProtected(lo)) continue; // another protected label
                 found = true;
             }
@@ -3326,12 +3421,14 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
                 moves.emplace_back(c, o);
                 const int32_t lo = static_cast<int32_t>(labAcc.getValue(o));
                 if (lo != c.from && !adds.count(o)) {
-                    adds[o] = Deferred{o, lo, c.from, 0.5f * float(dx)};
+                    adds[o] = Deferred{o, lo, c.from,
+                                       float(lsmo_internal::kHalfVoxelDistance * dx)};
                 }
             } else {
                 moves.emplace_back(c, c.ijk);
             }
-            // the outer shell near q (0.5*dx <= psi < 1.5*dx) next to the
+            // the outer shell near q (kObstacleShellInnerVoxels*dx <= psi <
+            // kObstacleShellOuterVoxels*dx) next to the
             // protected label also joins it where simple, so that the label
             // can wrap around the object rather than only reach the target o
             for (auto it = CoordBBox(c.ijk - Coord(2), c.ijk + Coord(2)).begin(); it; ++it) {
@@ -3340,13 +3437,17 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::stampKinematic(
                 const int32_t lp = static_cast<int32_t>(labAcc.getValue(p));
                 if (lp == c.from || this->isFixed(lp) || this->isProtected(lp)) continue;
                 const double sp = psiAt(obj, xform.indexToWorld(p));
-                if (sp < 0.5 * dx || sp >= 1.5 * dx) continue;
+                if (sp < lsmo_internal::kObstacleShellInnerVoxels * dx
+                    || sp >= lsmo_internal::kObstacleShellOuterVoxels * dx) continue;
                 bool touches = false;
                 for (int f = 0; f < 6 && !touches; ++f) {
                     const Coord q = p + lsmo_internal::faceOffsets()[f];
                     touches = static_cast<int32_t>(labAcc.getValue(q)) == c.from;
                 }
-                if (touches) adds[p] = Deferred{p, lp, c.from, 0.5f * float(dx)};
+                if (touches) {
+                    adds[p] = Deferred{p, lp, c.from,
+                                       float(lsmo_internal::kHalfVoxelDistance * dx)};
+                }
             }
         }
         bool changed = false;
@@ -3491,7 +3592,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyDeferred(
     const std::vector<std::vector<Deferred>>& deferred,
     FloatTreeT& phi, LabelTreeT& labels, BoolTreeT& freeze)
 {
-    const float barrier = float(std::max(1e-3 * mMls.voxelSize(), this->phiFloor()));
+    const float barrier = float(std::max(lsmo_internal::kBarrierPhiFraction * mMls.voxelSize(),
+                                         this->phiFloor()));
     tree::ValueAccessor<FloatTreeT> phiAcc(phi);
     tree::ValueAccessor<LabelTreeT> labAcc(labels);
     tree::ValueAccessor<BoolTreeT> maskAcc(freeze);
