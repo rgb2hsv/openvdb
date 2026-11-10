@@ -78,6 +78,38 @@ makePair(double dx = 1.0)
 
 } // anonymous namespace
 
+namespace {
+const char* const kBackgroundMessage =
+    "phi background must equal halfWidth * voxel size and the label background must be 0";
+
+template<typename T, typename = void>
+struct HasSetClampSpeed : std::false_type {};
+template<typename T>
+struct HasSetClampSpeed<T, decltype(void(std::declval<T&>().setClampSpeed(true)))>
+    : std::true_type {};
+template<typename T, typename = void>
+struct HasClampSpeed : std::false_type {};
+template<typename T>
+struct HasClampSpeed<T, decltype(void(std::declval<const T&>().clampSpeed()))>
+    : std::true_type {};
+
+struct DetectionSpeed
+{
+    float operator()(const Coord&, int32_t, const tools::LabelAwareStencil<MLS>&) const
+    { return 0.0f; }
+    bool isActive(int32_t) const { return true; }
+    float stableDt(float) const { return 1.0f; }
+};
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, NoClampSpeedOption)
+{
+    using Evolver = tools::LevelSetMultiObject<MLS, DetectionSpeed>;
+    static_assert(!HasSetClampSpeed<Evolver>::value, "setClampSpeed must not exist");
+    static_assert(!HasClampSpeed<Evolver>::value, "clampSpeed must not exist");
+    SUCCEED();
+}
+
 TEST_F(TestLevelSetMultiObject, HolderValidate)
 {
     auto m = makePair();
@@ -90,13 +122,13 @@ TEST_F(TestLevelSetMultiObject, HolderValidate)
     m->phi()->tree().setValueOn(Coord(2, 2, 2), -1.0f);
     msg.clear();
     EXPECT_FALSE(m->validate(&msg));
-    EXPECT_FALSE(msg.empty());
+    EXPECT_EQ(msg, "phi must be non-negative and finite at every active voxel");
 
     auto m2 = makePair();
     m2->labels()->tree().setValueOn(Coord(40, 0, 0), 1);
     msg.clear();
     EXPECT_FALSE(m2->validate(&msg));
-    EXPECT_FALSE(msg.empty());
+    EXPECT_EQ(msg, "phi and label trees have different active topology");
 }
 
 TEST_F(TestLevelSetMultiObject, HolderThrows)
@@ -173,13 +205,13 @@ TEST_F(TestLevelSetMultiObject, HolderInvariantThrows)
         EXPECT_TRUE(m.validate(&msg)) << msg;
         m.phi()->tree().root().setBackground(2.0f, /*updateChildNodes=*/true);
         EXPECT_FALSE(m.validate(&msg));
-        EXPECT_FALSE(msg.empty());
+        EXPECT_EQ(msg, kBackgroundMessage);
         m.phi()->tree().root().setBackground(1.5f, /*updateChildNodes=*/true);
         EXPECT_TRUE(m.validate(&msg)) << msg;
         m.labels()->tree().root().setBackground(3, /*updateChildNodes=*/true);
         msg.clear();
         EXPECT_FALSE(m.validate(&msg));
-        EXPECT_FALSE(msg.empty());
+        EXPECT_EQ(msg, kBackgroundMessage);
     }
 }
 

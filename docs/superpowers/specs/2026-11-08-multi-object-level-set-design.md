@@ -157,7 +157,7 @@ The evolver.
 - `float step(float maxDt)` — one Euler step, returns dt used (world time).
 - `size_t advect(double t0, double t1)` — steps until t1; returns step count.
   Checks interrupter each step; on interrupt returns with valid state.
-- Setters: `setCFL(float = 0.999)`, `setClampSpeed(bool)`, `setGrainSize(int)`,
+- Setters: `setCFL(float = 0.999)`, `setGrainSize(int)`,
   `setRedistanceTolerance(float)`.
 - Uses `tree::LeafManager` with one auxiliary buffer on each tree; reads from
   the main buffers (time n), writes to the aux buffers, then swaps both.
@@ -192,7 +192,6 @@ Forward Euler. All reads from time-n main buffers, writes to aux buffers.
    leaf in a compact candidate list (≤ 7 entries per voxel).
 3. **CFL.** dt = min(maxDt, cfl·dx / max|F|, speed.stableDt(dx)) via
    `tbb::parallel_reduce`.
-   With clampSpeed, F is clamped to [−1, 1] and dt = maxDt.
 4. **Two-smallest projection.** v_l = ψ_l + dt·F_l; label = argmin (ties →
    smaller label); φ = |(v₁ − v₂)/2|, or |v₁| with a single candidate.
    Non-interface voxels copy their time-n values.

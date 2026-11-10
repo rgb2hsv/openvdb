@@ -152,9 +152,11 @@ public:
         if (!mPhi->transform().hasUniformScale()) {
             OPENVDB_THROW(ValueError, "MultiLevelSet: transform must have uniform voxel size");
         }
-        std::string message;
-        if (!this->validateBackgrounds(&message) || !this->validatePhi(&message)) {
-            OPENVDB_THROW(ValueError, "MultiLevelSet: " << message);
+        if (!this->validateBackgrounds()) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet: " << kBackgroundMessage);
+        }
+        if (!this->validatePhi()) {
+            OPENVDB_THROW(ValueError, "MultiLevelSet: " << kPhiMessage);
         }
         mPhi->setGridClass(GRID_UNKNOWN);
         mPhi->insertMeta("multi_level_set_role", StringMetadata("phi"));
@@ -283,12 +285,19 @@ public:
     /// @param message if non-null, receives a description of the first failure.
     bool validate(std::string* message = nullptr) const
     {
-        if (!this->validateBackgrounds(message)) return false;
+        if (!this->validateBackgrounds()) {
+            if (message) *message = kBackgroundMessage;
+            return false;
+        }
         if (!mPhi->tree().hasSameTopology(mLabels->tree())) {
             if (message) *message = "phi and label trees have different active topology";
             return false;
         }
-        return this->validatePhi(message);
+        if (!this->validatePhi()) {
+            if (message) *message = kPhiMessage;
+            return false;
+        }
+        return true;
     }
 
     /// @brief Dilate the active topology of both trees by @a iterations
@@ -373,40 +382,26 @@ private:
         const BoolTreeT& candidates, const SamplerT& sampler, int halfWidth, bool reseed,
         int grainSize);
 
+    static constexpr const char* kBackgroundMessage =
+        "phi background must equal halfWidth * voxel size and the label background must be 0";
+    static constexpr const char* kPhiMessage =
+        "phi must be non-negative and finite at every active voxel";
+
     /// phi background == halfWidth*dx (relative tolerance 1e-6), label background 0.
-    bool validateBackgrounds(std::string* message) const
+    bool validateBackgrounds() const
     {
         const double expected = double(mHalfWidth) * this->voxelSize();
         const double bg = double(mPhi->tree().background());
-        if (!(std::abs(bg - expected) <= 1e-6 * expected)) {
-            if (message) {
-                std::ostringstream ss;
-                ss << "phi background " << bg << " differs from halfWidth*voxelSize = "
-                   << expected;
-                *message = ss.str();
-            }
-            return false;
-        }
-        if (mLabels->tree().background() != LabelT(0)) {
-            if (message) *message = "label background is not 0";
-            return false;
-        }
-        return true;
+        return std::abs(bg - expected) <= 1e-6 * expected
+            && mLabels->tree().background() == LabelT(0);
     }
 
     /// phi finite and non-negative at every active voxel.
-    bool validatePhi(std::string* message) const
+    bool validatePhi() const
     {
         for (auto it = mPhi->tree().cbeginValueOn(); it; ++it) {
             const float v = *it;
-            if (!std::isfinite(v) || v < 0.0f) {
-                if (message) {
-                    std::ostringstream ss;
-                    ss << "phi is negative or non-finite at " << it.getCoord();
-                    *message = ss.str();
-                }
-                return false;
-            }
+            if (!std::isfinite(v) || v < 0.0f) return false;
         }
         return true;
     }
@@ -2160,12 +2155,11 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    candidates; labels with isActive() false get dpsi/dt = +0.999, so
 ///    they slowly retreat from their neighbours.
 /// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx)),
-///    so an interface moves at most half a voxel per step; with
-///    setClampSpeed(true), F is clamped to [-1, 1] and
-///    dt = min(maxDt, 0.5*dx, speed.stableDt(dx)). The half-voxel cap is
-///    what makes the projected set sufficient: since psi_l >= phi at every
-///    voxel, no voxel outside it can change label by projection (orphan
-///    cleanup can still relabel), so no separate propagation pass is needed.
+///    so an interface moves at most half a voxel per step. The
+///    half-voxel cap is what makes the projected set sufficient: since
+///    psi_l >= phi at every voxel, no voxel outside it can change label by
+///    projection (orphan cleanup can still relabel), so no separate
+///    propagation pass is needed.
 /// -# <b>Projection.</b> v_l = psi_l + dt*F_l with psi_l = -phi for the own
 ///    label and +phi otherwise; the new label is the smallest v (ties to the
 ///    smaller label) and phi = |v_1 - v_2|/2 over the two smallest values, or
@@ -2297,10 +2291,6 @@ public:
         if (!(cfl > 0.0f)) OPENVDB_THROW(ValueError, "LevelSetMultiObject: CFL must be positive");
         mCfl = cfl;
     }
-    /// @brief Clamp speeds to [-1, 1] and take dt = min(maxDt, 0.5*dx)
-    /// (capped by speed.stableDt), as the reference implementation's
-    /// clampSpeed option.
-    void setClampSpeed(bool on) { mClampSpeed = on; }
     /// @brief TBB grain size in leaves; zero or negative runs serially.
     void setGrainSize(int grainSize) { mGrainSize = grainSize; }
     /// @brief Redistance tolerance in world units (default 1e-4*dx).
@@ -2412,7 +2402,6 @@ public:
     double time() const { return mTime; }
 
     float cfl() const { return mCfl; }
-    bool clampSpeed() const { return mClampSpeed; }
     int grainSize() const { return mGrainSize; }
     float redistanceTolerance() const { return mTolerance; }
     const std::set<int32_t>& topologyPreservingLabels() const { return mProtected; }
@@ -2877,7 +2866,6 @@ private:
             s.moveTo(ijk, label);
             f = mSpeed(ijk, label, s);
         }
-        if (mClampSpeed) f = std::max(-1.0f, std::min(1.0f, f));
         return f;
     }
 
@@ -2938,7 +2926,6 @@ private:
     MultiObjectConnectivity mConnectivity = MultiObjectConnectivity::FG26_BG6;
     double mMinPhiFraction = 1e-3;
     float mCfl = 0.999f;
-    bool mClampSpeed = false;
     int mGrainSize = 1;
     float mTolerance;
     bool mFullRedistance = false;
@@ -3049,8 +3036,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         return dt; // no non-zero candidate anywhere: nothing moves
     }
     if (any) {
-        if (mClampSpeed) dt = std::min(dt, halfDx);
-        else if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
+        if (maxSpeed > 0.0f) dt = std::min(dt, float(0.5 * mCfl * dx / maxSpeed));
     }
     if (!mKinematic.empty()) {
         // kinematic objects move at most 0.5*cfl*dx per step
