@@ -3283,7 +3283,8 @@ expectIncrementalMatchesFull(const std::string& name, const MakeT& make, const S
     std::cout << "IncrementalRedistance " << name << (check ? "" : " (not asserted)") << ": "
               << steps << " steps, max |phi_full - phi_incr| " << worst / dx << " dx, labels "
               << (labelsAgree ? "identical" : "DIFFER") << ", cap hits "
-              << ef.redistanceCapHits() << "/" << ei.redistanceCapHits() << "; full " << 1e3 * secs[0] / n
+              << ef.redistanceCapHits() << "/" << ei.redistanceCapHits() << "; full "
+              << 1e3 * secs[0] / n
               << " ms/step, " << double(iters[0]) / n << " iterations/step; incremental "
               << 1e3 * secs[1] / n << " ms/step, " << double(iters[1]) / n
               << " iterations/step" << std::endl;
@@ -3297,12 +3298,14 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
     for (int hw : {2, 3, 4, 5}) {
         const std::string h = "/hw" + std::to_string(hw);
         // agreement is asserted for halfWidth <= 3; wider bands are only
-        // reported (the converged second-order Jacobi depends on the order in
-        // which voxels are reached; see the class documentation)
+        // reported, over a shorter run ending at @a tShort (the converged
+        // second-order Jacobi depends on the order in which voxels are
+        // reached; see the class documentation)
         const bool check = hw <= 3;
         auto compare = [&](const std::string& name, const auto& make, const auto& speed,
-            const auto& config, double tEnd, double chunk) {
-            expectIncrementalMatchesFull(name + h, make, speed, config, tEnd, chunk, check);
+            const auto& config, double tEnd, double chunk, double tShort) {
+            expectIncrementalMatchesFull(name + h, make, speed, config,
+                check ? tEnd : std::min(tEnd, tShort), chunk, check);
         };
         auto sphere = [hw](float r) {
             std::map<int32_t, FloatGrid::ConstPtr> in;
@@ -3322,25 +3325,25 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
             };
             LabelSpeed speed;
             speed.speeds = {{1, -1.0f}, {2, 0.0f}};
-            compare("PartlyStatic", make, speed, none, 6.0, 1.0);
+            compare("PartlyStatic", make, speed, none, 6.0, 1.0, 6.0);
         }
         {
             ConstantSpeed speed;
             speed.s = -1.0f;
             compare("PressureGrowth", [&] { return sphere(8.0f); },
-                speed, none, 6.0, 1.0);
+                speed, none, 6.0, 1.0, 6.0);
         }
         {
             Forces forces;
             forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
             compare("UniformAdvection", [&] { return sphere(8.0f); },
-                forces, none, 7.5, 1.5);
+                forces, none, 7.5, 1.5, 7.5);
         }
         {
             Forces forces;
             forces.setCurvatureWeight(1.0f);
             compare("CurvatureFlow", [&] { return sphere(10.0f); },
-                forces, none, 30.0, 5.0);
+                forces, none, 30.0, 5.0, 10.0);
         }
         {
             const Tornado tornado;
@@ -3349,7 +3352,7 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
             forces.setCurvatureWeight(0.01f);
             compare("Tornado",
                 [&] { return MLS::fromSignedGrids(tornado.inputs(), hw); }, forces, none,
-                42.0, 2.0);
+                42.0, 2.0, 8.0);
         }
         {
             // TopologyCubeThroughSpheres: protected cube (label 1) advected
@@ -3381,7 +3384,7 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
                 e.setTopologyPreservingLabels({1});
             };
             compare("TopologyCubeThroughSpheres", make, forces, config,
-                84.0, 2.0);
+                84.0, 2.0, 6.0);
         }
         {
             // Only kinematic writes change the pair: a static protected cube
@@ -3412,12 +3415,12 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
                 };
             };
             compare("KinematicOnly", make, speed, ball(-8.0, 1.0),
-                16.0, 2.0);
+                16.0, 2.0, 12.0);
             // the same ball moving slowly (one step per chunk, a hundredth of a
             // voxel per step), so that few voxels change their freeze state
             // and the stamped values carry the changes
             compare("KinematicSlow", make, speed, ball(-3.3, 0.04),
-                6.0, 0.25);
+                6.0, 0.25, 3.0);
         }
     }
 }
