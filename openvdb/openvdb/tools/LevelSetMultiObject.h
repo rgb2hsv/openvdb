@@ -948,12 +948,17 @@ public:
     /// of @a dirty that are not active in @a freeze are reset and solved
     /// (same scheme, same signed reflection across frozen voxels, same
     /// convergence test); every other active voxel keeps its value and acts
-    /// as Dirichlet data. Both solves converge to the solution of their
-    /// Dirichlet data, so where @a dirty holds every active voxel within
+    /// as Dirichlet data. The evolver passes every active voxel within
     /// halfWidth + 1 voxels of each voxel whose phi, label, activity or
-    /// freeze state changed since phi was last redistanced (the domain of
-    /// dependence of a band value below halfWidth*dx), the two agree to
-    /// within the tolerance.
+    /// freeze state changed since phi was last redistanced. That region is
+    /// a heuristic, not an equivalence: the Jacobi update only lowers
+    /// values while its second-order term can raise one, so converged
+    /// values also depend on the order in which voxels are reached, and the
+    /// stopping test covers only the solved voxels (the full solve's covers
+    /// the whole band). It reproduces redistance(freeze) to within the
+    /// tolerance in the tested scenes for halfWidth <= 3; wider bands can
+    /// differ by up to about 1e-2*dx. Use redistance(freeze) where the full
+    /// solve's result is required.
     /// @return the number of Jacobi iterations performed (0 if nothing is
     /// solved).
     int redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)
@@ -987,8 +992,10 @@ public:
     }
 
     /// @brief Iteration cap of redistance(freeze) and its incremental forms:
-    /// 4*(ceil(halfWidth*sqrt(3)) + 2), a safety limit (they normally stop
-    /// at the tolerance well before it).
+    /// 4*(ceil(halfWidth*sqrt(3)) + 2), a safety limit. Narrow bands stop at
+    /// the tolerance well before it; wide bands (halfWidth >= 4) with
+    /// topology-preserving or kinematic labels can reach it, and the result
+    /// is then less converged (converged() is false).
     static int iterationCap(int halfWidth)
     {
         return 4 * (int(std::ceil(halfWidth * std::sqrt(3.0))) + 2);
@@ -2195,21 +2202,20 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    orphan fixes, band activation and deactivation, the phi floor) and
 ///    every change of the frozen set records its voxels, and only the
 ///    leaves within halfWidth + 1 voxels of a recorded voxel are re-solved;
-///    the others keep their values as Dirichlet data. A band value (below
-///    halfWidth*dx) depends only on the data within that distance, so the
-///    kept values are those the full solve would produce, and the two
-///    agree to within the tolerance. This assumes that only the evolver
-///    changes the pair between steps; the first step, and the first after
+///    the others keep their values as Dirichlet data. This assumes that
+///    only the evolver changes the pair between steps; the first step, and the first after
 ///    a change of the topology-preserving or kinematic labels, the phi
 ///    floor or the tolerance, re-solve the whole band, as does every step
 ///    with setFullRedistance(true).
-///    Agreement with the full solve to within the tolerance is verified for
-///    halfWidth <= 3. Wider bands can differ by up to about 1e-2*dx in some
-///    scenes: the Jacobi update only lowers values while its second-order
-///    upwind term can raise a value when a neighbour drops, so a converged
-///    result also depends on the order in which voxels are reached, and the
-///    kept values change that order. setFullRedistance(true) is the exact
-///    alternative.
+///    The halfWidth + 1 region is a heuristic, not a proof of equivalence:
+///    the Jacobi update only lowers values while its second-order upwind
+///    term can raise a value when a neighbour drops, so a converged result
+///    also depends on the order in which voxels are reached (which the kept
+///    values change), and the incremental stopping test covers only the
+///    re-solved leaves while the full one covers the whole band. In the
+///    tested scenes it reproduces the full solve to within the tolerance
+///    for halfWidth <= 3; wider bands can differ by up to about 1e-2*dx.
+///    setFullRedistance(true) is exact.
 ///
 /// Voxels of fixed labels never change label or phi and no label can
 /// capture them; a step with no non-zero candidate and no kinematic label
@@ -2301,8 +2307,9 @@ public:
     void setRedistanceTolerance(float tolWorld) { mTolerance = tolWorld; mPrimed = false; }
     /// @brief Re-solve the whole band at every step (default false: only the
     /// leaves near the voxels the step changed are re-solved; see the class
-    /// documentation). The results agree to within the redistance tolerance
-    /// for halfWidth <= 3 and can differ by up to about 1e-2*dx beyond.
+    /// documentation). In the tested scenes the results agree to within the
+    /// redistance tolerance for halfWidth <= 3 and differ by up to about
+    /// 1e-2*dx beyond; true makes the result exact.
     void setFullRedistance(bool on) { mFullRedistance = on; }
     bool fullRedistance() const { return mFullRedistance; }
     /// @brief Labels whose digital topology is preserved (default
@@ -2420,9 +2427,12 @@ public:
     /// @brief Jacobi iterations of the last step's redistance (0 before the
     /// first step or if nothing was re-solved).
     int redistanceIterations() const { return mRedistanceIterations; }
-    /// @brief Redistances since construction that stopped at the iteration
-    /// cap (MultiLevelSetRedistance::iterationCap) before reaching the
-    /// tolerance; normally 0.
+    /// @brief Redistances since construction that did not reach the
+    /// tolerance (MultiLevelSetRedistance::converged() false). The evolver
+    /// does not pass its interrupter to the redistance, so these are the
+    /// solves stopped by the iteration cap
+    /// (MultiLevelSetRedistance::iterationCap); normally 0, but wide bands
+    /// with topology-preserving or kinematic labels can reach it.
     size_t redistanceCapHits() const { return mRedistanceCapHits; }
 
     /// @brief One forward Euler step of at most @a maxDt (world time).
@@ -3668,15 +3678,13 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::incrementalRedistance(
 
     // 2. Solve every active, non-frozen voxel of the leaves within
     // halfWidth + 1 voxels of a dirty voxel (taken at leaf granularity, a
-    // superset). Both this solve and the full one iterate to the tolerance,
-    // so each converges to the solution of its Dirichlet data; a band value
-    // (below halfWidth*dx) is a distance along upwind paths that stay within
-    // halfWidth voxels of it, plus one voxel for the second-order stencil.
-    // Outside this region nothing within that distance changed, so the kept
-    // values are already the full solve's. (The monotone second-order update
-    // makes converged values depend on the order voxels are reached as well;
-    // agreement within the tolerance is verified for halfWidth <= 3 only,
-    // see the class documentation.)
+    // superset). The region follows the Eikonal domain of dependence (a
+    // band value below halfWidth*dx, plus one voxel for the second-order
+    // stencil) but is a heuristic: the monotone second-order update makes
+    // converged values depend on the order voxels are reached, and this
+    // solve's stopping test is local to the solved leaves. It matches the
+    // full solve to within the tolerance in the tested scenes for
+    // halfWidth <= 3 only (see the class documentation).
     const int reach = (mMls.halfWidth() + 1 + kDim - 1) / kDim; // in leaves
     std::vector<char> solveLeaf(n, 0);
     forEachIndex(n, [&](size_t i) {
