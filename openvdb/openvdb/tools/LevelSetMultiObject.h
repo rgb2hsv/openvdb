@@ -4189,6 +4189,11 @@ private:
     /// With @a stage0 (the time-n state of a TVD-RK2 update) the projected
     /// set and candidates are those of its second stage.
     Evaluation evaluate(Term term, const StageState* stage0 = nullptr);
+    /// The @a term speeds of the candidates of the last evaluate() on the
+    /// unchanged state (its projected set, freeze mask and candidates do not
+    /// depend on the term), evaluated as evaluate() would; they replace the
+    /// previous speeds and any multipliers added to them.
+    Evaluation respeed(Term term);
     /// @a dt limited so that interfaces move at most maxInterfaceMotion()
     /// times cfl*dx.
     float motionLimit(const Evaluation& e, float dt) const;
@@ -4333,6 +4338,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     // volume constraints: volumes and areas on the time-n state, the
     // multipliers once the time step is known (fixed for the whole step)
     const bool constrained = this->beginVolumeStep();
+    Evaluation e;
+    bool evaluated = false;
     if (this->splitting()) {
         // split only if the parabolic limit is below the hyperbolic dt
         const float pStable = this->parabolicStableDt();
@@ -4346,12 +4353,17 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
                 }
                 if (pStable < dt) return this->splitStep(dt);
                 mLambda.clear(); // unsplit: recomputed for its own time step
+                // the full speeds of the same candidates
+                e = this->respeed(Term::Full);
+            } else {
+                e = h; // no candidate: the same as a full evaluation
             }
+            evaluated = true;
         }
     }
 
     // 1-2. projected set, candidates and speeds, all on time-n data
-    Evaluation e = this->evaluate(Term::Full);
+    if (!evaluated) e = this->evaluate(Term::Full);
 
     // 3. time step: interfaces move at most the motion cap, so only projected
     // voxels can change label
@@ -4591,6 +4603,40 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
         result.any |= data[i].any;
     }
     mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage());
+    return result;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+typename LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::Evaluation
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::respeed(Term term)
+{
+    const FloatTreeT& phi = mMls.phi()->tree();
+    tree::LeafManager<const FloatTreeT> leafs(phi);
+    const size_t leafCount = leafs.leafCount();
+    std::vector<LeafData>& data = mScratch.data;
+    OPENVDB_ASSERT(data.size() >= leafCount);
+    forEachIndex(leafCount, [&](size_t i) {
+        LeafData& d = data[i];
+        if (d.entries.empty()) return;
+        const auto& leaf = leafs.leaf(i);
+        StencilT stencil(mMls, mSpatialScheme);
+        d.maxSpeed = 0.0f;
+        Candidate* c = d.cand.data();
+        for (const VoxelEntry& v : d.entries) {
+            const Coord p = leaf.offsetToGlobalCoord(v.offset);
+            for (int j = 0; j < v.n; ++j, ++c) {
+                c->second = this->evalSpeed(stencil, p, c->first, term);
+                d.maxSpeed = std::max(d.maxSpeed, std::abs(c->second));
+            }
+        }
+        OPENVDB_ASSERT(c == d.cand.data() + d.cand.size());
+    });
+    Evaluation result;
+    for (size_t i = 0; i < leafCount; ++i) {
+        result.maxSpeed = std::max(result.maxSpeed, data[i].maxSpeed);
+        result.any |= data[i].any;
+    }
     return result;
 }
 
