@@ -257,7 +257,8 @@ struct Vortex
     /// Schedule: chunk length, cap on the time to first contact, end time.
     static constexpr double kChunk = 2.0, kContactCap = 70.0, kEndTime = 60.0;
 
-    /// Parameters (see VortexEightObjects for why they were chosen).
+    /// Parameters (see runVortexEightObjects in TestLevelSetMultiObject.cc for
+    /// why they were chosen).
     static constexpr double kShapeScale = 1.4;      ///< factor on every shape dimension
     static constexpr double kRingPolygonRadius = 5.0; ///< label 8 polygon radius before scaling
     static constexpr double kStartRadius = 34.0;    ///< initial distance of centers from the axis
