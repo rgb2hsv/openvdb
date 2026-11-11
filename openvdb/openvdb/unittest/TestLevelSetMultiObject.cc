@@ -1426,6 +1426,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
 
     const float wc = 0.5f, wa = 1.5f, wp = 2.0f;
     Forces f;
+    f.setSpeedExtension(false); // the formula samples the fields at the voxel center
     f.setCurvatureWeight(wc);
     f.setAdvection(vg, wa);
     f.setPressure(pg, wp); // NaN target: values used as given
@@ -1484,6 +1485,7 @@ TEST_F(TestLevelSetMultiObject, ForcesMatchesWedgeFormula)
     // Negative pressure force takes the other Godunov branch.
     pg->tree().setValue(Coord(0, 0, 0), -0.7f);
     Forces f2;
+    f2.setSpeedExtension(false);
     f2.setPressure(pg, wp);
     const float got2 = f2(Coord(0, 0, 0), 1, s);
     EXPECT_NEAR(got2, 1.4f * std::sqrt(gsNeg), 1e-6f);
@@ -1965,13 +1967,14 @@ makeVelocityField(const math::Transform::Ptr& xform, double dx)
 // translated by @a shift voxels from the pair's; @a force selects the
 // BoxSampler path.
 MLS::Ptr
-runFieldScenario(const Vec3d& shift, bool force, double dx = 1.0)
+runFieldScenario(const Vec3d& shift, bool force, double dx = 1.0, bool extension = false)
 {
     auto m = makeSphere(8.0 * dx, Vec3d(0.0), dx);
     math::Transform::Ptr xf = m->phi()->transform().copy();
     xf->postTranslate(shift * m->voxelSize());
     Forces forces;
     forces.setForceSampling(force);
+    forces.setSpeedExtension(extension);
     forces.setPressure(makePressureField(xf, dx), 1.0f);
     forces.setAdvection(makeVelocityField(xf, dx), 1.0f);
     forces.setCurvatureWeight(0.1f);
@@ -2029,6 +2032,18 @@ TEST_F(TestLevelSetMultiObject, FieldDirectReadMatchesSampler)
     auto sampled1 = runFieldScenario(Vec3d(0.0), true, 0.1);
     ASSERT_FALSE(direct1->phi()->tree().empty());
     EXPECT_EQ(bitDifferences(*direct1, *sampled1), Index64(0));
+
+    // speed extension (closest-point samples always interpolate): the
+    // force-sampling hook changes nothing, and the result differs from
+    // voxel-center sampling
+    const auto t3 = Clock::now();
+    auto ext = runFieldScenario(Vec3d(0.0), false, 1.0, true);
+    const auto t4 = Clock::now();
+    std::cout << "FieldDirectReadMatchesSampler: speed extension "
+              << std::chrono::duration<double, std::milli>(t4 - t3).count() << " ms" << std::endl;
+    auto extSampled = runFieldScenario(Vec3d(0.0), true, 1.0, true);
+    EXPECT_EQ(bitDifferences(*ext, *extSampled), Index64(0));
+    EXPECT_GT(bitDifferences(*ext, *direct), Index64(0));
 }
 
 TEST_F(TestLevelSetMultiObject, FixedLabels)
@@ -2516,13 +2531,17 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
 }
 
 // The schemes of the first-order reference (LevelSetAdvection with
-// FIRST_BIAS / TVD_RK1), for the equivalence tests.
+// FIRST_BIAS / TVD_RK1), and, given @a forces, its field sampling at the
+// voxel centers (speed extension off) for the equivalence tests. The evolver
+// holds the forces by reference, so the extension may be switched off after
+// constructing it.
 template<typename EvolverT>
 void
-pinFirstOrder(EvolverT& e)
+pinFirstOrder(EvolverT& e, Forces* forces = nullptr)
 {
     e.setSpatialScheme(math::FIRST_BIAS);
     e.setTemporalScheme(math::TVD_RK1);
+    if (forces) forces->setSpeedExtension(false);
 }
 
 } // anonymous namespace
@@ -2538,7 +2557,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectAdvection)
     Forces forces;
     forces.setAdvection(vel, 1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-    pinFirstOrder(lsmo); // compared against the first-order reference
+    pinFirstOrder(lsmo, &forces); // compared against the first-order reference
     const size_t steps = lsmo.advect(0.0, 30.0);
     // exact solution: the sphere rotated by 0.05*30 = 1.5 radians about z
     const double angle = 0.05 * 30.0;
@@ -2559,7 +2578,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
     Forces forces;
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-    pinFirstOrder(lsmo); // compared against the first-order reference
+    pinFirstOrder(lsmo, &forces); // compared against the first-order reference
     const size_t steps = lsmo.advect(0.0, 30.0);
     // exact: r^2 = r0^2 - 2t at the unmoved center
     checkEquivalence("SingleObjectCurvature", *m, *ref, steps, 0.0, nullptr,
@@ -2584,7 +2603,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     forces.setAdvection(vel, 1.0f);
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
-    pinFirstOrder(lsmo); // compared against the first-order reference
+    pinFirstOrder(lsmo, &forces); // compared against the first-order reference
     EXPECT_TRUE(lsmo.splitting()); // the default for a split speed functor
     const size_t steps = lsmo.advect(0.0, 15.0);
     // exact: r^2 = r0^2 - 2t about the center rotated by 0.05*15 radians.
@@ -3797,8 +3816,9 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
     // grain size. (A legitimate numerical change elsewhere re-records them.)
-    // (re-recorded for the HJWENO5 / TVD-RK2 defaults)
-    constexpr uint64_t kVortexHash = 0x6de2c5997a259e61ull;
+    // (re-recorded for the HJWENO5 / TVD-RK2 defaults, and the vortex for
+    // the speed extension; the cube and partition fields are uniform)
+    constexpr uint64_t kVortexHash = 0x92f2ad31e78a693aull;
     constexpr uint64_t kCubeHash[2] = {0xe768c85d9259c2a7ull, 0x77c900ec3774e44bull}; // FG26, FG6
     constexpr uint64_t kPartitionHash = 0x1ce11d129535607eull;
     // end times of the recorded cube runs and of the serial vs parallel check
@@ -3932,6 +3952,89 @@ TEST_F(TestLevelSetMultiObject, ExtractAccuracyAfterEvolution)
         EXPECT_LE(iface, 0.1) << c.name;
         EXPECT_LE(rms, 0.1) << c.name;
     }
+}
+
+namespace {
+
+// Shear rate of the velocity v = (kShearRate*z, 0, 0) of SpeedExtensionKeepsDistance.
+constexpr float kShearRate = 0.05f;
+
+// The shear field on @a xf, dense over the region the band of the sheared
+// sphere of SpeedExtensionKeepsDistance sweeps (zero outside).
+Vec3SGrid::Ptr
+makeShearField(const math::Transform& xf)
+{
+    Vec3SGrid::Ptr g = Vec3SGrid::create(Vec3f(0.0f));
+    g->setTransform(xf.copy());
+    auto acc = g->getAccessor();
+    for (auto p = CoordBBox(Coord(-36, -20, -20), Coord(36, 20, 20)).begin(); p; ++p) {
+        const Vec3d w = xf.indexToWorld(*p);
+        acc.setValue(*p, Vec3f(kShearRate * float(w.z()), 0.0f, 0.0f));
+    }
+    return g;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, SpeedExtensionKeepsDistance)
+{
+    // ExtractAccuracyAfterEvolution's advection case in a shear field: the
+    // closest-interface-point sampling of the velocity (the default) keeps
+    // the distance property within the 0.1*dx interface gate, and at least
+    // as well as voxel-center sampling. Voxel-center sampling is reported
+    // only: it measured 0.21*dx here (the shear changes |grad psi| at the
+    // interface voxels, which the redistancing keeps as seeds).
+    {
+        Forces f;
+        EXPECT_TRUE(f.speedExtension()); // on by default
+        f.setSpeedExtension(false);
+        EXPECT_FALSE(f.speedExtension());
+    }
+
+    // The closest point of an interface voxel lies on the sphere, and is the
+    // same for both labels of the interface (one sample serves both).
+    {
+        const double r = 12.3;
+        const Vec3d c(0.3, 0.1, 0.2);
+        auto m = makeSphere(r, c);
+        Stencil s(*m);
+        int n = 0;
+        double worst = 0.0;
+        for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) {
+            if (std::abs(*it) > 1.0f) continue;
+            const Coord p = it.getCoord();
+            s.moveTo(p, 1);
+            const Vec3d q1 = s.closestInterfacePoint();
+            s.moveTo(p, 0);
+            const Vec3d q0 = s.closestInterfacePoint();
+            EXPECT_EQ(q0, q1) << p;
+            worst = std::max(worst, std::abs((q1 - c).length() - r));
+            ++n;
+        }
+        ASSERT_GT(n, 1000);
+        std::cout << "SpeedExtensionKeepsDistance: closest points of " << n
+                  << " interface voxels within " << worst << " dx of the sphere" << std::endl;
+        EXPECT_LT(worst, 0.1);
+    }
+
+    constexpr double kT1 = 15.0;
+    double iface[2], rms[2];
+    for (int on = 0; on < 2; ++on) {
+        auto m = makeSphere(12.3, Vec3d(0.3, 0.1, 0.2));
+        Forces forces;
+        forces.setSpeedExtension(on == 1);
+        forces.setAdvection(makeShearField(m->phi()->transform()), 1.0f);
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        const size_t steps = lsmo.advect(0.0, kT1);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        extractSelfConsistency(*m, 1, iface[on], rms[on]);
+        std::cout << "SpeedExtensionKeepsDistance shear (t = " << kT1 << ", " << steps
+                  << " steps, extension " << (on ? "on" : "off") << "): interface max error "
+                  << iface[on] << " dx, band RMS " << rms[on] << " dx" << std::endl;
+    }
+    EXPECT_LE(iface[1], 0.1);
+    EXPECT_LE(iface[1], iface[0]);
 }
 
 TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)

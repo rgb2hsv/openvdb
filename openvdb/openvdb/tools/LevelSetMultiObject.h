@@ -155,6 +155,10 @@ constexpr float kCurvatureCorrectionMax = 0.5f;
 /// Smallest magnitude of a field extremum that is still used to rescale the
 /// field (field units).
 constexpr float kRescaleMinMagnitude = 1e-4f;
+/// Speed extension: below this squared gradient magnitude |grad psi|^2
+/// (dimensionless) the closest interface point is undefined and fields are
+/// sampled at the voxel center instead.
+constexpr double kSpeedExtensionMinGradSqr = 1e-8;
 /// Default minimum phi of protected-label voxels, as a fraction of dx.
 constexpr double kDefaultMinimumPhiFraction = 1e-3;
 /// Minimum phi of barrier and kinematic-stamp voxels, as a fraction of dx;
@@ -1842,9 +1846,11 @@ stencilIndex(int i, int j, int k)
 /// upwind differences (e.g. curvature only) never read them.
 ///
 /// The stencil also samples auxiliary grids (velocity, pressure, ...) at its
-/// center voxel through sampleAtCenter(), which caches the result per center
-/// voxel so that speed functors evaluating several labels at one voxel sample
-/// each field once.
+/// center voxel through sampleAtCenter(), or at the closest point of the
+/// interface of the current label through sampleAtClosestPoint(). Both cache
+/// the result per center voxel (and, for the closest point, per point), so
+/// that speed functors evaluating several labels at one voxel sample each
+/// field once: the two labels of an interface share its closest point.
 template<typename MultiLevelSetT>
 class LabelAwareStencil
 {
@@ -1889,6 +1895,7 @@ public:
         mCenter = ijk;
         mLabel = label;
         mAxisLoaded = false;
+        mClosestLoaded = false;
         static const Coord offs[19] = {
             Coord(0,0,0), Coord(-1,0,0), Coord(1,0,0), Coord(0,-1,0), Coord(0,1,0),
             Coord(0,0,-1), Coord(0,0,1),
@@ -1918,12 +1925,40 @@ public:
     /// @a grid must outlive the stencil.
     float sampleAtCenter(const FloatGrid& grid, bool forceSampling = false) const
     {
-        return this->sample(grid, mScalarCache, forceSampling);
+        return this->sample(grid, mScalarCache, forceSampling, /*closest=*/false);
     }
     /// @brief Vector-valued version of sampleAtCenter().
     Vec3f sampleAtCenter(const Vec3SGrid& grid, bool forceSampling = false) const
     {
-        return this->sample(grid, mVectorCache, forceSampling);
+        return this->sample(grid, mVectorCache, forceSampling, /*closest=*/false);
+    }
+
+    /// @brief World position of the closest point on the zero level set of
+    /// psi of the current label, x - psi*grad psi/|grad psi|^2, with x the
+    /// world position of the center voxel and grad psi the central-difference
+    /// gradient(); x itself where |grad psi|^2 < 1e-8 (no defined normal).
+    /// Computed once per moveTo().
+    Vec3d closestInterfacePoint() const
+    {
+        this->loadClosest();
+        return mClosest;
+    }
+
+    /// @brief Value of @a grid at closestInterfacePoint(), BoxSampler-
+    /// interpolated (the point is generally not a voxel center, so the
+    /// direct read of sampleAtCenter() does not apply). Where the closest
+    /// point is undefined this is sampleAtCenter(@a grid, @a forceSampling).
+    /// The value is cached per grid and point until the stencil moves to
+    /// another voxel; labels sharing the closest point (the two sides of an
+    /// interface, whose psi differ only in sign) share the sample.
+    float sampleAtClosestPoint(const FloatGrid& grid, bool forceSampling = false) const
+    {
+        return this->sample(grid, mScalarCache, forceSampling, /*closest=*/true);
+    }
+    /// @brief Vector-valued version of sampleAtClosestPoint().
+    Vec3f sampleAtClosestPoint(const Vec3SGrid& grid, bool forceSampling = false) const
+    {
+        return this->sample(grid, mVectorCache, forceSampling, /*closest=*/true);
     }
 
     /// @brief psi at offset (i,j,k) from the center; the 19 points have at
@@ -2018,8 +2053,9 @@ public:
 
 private:
     /// Cache entry of a sampled grid: the grid, a value accessor to its
-    /// tree, whether the grid shares the stencil's transform, and the value
-    /// at the current center voxel.
+    /// tree, whether the grid shares the stencil's transform, the value at
+    /// the current center voxel, and the value at the last closest point
+    /// sampled around it (keyed by the point's world position).
     template<typename GridT>
     struct FieldEntry
     {
@@ -2028,6 +2064,9 @@ private:
         std::unique_ptr<tree::ValueAccessor<const typename GridT::TreeType>> acc;
         bool valid = false;
         typename GridT::ValueType value{};
+        bool pointValid = false;
+        Vec3d point{0.0};
+        typename GridT::ValueType pointValue{};
     };
 
     /// Cache of up to kMaxFields grids keyed by grid address, so that fields
@@ -2039,7 +2078,10 @@ private:
         std::array<FieldEntry<GridT>, kMaxFields> entries;
         int size = 0, next = 0;
 
-        void invalidate() { for (int i = 0; i < size; ++i) entries[i].valid = false; }
+        void invalidate()
+        {
+            for (int i = 0; i < size; ++i) entries[i].valid = entries[i].pointValid = false;
+        }
 
         FieldEntry<GridT>& find(const GridT& grid, const math::Transform& xform)
         {
@@ -2052,7 +2094,7 @@ private:
             e.grid = &grid;
             e.acc.reset(new tree::ValueAccessor<const typename GridT::TreeType>(grid.tree()));
             e.aligned = (grid.transform() == xform);
-            e.valid = false;
+            e.valid = e.pointValid = false;
             return e;
         }
     };
@@ -2074,11 +2116,37 @@ private:
         mAxisLoaded = true;
     }
 
+    /// The closest interface point of the current label (once per center
+    /// and label); mClosestDefined is false where |grad psi|^2 is below
+    /// kSpeedExtensionMinGradSqr (mClosest is then the center).
+    void loadClosest() const
+    {
+        if (mClosestLoaded) return;
+        mClosest = mTransform.indexToWorld(mCenter);
+        const Vec3d g(this->gradient());
+        const double g2 = g.lengthSqr();
+        mClosestDefined = g2 >= lsmo_internal::kSpeedExtensionMinGradSqr;
+        if (mClosestDefined) mClosest -= g * (double(mValues[0]) / g2);
+        mClosestLoaded = true;
+    }
+
     template<typename GridT>
     typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& caches,
-        bool forceSampling) const
+        bool forceSampling, bool closest) const
     {
         FieldEntry<GridT>& cache = caches.find(grid, mTransform);
+        if (closest) {
+            this->loadClosest();
+            if (mClosestDefined) {
+                if (!cache.pointValid || cache.point != mClosest) {
+                    const Vec3R idx = grid.transform().worldToIndex(mClosest);
+                    cache.pointValue = tools::BoxSampler::sample(*cache.acc, idx);
+                    cache.point = mClosest;
+                    cache.pointValid = true;
+                }
+                return cache.pointValue;
+            }
+        }
         if (!cache.valid) {
             if (cache.aligned && !forceSampling) {
                 cache.value = cache.acc->getValue(mCenter);
@@ -2103,6 +2171,9 @@ private:
     /// psi at offsets -3, -2, +2, +3 along x, y, z (loadAxis)
     mutable float mAxis[3][4];
     mutable bool mAxisLoaded = false;
+    /// closest interface point of the current label (loadClosest)
+    mutable Vec3d mClosest{0.0};
+    mutable bool mClosestDefined = false, mClosestLoaded = false;
     mutable FieldCache<FloatGrid> mScalarCache;
     mutable FieldCache<Vec3SGrid> mVectorCache;
 };
@@ -2117,6 +2188,21 @@ private:
 /// The upwind terms use the stencil's one-sided differences
 /// (LabelAwareStencil::upwindDifferences), so their order is the spatial
 /// scheme the evolver selects (HJWENO5 by default, or first order).
+///
+/// Speed extension (setSpeedExtension, on by default): the advection
+/// velocity and the pressure are sampled at the closest point of the
+/// interface of l, x - psi*grad psi/|grad psi|^2
+/// (LabelAwareStencil::closestInterfacePoint), rather than at the voxel
+/// center x, so that every voxel along a normal moves with the speed of the
+/// interface point it belongs to; this keeps psi a distance in fields that
+/// vary across the interface (e.g. a shear). The curvature term has its own
+/// interface correction (see the note below). The cost is one BoxSampler
+/// interpolation (8 voxel reads) per field and voxel instead of one direct
+/// read for fields on the level set's transform; the sample is shared by
+/// the labels of an interface. Where |grad psi|^2 < 1e-8 the voxel center is
+/// used. Off, fields are sampled at the voxel center, as in the reference
+/// implementation.
+///
 /// It satisfies the SpeedT concept of LevelSetMultiObject. Label 0 is
 /// handled by the evolver as passive (its value is the complement of the
 /// other candidates, so it never needs a speed), so isFixed(0) is false
@@ -2184,11 +2270,21 @@ public:
 
     /// @brief Test hook: when true, fields are always BoxSampler-interpolated,
     /// even if their transform equals that of the level set (default false:
-    /// such fields are read directly, with identical results).
+    /// such fields are read directly, with identical results). Only voxel-
+    /// center samples are affected (closest-point samples always
+    /// interpolate).
     void setForceSampling(bool force) { mForceSampling = force; }
 
-    /// @brief Advection velocity (world units), sampled with BoxSampler unless
-    /// its transform equals that of the level set (then read directly).
+    /// @brief Sample the advection velocity and the pressure at the closest
+    /// interface point of the label (true, the default) or at the voxel
+    /// center (false); see the class documentation.
+    void setSpeedExtension(bool on) { mSpeedExtension = on; }
+    bool speedExtension() const { return mSpeedExtension; }
+
+    /// @brief Advection velocity (world units), sampled at the closest
+    /// interface point with BoxSampler (speed extension), or, with the
+    /// extension off, at the voxel center: BoxSampler-interpolated unless its
+    /// transform equals that of the level set (then read directly).
     /// Shared by all labels without their own field (see below).
     /// @throw ValueError if @a velocity is null.
     void setAdvection(Vec3SGrid::ConstPtr velocity, float weight)
@@ -2307,7 +2403,16 @@ private:
         return std::max(-mMaxCurvatureForce, std::min(mMaxCurvatureForce, kappa));
     }
 
-    /// Upwinded advection term v.grad psi (sampled at the stencil center).
+    /// @a grid at the closest interface point (speed extension) or the center.
+    template<typename GridT>
+    typename GridT::ValueType sampleField(const LabelAwareStencil<MultiLevelSetT>& s,
+        const GridT& grid) const
+    {
+        return mSpeedExtension ? s.sampleAtClosestPoint(grid, mForceSampling)
+                               : s.sampleAtCenter(grid, mForceSampling);
+    }
+
+    /// Upwinded advection term v.grad psi (v from sampleField).
     float advectionTerm(int32_t label, const LabelAwareStencil<MultiLevelSetT>& s,
         const float dneg[3], const float dpos[3]) const
     {
@@ -2322,7 +2427,7 @@ private:
             }
         }
         if (advField) {
-            const Vec3f vel = s.sampleAtCenter(*advField, mForceSampling);
+            const Vec3f vel = this->sampleField(s, *advField);
             for (int a = 0; a < 3; ++a) {
                 const float f = advWeight * vel[a];
                 if (f > 0.0f) advection += f * dneg[a];
@@ -2332,12 +2437,12 @@ private:
         return advection;
     }
 
-    /// Godunov-upwinded pressure term (sampled at the stencil center).
+    /// Godunov-upwinded pressure term (pressure from sampleField).
     float pressureTerm(const LabelAwareStencil<MultiLevelSetT>& s,
         const float dneg[3], const float dpos[3]) const
     {
         if (!mPressure) return 0.0f;
-        const float force = mPressureWeight * s.sampleAtCenter(*mPressure, mForceSampling);
+        const float force = mPressureWeight * this->sampleField(s, *mPressure);
         float gsPos = 0.0f, gsNeg = 0.0f;
         for (int a = 0; a < 3; ++a) {
             const float nMax = std::max(dneg[a], 0.0f), nMin = std::min(dneg[a], 0.0f);
@@ -2364,6 +2469,7 @@ private:
     // hashed: looked up per voxel, never iterated
     std::unordered_map<int32_t, LabelAdvection> mLabelAdvection;
     bool mForceSampling = false;
+    bool mSpeedExtension = true;
     std::unordered_set<int32_t> mInactive, mFixed;
 };
 
