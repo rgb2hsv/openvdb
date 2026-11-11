@@ -464,6 +464,7 @@ public:
 
     /// @brief extractSignedDistance with all settings in @a settings (see
     /// ExtractSettings and the overload above).
+    /// @throw ValueError if settings.halfWidth is not -1 and less than 2.
     template<typename InterruptT = util::NullInterrupter>
     typename FloatGridT::Ptr extractSignedDistance(int32_t label,
         const ExtractSettings& settings, InterruptT* interrupt = nullptr) const;
@@ -1315,6 +1316,17 @@ constexpr double kClosestPointSupportToleranceVoxels = 0.01;
 constexpr double kClosestPointParallelSin2 = 1e-6;
 /// @}
 
+/// @brief Diagnostics of closestPointPsi.
+struct ClosestPointInfo
+{
+    /// Some plane was usable, so the plane estimate gave the result (else
+    /// the result is the Godunov fallback).
+    bool planeDecided = false;
+    /// The union distance (not the supporting-plane bound or a clamp) gave
+    /// the result.
+    bool unionDecisive = false;
+};
+
 /// @brief Distance from the voxel @a q outside the region {L == @a label}
 /// to that region's boundary, from a local planar reconstruction of the
 /// boundary (accessor form; see the tree form below).
@@ -1337,17 +1349,23 @@ constexpr double kClosestPointParallelSin2 = 1e-6;
 ///   distance is the smallest distance from q to one of them.
 /// The estimate is the larger of the two, clamped to the proven bounds
 /// [phi_q, max(phi_q, B)], B the minimum of |q - x| - phi_x over x in U
-/// (as in rebuildJunctionSeeds). Without a usable plane it is phi_q.
+/// (as in rebuildJunctionSeeds). If no plane is usable (e.g. next to a
+/// sliver of the region one or two voxels wide, whose boundary voxels all
+/// have mixed gradients), the result is instead one local
+/// Godunov step on psi (per axis the smaller psi of the two face neighbors,
+/// -phi in the region and +phi elsewhere), clamped to the same bounds.
 /// phi is read as max(phi, @a phiFloor).
 /// @param phi accessor of the distance tree (float values)
 /// @param labels accessor of the label tree
 /// @param dx voxel size
+/// @param info if non-null, receives which estimate gave the result
 /// @return the distance in world units (non-negative). Needs about 10 KB of
 /// stack and no heap memory.
 template<typename PhiAccT, typename LabelAccT>
 inline float closestPointPsi(PhiAccT& phi, LabelAccT& labels, const Coord& q, int32_t label,
-    double dx, double phiFloor)
+    double dx, double phiFloor, ClosestPointInfo* info = nullptr)
 {
+    if (info) *info = ClosestPointInfo();
     constexpr int R = kClosestPointReach;
     constexpr int kMaxPoints = (2 * R + 1) * (2 * R + 1) * (2 * R + 1);
     struct Plane { Vec3d n, f; double d; };  // inward normal, foot point - q, (f . n)
@@ -1389,6 +1407,9 @@ inline float closestPointPsi(PhiAccT& phi, LabelAccT& labels, const Coord& q, in
                     if (in[0] && in[1]) g[axis] = 0.5 * (s[1] - s[0]);
                     else if (in[1]) g[axis] = s[1] - phiP;
                     else if (in[0]) g[axis] = phiP - s[0];
+                    // An inactive neighbor reads the background, so these
+                    // differences give a non-unit gradient that the
+                    // |g| = 1 gate below rejects.
                     else g[axis] = 0.5 * (s[1] - s[0]);
                 }
                 const double len = g.length();
@@ -1401,7 +1422,21 @@ inline float closestPointPsi(PhiAccT& phi, LabelAccT& labels, const Coord& q, in
         }
     }
     const double hi = std::max(ballBound, phiQ);
-    if (np == 0) return float(phiQ);
+    // fallback: one local Godunov step, within the same bounds
+    auto godunov = [&]() {
+        double abar[3], coef[3] = {1.0, 1.0, 1.0};
+        for (int axis = 0; axis < 3; ++axis) {
+            double a = std::numeric_limits<double>::max();
+            for (int side = 0; side < 2; ++side) {
+                const Coord n = q + offs[2 * axis + side];
+                const double v = std::max(double(phi.getValue(n)), phiFloor);
+                a = std::min(a, inside(n) ? -v : v);
+            }
+            abar[axis] = a;
+        }
+        return float(std::min(std::max(solveGodunov(abar, coef, 3, dx), phiQ), hi));
+    };
+    if (np == 0) return godunov();
 
     // supporting planes: keep them in front
     const double tol = kClosestPointSupportToleranceVoxels * dx;
@@ -1437,13 +1472,19 @@ inline float closestPointPsi(PhiAccT& phi, LabelAccT& labels, const Coord& q, in
             lo = std::max(lo, w);
         }
     }
-    return float(std::min(std::max(lo, unionDist), hi));
+    const double est = std::max(lo, unionDist);
+    if (info) {
+        info->planeDecided = true;
+        info->unionDecisive = unionDist > lo && unionDist < hi;
+    }
+    return float(std::min(est, hi));
 }
 
-/// @brief Tree form of closestPointPsi: ψ of the region {L == @a label} at
+/// @brief Tree form of closestPointPsi: psi of the region {L == @a label} at
 /// the voxel @a q outside it, from local planes through p - phi_p*n_p over
 /// the region's boundary voxels in q's 5x5x5 neighborhood, clamped to
-/// [phi_q, min_p(|q - p| - phi_p)] (see the accessor form). Uses
+/// [phi_q, max(phi_q, B)] with B = min_p(|q - p| - phi_p) (see the accessor
+/// form; no phi floor). Uses
 /// non-registering accessors, so it allocates nothing; callers looping over
 /// many voxels should use the accessor form.
 template<typename FloatTreeT, typename LabelTreeT>
@@ -1482,10 +1523,11 @@ inline float closestPointPsi(const FloatTreeT& phi, const LabelTreeT& labels, co
 /// whose phi_q is already exact stay within the interval but may move.
 /// Runs serially (junction seeds are few).
 ///
-/// With @a closestPointPhi (the pair's distance tree), each such seed is
-/// instead set to closestPointPsi over @a closestPointPhi (capped at the
-/// background of @a out); no sweeps are needed, since every value is read
-/// from the pair.
+/// With @a closestPointPhi (the pair's distance tree), each such seed that a
+/// plane decides (ClosestPointInfo::planeDecided) is instead set to
+/// closestPointPsi over @a closestPointPhi (capped at the background of
+/// @a out) and acts as a known value; the remaining seeds use the Godunov
+/// rule above.
 template<typename FloatTreeT, typename BoolTreeT, typename LabelTreeT>
 void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTreeT& labels,
     typename LabelTreeT::ValueType label, double dx, const FloatTreeT* closestPointPhi = nullptr)
@@ -1499,7 +1541,7 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
 
     const float bg = out.background();
     tree::ValueAccessor<const FloatTreeT> cpPhi(closestPointPhi ? *closestPointPhi : out);
-    std::vector<Coord> todo;
+    std::vector<Coord> todo, planeSeeds;
     std::vector<float> keep, upper, rebuilt;
     for (auto it = seeds.cbeginValueOn(); it; ++it) {
         const Coord q = it.getCoord();
@@ -1512,11 +1554,15 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
         }
         if (!third) continue;
         if (closestPointPhi) {
-            // values are read from the pair, so the order does not matter
-            todo.push_back(q);
-            rebuilt.push_back(std::min(closestPointPsi(cpPhi, lab, q, int32_t(label), dx, 0.0),
-                bg));
-            continue;
+            // values are read from the pair, so the order does not matter;
+            // seeds no plane decides are left to the Godunov rule below
+            ClosestPointInfo info;
+            const float v = closestPointPsi(cpPhi, lab, q, int32_t(label), dx, 0.0, &info);
+            if (info.planeDecided) {
+                planeSeeds.push_back(q);
+                rebuilt.push_back(std::min(v, bg));
+                continue;
+            }
         }
         // upper bound from the balls inside the region (see above)
         const float phiQ = acc.getValue(q);
@@ -1536,11 +1582,9 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
         keep.push_back(phiQ);
         upper.push_back(float(std::max(ball, double(phiQ))));
     }
+    // plane-decided seeds are known values for the sweeps
+    for (size_t n = 0; n < planeSeeds.size(); ++n) acc.setValue(planeSeeds[n], rebuilt[n]);
     if (todo.empty()) return;
-    if (closestPointPhi) {
-        for (size_t n = 0; n < todo.size(); ++n) acc.setValue(todo[n], rebuilt[n]);
-        return;
-    }
     for (const Coord& q : todo) acc.setValue(q, kUnknownDistance);
 
     const float tol = float(kDefaultRedistanceToleranceFraction * dx);

@@ -1252,8 +1252,9 @@ namespace {
 /// Max interface-layer error of @a g against the analytic distance to
 /// sector @a l of @a tj, in voxels, within (@a nearMax) and at least
 /// (@a farMax) 2 voxels from the junction line.
+template<typename JunctionT>
 void
-junctionInterfaceError(const FloatGrid& g, const TripleJunction& tj, int l,
+junctionInterfaceError(const FloatGrid& g, const JunctionT& tj, int l,
     double& nearMax, double& farMax)
 {
     const Coord* offs = tools::lsmo_internal::faceOffsets();
@@ -1275,7 +1276,225 @@ junctionInterfaceError(const FloatGrid& g, const TripleJunction& tj, int l,
     }
 }
 
+/// Largest |a - b| / dx over the interface voxels of @a a (sign change to a
+/// face neighbor) at least 2 voxels from the junction line of @a tj.
+template<typename JunctionT>
+double
+farFieldDifference(const FloatGrid& a, const FloatGrid& b, const JunctionT& tj)
+{
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    double worst = 0.0;
+    tree::ValueAccessor<const FloatTree> acc(a.tree()), bAcc(b.tree());
+    for (auto it = a.tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        bool iface = false;
+        for (int f = 0; f < 6 && !iface; ++f) {
+            float v;
+            if (acc.probeValue(p + offs[f], v)) iface = (v < 0.0f) != (*it < 0.0f);
+        }
+        if (!iface || tj.lineDist(a.indexToWorld(p)) < 2.0) continue;
+        worst = std::max(worst, std::abs(double(*it) - double(bAcc.getValue(p))) / tj.dx);
+    }
+    return worst;
+}
+
+/// Three labels around a z-parallel line through index point (c, 0) with
+/// arbitrary angular spans (degrees, summing to 360): label l owns the
+/// polar angles [b_{l-1}, b_l) about the line, b_0 = theta0. Same analytic
+/// distance and pair construction as lsmo_test::TripleJunction.
+struct SectorJunction
+{
+    double dx = 0.5;
+    double b[3];      // start angle of each sector, radians
+    double span01[2]; // cumulative end angles of sectors 1 and 2 past b[0]
+    Vec2d c;
+    int H = 12;
+
+    SectorJunction(double theta0Deg, const double spanDeg[3], const Vec2d& center) : c(center)
+    {
+        const double rad = math::pi<double>() / 180.0;
+        b[0] = theta0Deg * rad;
+        b[1] = b[0] + spanDeg[0] * rad;
+        b[2] = b[1] + spanDeg[1] * rad;
+        span01[0] = spanDeg[0] * rad;
+        span01[1] = (spanDeg[0] + spanDeg[1]) * rad;
+    }
+    Vec2d local(const Vec3d& w) const { return Vec2d(w[0] / dx - c[0], w[1] / dx - c[1]); }
+    Vec2d ray(int k) const { return Vec2d(std::cos(b[k % 3]), std::sin(b[k % 3])); }
+    int sector(const Vec3d& w) const
+    {
+        const Vec2d p = local(w);
+        const double twoPi = 2.0 * math::pi<double>();
+        double t = std::atan2(p[1], p[0]) - b[0];
+        while (t < 0.0) t += twoPi;
+        while (t >= twoPi) t -= twoPi;
+        return t < span01[0] ? 1 : (t < span01[1] ? 2 : 3);
+    }
+    double signedDist(const Vec3d& w, int l) const
+    {
+        const Vec2d p = local(w);
+        const double d = std::min(TripleJunction::rayDist(p, ray(l - 1)),
+            TripleJunction::rayDist(p, ray(l)));
+        return dx * (sector(w) == l ? -d : d);
+    }
+    double lineDist(const Vec3d& w) const { return local(w).length(); }
+    double boxDepth(const Coord& p) const
+    {
+        return H - std::max({std::abs(p[0] + 0.5), std::abs(p[1] + 0.5), std::abs(p[2] + 0.5)});
+    }
+    MLS::Ptr build() const
+    {
+        const int halfWidth = 3;
+        auto xform = math::Transform::createLinearTransform(dx);
+        FloatGrid::Ptr phi = FloatGrid::create(float(halfWidth * dx));
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
+        phi->setTransform(xform);
+        lab->setTransform(xform->copy());
+        auto pa = phi->getAccessor();
+        auto la = lab->getAccessor();
+        for (int i = -H - 1; i <= H; ++i)
+            for (int j = -H - 1; j <= H; ++j)
+                for (int k = -H - 1; k <= H; ++k) {
+                    const Coord q(i, j, k);
+                    const Vec3d w = xform->indexToWorld(q);
+                    const int l = sector(w);
+                    const double d = std::abs(signedDist(w, l));
+                    if (boxDepth(q) > 0.0 && d < halfWidth * dx) {
+                        pa.setValue(q, float(d));
+                        la.setValue(q, l);
+                    } else {
+                        pa.touchLeaf(q);
+                        la.setValueOff(q, l);
+                    }
+                }
+        return MLS::Ptr(new MLS(phi, lab, halfWidth));
+    }
+};
+
+/// Outside voxels of @a l that extractSignedDistance rebuilds: active, not
+/// @a l, with a face neighbor of @a l and one of a third label.
+std::vector<Coord>
+junctionSeedsOutside(const MLS& m, int l)
+{
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    std::vector<Coord> out;
+    auto lab = m.labels()->getConstAccessor();
+    for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) {
+        const Coord q = it.getCoord();
+        const int lq = lab.getValue(q);
+        if (lq == l) continue;
+        bool nl = false, third = false;
+        for (int f = 0; f < 6; ++f) {
+            const int ln = lab.getValue(q + offs[f]);
+            nl = nl || ln == l;
+            third = third || (ln != l && ln != lq);
+        }
+        if (nl && third) out.push_back(q);
+    }
+    return out;
+}
+
 } // anonymous namespace
+
+// Closest-point reconstruction next to a reflex (240 degree) sector, where
+// the region is locally a union of half-spaces and no boundary plane
+// supports it: the union distance must decide some seeds. For every label
+// (the 60 degree slivers included) the result must be no worse than the
+// Godunov rule within 2 voxels of the line and below 0.5*dx there, and the
+// far field must not change.
+TEST_F(TestLevelSetMultiObject, ClosestPointReflexJunction)
+{
+    const double spans[3] = {240.0, 60.0, 60.0};
+    const SectorJunction set[2] = {SectorJunction(25.0, spans, Vec2d(0.37, -0.21)),
+        SectorJunction(200.0, spans, Vec2d(-0.13, 0.29))};
+    constexpr double kFarTolerance = 1e-6;
+    for (int n = 0; n < 2; ++n) {
+        const SectorJunction& sj = set[n];
+        auto m = sj.build();
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3}));
+        for (int l = 1; l <= 3; ++l) {
+            SCOPED_TRACE("reflex junction " + std::to_string(n) + " label " + std::to_string(l));
+            tools::ExtractSettings s;
+            s.closestPointJunctions = false;
+            FloatGrid::Ptr off = m->extractSignedDistance(l, s);
+            s.closestPointJunctions = true;
+            FloatGrid::Ptr on = m->extractSignedDistance(l, s);
+            double nearOff, farOff, nearOn, farOn;
+            junctionInterfaceError(*off, sj, l, nearOff, farOff);
+            junctionInterfaceError(*on, sj, l, nearOn, farOn);
+            // the union distance decides at least one rebuilt seed of the reflex sector
+            int decisive = 0;
+            tree::ValueAccessor<const FloatTree, false> pa(m->phi()->tree());
+            tree::ValueAccessor<const LabelTree, false> la(m->labels()->tree());
+            const std::vector<Coord> seeds = junctionSeedsOutside(*m, l);
+            for (const Coord& q : seeds) {
+                tools::lsmo_internal::ClosestPointInfo info;
+                tools::lsmo_internal::closestPointPsi(pa, la, q, l, sj.dx, 0.0, &info);
+                decisive += info.unionDecisive ? 1 : 0;
+            }
+            std::cout << "[ClosestPointReflexJunction] junction " << n << " label " << l
+                      << " (span " << spans[l - 1] << " deg): <2 vox off " << nearOff
+                      << " dx, on " << nearOn << " dx; >=2 vox off " << farOff << " dx, on "
+                      << farOn << " dx; union-decided seeds " << decisive << " of "
+                      << seeds.size() << std::endl;
+            constexpr double kNearGate = 0.5;
+            EXPECT_LE(farOn, 0.05);
+            EXPECT_LE(farFieldDifference(*on, *off, sj), kFarTolerance);
+            EXPECT_LE(nearOn, nearOff + kFarTolerance);
+            EXPECT_LT(nearOn, kNearGate);
+            if (l == 1) EXPECT_GT(decisive, 0); // the 240 degree sector
+        }
+    }
+}
+
+// The phi floor of the accessor form of closestPointPsi: a floor below
+// every phi changes nothing; a floor above some phi gives the same result
+// as flooring the tree itself, and never less than the floor.
+TEST_F(TestLevelSetMultiObject, ClosestPointPsiFloor)
+{
+    const double spans[3] = {240.0, 60.0, 60.0};
+    const TripleJunction tj = junctionSet()[8];
+    const SectorJunction sj(25.0, spans, Vec2d(0.37, -0.21));
+    MLS::Ptr ms[2] = {tj.build(), sj.build()};
+    const double dx = tj.dx;
+    for (int n = 0; n < 2; ++n) {
+        const MLS& m = *ms[n];
+        const FloatTree& phi = m.phi()->tree();
+        float minPhi = std::numeric_limits<float>::max();
+        for (auto it = phi.cbeginValueOn(); it; ++it) minPhi = std::min(minPhi, *it);
+        ASSERT_GT(minPhi, 0.0f);
+        const double lowFloor = 0.5 * double(minPhi);
+        const double highFloor = 0.25 * dx;
+        FloatTree floored(phi);
+        for (auto it = floored.beginValueOn(); it; ++it) {
+            it.setValue(std::max(*it, float(highFloor)));
+        }
+        tree::ValueAccessor<const FloatTree, false> pa(phi), fa(floored);
+        tree::ValueAccessor<const LabelTree, false> la(m.labels()->tree());
+        int raised = 0, total = 0;
+        for (int l = 1; l <= 3; ++l) {
+            for (const Coord& q : junctionSeedsOutside(m, l)) {
+                const float ref = tools::lsmo_internal::closestPointPsi(pa, la, q, l, dx, 0.0);
+                EXPECT_EQ(ref, tools::lsmo_internal::closestPointPsi(
+                    phi, m.labels()->tree(), q, l, dx));
+                EXPECT_EQ(ref, tools::lsmo_internal::closestPointPsi(pa, la, q, l, dx, lowFloor));
+                const float high = tools::lsmo_internal::closestPointPsi(pa, la, q, l, dx,
+                    highFloor);
+                EXPECT_EQ(high, tools::lsmo_internal::closestPointPsi(fa, la, q, l, dx, 0.0));
+                EXPECT_GE(double(high), highFloor * (1.0 - 1e-6));
+                raised += high != ref ? 1 : 0;
+                ++total;
+            }
+        }
+        std::cout << "[ClosestPointPsiFloor] fixture " << n << ": min phi " << minPhi / dx
+                  << " dx; floor " << highFloor / dx << " dx changed " << raised << " of "
+                  << total << " estimates" << std::endl;
+        EXPECT_GT(total, 0);
+        EXPECT_GT(raised, 0);
+    }
+}
 
 // Closest-point junction reconstruction (ExtractSettings::closestPointJunctions):
 // on (the default) lowers the worst interface error within 2 voxels of the
@@ -1312,6 +1531,11 @@ TEST_F(TestLevelSetMultiObject, ClosestPointJunctions)
                 near[on] = std::max(near[on], nm);
                 worstFar[on] = std::max(worstFar[on], fm);
                 if (on == 1) {
+                    // far field: identical to the option off
+                    tools::ExtractSettings so = s;
+                    so.closestPointJunctions = false;
+                    FloatGrid::Ptr off = m->extractSignedDistance(l, so);
+                    EXPECT_LE(farFieldDifference(*g, *off, tj), 1e-6);
                     // the default overload is the option on
                     FloatGrid::Ptr d = m->extractSignedDistance(l);
                     double dn, df;

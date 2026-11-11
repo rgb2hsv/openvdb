@@ -886,7 +886,8 @@ struct MeshContext
     /// latter is taken over the 5x5x5 neighborhood of q. With
     /// settings.closestPointJunctions (the default) the estimate is
     /// closestPointPsi (the closest point on a local planar reconstruction
-    /// of l's boundary, within those bounds); otherwise it is one
+    /// of l's boundary, within those bounds) where a plane decides it
+    /// (ClosestPointInfo::planeDecided); otherwise it is one
     /// local Godunov step on psi_l (per axis the smaller psi_l of the two
     /// face neighbors, -phi in l and +phi elsewhere), clamped to
     /// [phi_q, max(phi_q, upper bound)]. It depends only on q and l, so every
@@ -894,7 +895,10 @@ struct MeshContext
     double correctedOutside(const Coord& q, LabelT l, double phiQ)
     {
         if (settings.closestPointJunctions) {
-            return closestPointPsi(phi, lab, q, int32_t(l), dx, settings.minimumPhi);
+            ClosestPointInfo info;
+            const double v = closestPointPsi(phi, lab, q, int32_t(l), dx, settings.minimumPhi,
+                &info);
+            if (info.planeDecided) return v;
         }
         double upper = std::numeric_limits<double>::max();
         for (int k = -2; k <= 2; ++k)
