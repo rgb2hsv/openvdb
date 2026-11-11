@@ -2016,57 +2016,113 @@ TEST_F(TestLevelSetMultiObject, PartitionInvariant)
     EXPECT_EQ(badCover, Index64(0));
 }
 
-TEST_F(TestLevelSetMultiObject, PressureGrowth)
+namespace {
+
+// Max interface motion argument of the scenario helpers below meaning "keep
+// the evolver's default".
+constexpr double kDefaultMotion = 0.0;
+
+// Failed assertions recorded so far by the current test.
+int
+failureCount()
+{
+    return ::testing::UnitTest::GetInstance()->current_test_info()->result()
+        ->total_part_count();
+}
+
+template<typename EvolverT>
+void
+applyMotion(EvolverT& e, double motion)
+{
+    if (motion > kDefaultMotion) e.setMaxInterfaceMotion(motion);
+}
+
+// Sphere of radius 8 grown at unit speed to t = 6 (gate: mean radius
+// 14 +- 0.5*dx). @return the number of steps.
+size_t
+runPressureGrowth(double motion)
 {
     auto m = makeSphere(8.0);
     const double dx = m->voxelSize();
     ConstantSpeed speed;
     speed.s = -1.0f; // dpsi/dt = -1: the object grows at unit speed
     tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    applyMotion(lsmo, motion);
+    const auto start = std::chrono::steady_clock::now();
     const size_t steps = lsmo.advect(0.0, 6.0);
+    const double secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
     EXPECT_GE(steps, size_t(6));
     std::string msg;
-    ASSERT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
     const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
-    std::cout << "PressureGrowth: steps " << steps << " mean radius " << r << " (expected 14)"
-              << std::endl;
+    std::cout << "PressureGrowth: motion " << lsmo.maxInterfaceMotion() << " steps " << steps
+              << " (" << 1e3 * secs / double(std::max(steps, size_t(1))) << " ms/step)"
+              << " mean radius " << r << " (expected 14)" << std::endl;
     EXPECT_NEAR(r, 8.0 + 6.0, 0.5 * dx);
+    return steps;
 }
 
-TEST_F(TestLevelSetMultiObject, CurvatureFlow)
+// Sphere of radius 10 under unit curvature flow to t = 30 (gate: r^2 =
+// 40 +- 2*sqrt(40)*0.5*dx).
+void
+runCurvatureFlow(double motion)
 {
     auto m = makeSphere(10.0);
     const double dx = m->voxelSize();
     Forces forces;
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    applyMotion(lsmo, motion);
     const size_t steps = lsmo.advect(0.0, 30.0);
     std::string msg;
-    ASSERT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
     const double r = meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0));
     // r^2 = r0^2 - 2t = 100 - 60
-    std::cout << "CurvatureFlow: steps " << steps << " r^2 " << r * r << " (expected 40)" << std::endl;
+    std::cout << "CurvatureFlow: motion " << lsmo.maxInterfaceMotion() << " steps " << steps
+              << " r^2 " << r * r << " (expected 40)" << std::endl;
     EXPECT_NEAR(r * r, 40.0, 2.0 * std::sqrt(40.0) * 0.5 * dx);
 }
 
-TEST_F(TestLevelSetMultiObject, UniformAdvection)
+// Sphere of radius 8 advected by (1, 0, 0) to t = 7.5 (gate: centroid shift
+// (7.5, 0, 0) +- 0.5*dx per axis).
+void
+runUniformAdvection(double motion)
 {
     auto m = makeSphere(8.0);
     const double dx = m->voxelSize();
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    applyMotion(lsmo, motion);
     const Vec3d c0 = centroid(zeroCrossings(*m->extractSignedDistance(1)));
     const size_t steps = lsmo.advect(0.0, 7.5);
     std::string msg;
-    ASSERT_TRUE(m->validate(&msg)) << msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
     const auto pts = zeroCrossings(*m->extractSignedDistance(1));
     const Vec3d c1 = centroid(pts);
-    std::cout << "UniformAdvection: steps " << steps << " shift " << (c1 - c0)
-              << " mean radius " << meanRadius(pts, c1) << std::endl;
+    std::cout << "UniformAdvection: motion " << lsmo.maxInterfaceMotion() << " steps " << steps
+              << " shift " << (c1 - c0) << " mean radius " << meanRadius(pts, c1) << std::endl;
     EXPECT_NEAR(c1[0] - c0[0], 7.5, 0.5 * dx);
     EXPECT_NEAR(c1[1] - c0[1], 0.0, 0.5 * dx);
     EXPECT_NEAR(c1[2] - c0[2], 0.0, 0.5 * dx);
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, PressureGrowth)
+{
+    runPressureGrowth(kDefaultMotion);
+}
+
+TEST_F(TestLevelSetMultiObject, CurvatureFlow)
+{
+    runCurvatureFlow(kDefaultMotion);
+}
+
+TEST_F(TestLevelSetMultiObject, UniformAdvection)
+{
+    runUniformAdvection(kDefaultMotion);
 }
 
 TEST_F(TestLevelSetMultiObject, PerLabelAdvection)
@@ -2358,7 +2414,12 @@ TEST_F(TestLevelSetMultiObject, FieldDirectReadMatchesSampler)
     EXPECT_GT(bitDifferences(*ext, *direct), Index64(0));
 }
 
-TEST_F(TestLevelSetMultiObject, FixedLabels)
+namespace {
+
+// Sphere 1 grows into the fixed sphere 2 over 30 steps of at most 0.75
+// (gate: no voxel of label 2 changes; the labels end in contact).
+void
+runFixedLabels(double motion)
 {
     auto m = makeTwoSpheres(1.0);
     std::map<Coord, float> before;
@@ -2370,8 +2431,11 @@ TEST_F(TestLevelSetMultiObject, FixedLabels)
     speed.s = -1.0f;
     speed.fixed = {2};
     tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    applyMotion(lsmo, motion);
     for (int n = 0; n < 30; ++n) {
-        lsmo.step(0.75f); // dt = 0.5*cfl: sphere 1 grows ~15 voxels, reaching the wall after ~20 steps
+        // dt = min(0.75, motion*cfl): at the default motion 0.5 sphere 1
+        // grows ~15 voxels, reaching the wall after ~20 steps
+        lsmo.step(0.75f);
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
     }
@@ -2391,6 +2455,13 @@ TEST_F(TestLevelSetMultiObject, FixedLabels)
         for (int f = 0; f < 6; ++f) contact += m->labels()->tree().getValue(it.getCoord() + offs[f]) == 2;
     }
     EXPECT_GT(contact, Index64(0));
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, FixedLabels)
+{
+    runFixedLabels(kDefaultMotion);
 }
 
 TEST_F(TestLevelSetMultiObject, BandMaintenance)
@@ -2594,13 +2665,15 @@ struct LabelSpeed
     float stableDt(float) const { return std::numeric_limits<float>::infinity(); }
 };
 
-} // anonymous namespace
-
-TEST_F(TestLevelSetMultiObject, ContactNoCascade)
+// Review probe of ContactNoCascade; @a motion as for runPressureGrowth.
+void
+runContactNoCascade(double motion)
 {
     // Review probe: label 1 slab x < 10, label 2 block x in [10,13), y < 3,
     // in contact; label 2 is faster. Along the contact shell (10, y, 12)
-    // label 2 may advance at most half a voxel per step (the evolver caps dt so interfaces move <= 0.5*dx per step).
+    // label 2 may advance at most one voxel per step (the evolver caps dt so
+    // interfaces move at most maxInterfaceMotion()*cfl*dx per step: half a
+    // voxel by default).
     Int32Grid::Ptr labels = Int32Grid::create(0);
     {
         auto acc = labels->getAccessor();
@@ -2615,6 +2688,8 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
     LabelSpeed speed;
     speed.speeds = {{1, -0.5f}, {2, -1.0f}};
     tools::LevelSetMultiObject<MLS, LabelSpeed> lsmo(*m, speed);
+    applyMotion(lsmo, motion);
+    const double cap = lsmo.maxInterfaceMotion();
     auto extent = [&]() {
         int maxj = -1;
         for (int j = 0; j < 24; ++j) {
@@ -2634,13 +2709,13 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
     std::vector<int> extents{y0};
     const double cfl = 0.999;
     // 1.5 x the time of three full steps: four full steps and a half step
-    const double tEnd = 1.5 * 3.0 * 0.5 * cfl;
+    const double tEnd = 1.5 * 3.0 * cap * cfl;
     double t = 0.0;
     int nSteps = 0;
     while (t < tEnd - 1e-6) {
-        const double expected = std::min(0.5 * cfl, tEnd - t);
+        const double expected = std::min(cap * cfl, tEnd - t);
         const float dt = lsmo.step(float(tEnd - t));
-        // max|F| = 1: at most half a voxel (R24)
+        // max|F| = 1: at most the motion cap (R24)
         EXPECT_FLOAT_EQ(dt, float(expected)) << "step " << nSteps + 1;
         t += dt;
         ++nSteps;
@@ -2650,7 +2725,7 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
         ASSERT_TRUE(m->validate(&msg)) << msg;
     }
     ASSERT_EQ(nSteps, 5);
-    std::cout << "ContactNoCascade: t " << t << ", extent";
+    std::cout << "ContactNoCascade: motion " << cap << " t " << t << ", extent";
     for (int e : extents) std::cout << " " << e;
     std::cout << ", label-2 voxels";
     for (Index64 c : counts) std::cout << " " << c;
@@ -2679,6 +2754,13 @@ TEST_F(TestLevelSetMultiObject, ContactNoCascade)
         }
     }
     EXPECT_EQ(far, Index64(0));
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, ContactNoCascade)
+{
+    runContactNoCascade(kDefaultMotion);
 }
 
 TEST_F(TestLevelSetMultiObject, WallRetreat)
@@ -3189,7 +3271,12 @@ insideVoxelCount(const FloatGrid& g)
 
 } // anonymous namespace
 
-TEST_F(TestLevelSetMultiObject, VortexEightObjects)
+namespace {
+
+// The VortexEightObjects scenario and gates; @a motion as for
+// runPressureGrowth.
+void
+runVortexEightObjects(double motion)
 {
     // Parameters (a first parameter set dissolved every object
     // through first-order upwind diffusion before any contact, and a ring of
@@ -3239,9 +3326,12 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
     size_t steps = 0;
     double tContact = -1.0;
     std::set<std::pair<int32_t, int32_t>> pairs;
+    // failures of this run only (FullVoxelMotion runs several scenarios)
+    const int failures0 = failureCount();
     const auto start = std::chrono::steady_clock::now();
     math::BiasedGradientScheme spatial = math::UNKNOWN_BIAS;
     math::TemporalIntegrationScheme temporal = math::UNKNOWN_TIS;
+    double usedMotion = 0.0;
     // Keep going to the end time; contacts must persist after first contact.
     const double t = vortex.run(*m, vel, steps, tContact,
         [&](double tc, size_t n, const std::set<std::pair<int32_t, int32_t>>& p, int after) {
@@ -3261,14 +3351,21 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
             for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
             std::cout << std::endl;
             if (after >= 1) { EXPECT_GE(p.size(), size_t(4)) << "t " << tc; }
-            return !::testing::Test::HasFailure();
+            return failureCount() == failures0;
         },
-        [&](Vortex::Evolver& e) { spatial = e.spatialScheme(); temporal = e.temporalScheme(); });
-    ASSERT_FALSE(::testing::Test::HasFailure());
+        [&](Vortex::Evolver& e) {
+            applyMotion(e, motion);
+            usedMotion = e.maxInterfaceMotion();
+            spatial = e.spatialScheme();
+            temporal = e.temporalScheme();
+        });
+    ASSERT_EQ(failureCount(), failures0);
     std::cout << "Vortex: >= 4 contact pairs first at t " << tContact << std::endl;
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    std::cout << "Vortex: t " << t << ", " << steps << " steps, " << secs << " s, contact pairs";
+    std::cout << "Vortex: motion " << usedMotion << ", t " << t
+              << ", " << steps << " steps, " << secs << " s ("
+              << 1e3 * secs / double(std::max(steps, size_t(1))) << " ms/step), contact pairs";
     for (const auto& pr : pairs) std::cout << " " << pr.first << "-" << pr.second;
     std::cout << std::endl;
     EXPECT_GE(pairs.size(), size_t(4));
@@ -3293,6 +3390,12 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
     }
 }
 
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, VortexEightObjects)
+{
+    runVortexEightObjects(kDefaultMotion);
+}
 
 TEST_F(TestLevelSetMultiObject, Weno5ReducesVortexLoss)
 {
@@ -3967,7 +4070,8 @@ struct CubeRunResult
 // @a protect (the control) the run stops at the first chunk where the
 // cube's topology changed. @a tEnd < 0 runs the whole distance.
 CubeRunResult
-runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = -1.0)
+runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = -1.0,
+    double motion = kDefaultMotion)
 {
     const int side = 40;
     const bool fullRun = !(tEnd > 0.0);
@@ -4039,6 +4143,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
     forces.setCurvatureWeight(0.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
     lsmo.setGrainSize(grainSize);
+    applyMotion(lsmo, motion);
     for (int s = 0; s < 3; ++s) {
         lsmo.setKinematicLabel(2 + s, tools::createLevelSetSphere<FloatGrid>(4.0f,
             Vec3f(kOrbitSpheres[s].asVec3d()), float(dx)), orbitMotion);
@@ -4143,7 +4248,9 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
     res.frontShift = centerFront() - centerFront0;
     res.maxXShift = double(labelMaxX() - front0);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    std::cout << log << ": " << steps << " steps, " << secs << " s, t " << t
+    std::cout << log << ": motion " << lsmo.maxInterfaceMotion() << ", " << steps << " steps, "
+              << secs << " s (" << 1e3 * secs / double(std::max(steps, size_t(1)))
+              << " ms/step), t " << t
               << ", active phi below minimumPhi*dx (summed over chunks) " << res.belowFloor
               << ", leading-face shift (centerline) " << res.frontShift
               << ", max-x shift (diagnostic) " << res.maxXShift << ", centroid shift " << res.shift
@@ -4163,12 +4270,17 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
 
 } // anonymous namespace
 
-TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
+namespace {
+
+// The TopologyCubeThroughSpheres gates under both rules; @a motion as for
+// runPressureGrowth.
+void
+runTopologyCubeGates(double motion)
 {
     const double distance = 84.0;
     for (Conn rule : {Conn::FG26_BG6, Conn::FG6_BG26}) {
         SCOPED_TRACE(lsmo_test::connectivityName(rule));
-        const CubeRunResult prot = runCubeThroughSpheres(true, rule);
+        const CubeRunResult prot = runCubeThroughSpheres(true, rule, 1, -1.0, motion);
         EXPECT_FALSE(prot.changed);
         // Leading face along the centerline column, not the centroid:
         // topology protection leaves label-1 material tethered around the
@@ -4181,7 +4293,7 @@ TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
             EXPECT_LE(prot.maxCentroidError[s], 1.0) << "sphere " << 2 + s;
         }
         // control: without protection the spheres change the cube's topology
-        const CubeRunResult ctrl = runCubeThroughSpheres(false, rule);
+        const CubeRunResult ctrl = runCubeThroughSpheres(false, rule, 1, -1.0, motion);
         EXPECT_TRUE(ctrl.changed);
         // no protected label: no floor, and phi values below it occur
         EXPECT_GT(ctrl.belowFloor, Index64(0));
@@ -4189,6 +4301,13 @@ TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
                   << "): first change at t " << ctrl.firstChange << " " << ctrl.firstChangeTopo
                   << std::endl;
     }
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
+{
+    runTopologyCubeGates(kDefaultMotion);
 }
 
 TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
@@ -4886,3 +5005,72 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
     }
 }
 
+
+TEST_F(TestLevelSetMultiObject, MaxInterfaceMotionApi)
+{
+    auto m = makeSphere(8.0);
+    ConstantSpeed speed;
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    EXPECT_EQ(lsmo.maxInterfaceMotion(), tools::lsmo_internal::kDefaultMaxInterfaceMotionVoxels);
+    lsmo.setMaxInterfaceMotion(tools::lsmo_internal::kFullVoxelMotion);
+    EXPECT_EQ(lsmo.maxInterfaceMotion(), 1.0);
+    lsmo.setMaxInterfaceMotion(tools::lsmo_internal::kHalfVoxelMotion);
+    EXPECT_EQ(lsmo.maxInterfaceMotion(), 0.5);
+    for (double bad : {0.0, -0.5, 0.75, 1.5, 2.0, std::numeric_limits<double>::quiet_NaN()}) {
+        EXPECT_THROW(lsmo.setMaxInterfaceMotion(bad), ValueError) << bad;
+        EXPECT_EQ(lsmo.maxInterfaceMotion(), 0.5) << bad;
+    }
+    // the cap of an unconstrained step: motion * cfl * dx / max|F|
+    speed.s = -1.0f;
+    EXPECT_FLOAT_EQ(lsmo.step(10.0f), 0.5f * lsmo.cfl());
+    lsmo.setMaxInterfaceMotion(1.0);
+    EXPECT_FLOAT_EQ(lsmo.step(10.0f), lsmo.cfl());
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+}
+
+TEST_F(TestLevelSetMultiObject, FullVoxelMotion)
+{
+    // Every gate of the half-voxel scenarios, unchanged, at full-voxel
+    // motion (setMaxInterfaceMotion(1.0)): ContactNoCascade (label-2 extent
+    // growth at most one voxel per step, no cascade), PressureGrowth,
+    // UniformAdvection, CurvatureFlow, VortexEightObjects (t = 60),
+    // TopologyCubeThroughSpheres (both rules, protected and control) and
+    // FixedLabels; and PressureGrowth takes at most 0.6x the steps of the
+    // half-voxel run.
+    constexpr double kFull = tools::lsmo_internal::kFullVoxelMotion;
+    constexpr double kHalf = tools::lsmo_internal::kHalfVoxelMotion;
+    constexpr double kMaxStepRatio = 0.6;
+    {
+        SCOPED_TRACE("ContactNoCascade");
+        runContactNoCascade(kFull);
+    }
+    {
+        SCOPED_TRACE("PressureGrowth");
+        const size_t half = runPressureGrowth(kHalf);
+        const size_t full = runPressureGrowth(kFull);
+        std::cout << "FullVoxelMotion: PressureGrowth steps " << full << " vs " << half
+                  << " at half-voxel motion" << std::endl;
+        EXPECT_LE(double(full), kMaxStepRatio * double(half));
+    }
+    {
+        SCOPED_TRACE("UniformAdvection");
+        runUniformAdvection(kFull);
+    }
+    {
+        SCOPED_TRACE("CurvatureFlow");
+        runCurvatureFlow(kFull);
+    }
+    {
+        SCOPED_TRACE("FixedLabels");
+        runFixedLabels(kFull);
+    }
+    {
+        SCOPED_TRACE("VortexEightObjects");
+        runVortexEightObjects(kFull);
+    }
+    {
+        SCOPED_TRACE("TopologyCubeThroughSpheres");
+        runTopologyCubeGates(kFull);
+    }
+}

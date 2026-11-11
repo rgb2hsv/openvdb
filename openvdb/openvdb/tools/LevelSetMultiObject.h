@@ -136,9 +136,14 @@ constexpr int kRedistanceIterationCapFactor = 4;
 /// Distance, in voxels, from a voxel to the interface it shares with a face
 /// neighbor of a different label (the midpoint between the two voxels).
 constexpr double kHalfVoxelDistance = 0.5;
-/// Maximum interface motion per step, in voxels. Also the width of the
-/// candidate band (phi <= this) in which a voxel may change label.
-constexpr double kMaxInterfaceMotionVoxels = 0.5;
+/// Half-voxel interface motion per step (LevelSetMultiObject::
+/// setMaxInterfaceMotion), in voxels: also the depth of the projected set
+/// (phi <= this) besides the voxels next to another label.
+constexpr double kHalfVoxelMotion = 0.5;
+/// Full-voxel interface motion per step, in voxels.
+constexpr double kFullVoxelMotion = 1.0;
+/// Default maximum interface motion per step, in voxels.
+constexpr double kDefaultMaxInterfaceMotionVoxels = kHalfVoxelMotion;
 /// Default CFL number: fraction of the maximum interface motion a step may
 /// use (dimensionless).
 constexpr float kDefaultCfl = 0.999f;
@@ -193,7 +198,7 @@ constexpr double kSplitPhaseRelativeEpsilon = 1e-6;
 /// half width that supports them (voxels).
 constexpr int kWeno5StencilRadius = 3;
 /// TVD-RK2 second stage: factor on the projected-set threshold
-/// (kMaxInterfaceMotionVoxels*dx) and on the motion cap its speeds must
+/// (maxInterfaceMotion()*dx) and on the motion cap its speeds must
 /// respect (dimensionless; see LevelSetMultiObject).
 constexpr double kRk2StageMotionFactor = 2.0;
 /// TVD-RK2: weight of each of the two stage values in their average.
@@ -631,6 +636,33 @@ inline const Coord* faceOffsets()
         Coord(-1,0,0), Coord(1,0,0), Coord(0,-1,0),
         Coord(0,1,0), Coord(0,0,-1), Coord(0,0,1)};
     return offs;
+}
+
+/// Number of edge and corner neighbors (the 26-neighborhood minus the faces).
+constexpr int kEdgeCornerNeighbors = 20;
+
+/// Edge- and corner-neighbor offsets (the 26-neighborhood without the face
+/// neighbors), in increasing (z, y, x) order.
+inline const Coord* edgeCornerOffsets()
+{
+    struct Table
+    {
+        Coord offs[kEdgeCornerNeighbors];
+        Table()
+        {
+            int n = 0;
+            for (int k = -1; k <= 1; ++k) {
+                for (int j = -1; j <= 1; ++j) {
+                    for (int i = -1; i <= 1; ++i) {
+                        const int axes = std::abs(i) + std::abs(j) + std::abs(k);
+                        if (axes >= 2) offs[n++] = Coord(i, j, k);
+                    }
+                }
+            }
+        }
+    };
+    static const Table table;
+    return table.offs;
 }
 
 /// Run @a body on the leaf range of @a leafs: in parallel with grain size
@@ -2876,7 +2908,9 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// @brief Multi-object level set evolver (multi-object geodesic active
 /// contours, MOGAC).
 ///
-/// @details One forward Euler update (TVD_RK1) of step() does:
+/// @details One forward Euler update (TVD_RK1) of step() does (as written
+/// for half-voxel motion, setMaxInterfaceMotion(0.5), the default; see
+/// Full-voxel motion below for 1.0):
 /// -# <b>Projected set and candidates.</b> Every active voxel that is not of
 ///    a fixed label and has phi <= 0.5*dx or a face neighbor (active or
 ///    not) of a different label is projected: these are the only voxels
@@ -2891,9 +2925,10 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    called (on time-n data through a LabelAwareStencil) only for non-zero
 ///    candidates; labels with isActive() false get dpsi/dt = +0.999, so
 ///    they slowly retreat from their neighbors.
-/// -# <b>Time step.</b> dt = min(maxDt, 0.5*cfl*dx/max|F|, speed.stableDt(dx))
-///    (see Operator splitting below for split speed functors),
-///    so an interface moves at most half a voxel per step. The
+/// -# <b>Time step.</b> dt = min(maxDt, m*cfl*dx/max|F|, speed.stableDt(dx))
+///    with m = maxInterfaceMotion() (see Operator splitting below for split
+///    speed functors), so an interface moves at most m = half a voxel per
+///    step. The
 ///    half-voxel cap is what makes the projected set sufficient: since
 ///    psi_l >= phi at every voxel, no voxel outside it can change label by
 ///    projection (orphan cleanup can still relabel), so no separate
@@ -2970,14 +3005,14 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    two-smallest rule (passive label 0 the complement -min v_l), again
 ///    with topology preservation, the phi floor, kinematic labels at
 ///    t_{n+1}, orphan cleanup, redistance and band maintenance. Its
-///    projected set is twice as deep (phi <= 2*0.5*dx or a face neighbor of
+///    projected set is twice as deep (phi <= 2*m*dx or a face neighbor of
 ///    another label) because its values move by up to
 ///    |psi^n - psi^(1)|/2 + dt*|F^(1)|/2, and a voxel's candidates are
 ///    limited to the labels a forward Euler update from time n could give
 ///    it (its time-n label and face labels) plus its stage-1 label, so no
 ///    label advances more than one voxel per step at a junction (where
 ///    psi of a label that is not a neighbor is only a lower bound).
-///    If dt*max|F^(1)| exceeds twice the motion cap (2*0.5*cfl*dx), the
+///    If dt*max|F^(1)| exceeds twice the motion cap (2*m*cfl*dx), the
 ///    projected set would not suffice: the update keeps the stage-1 result
 ///    (forward Euler; counted by eulerFallbacks()).
 ///
@@ -2986,16 +3021,52 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// math::TVD_RK1 makes every update forward Euler. TVD-RK2 doubles the speed evaluations and the
 /// redistances of an update.
 ///
+/// <b>Full-voxel motion</b> (opt-in, setMaxInterfaceMotion(1.0)). Interfaces
+/// may move up to cfl*dx per update (twice the half-voxel cap, so updates
+/// can be about twice as long), as may kinematic objects and the
+/// volume-constraint correction; the larger steps cost accuracy (up to
+/// three times the interface error of sheared advection). A label can then reach
+/// voxels one voxel beyond its face neighbors, so the projection works on
+/// the 26-neighborhood:
+/// -# the projected set holds the voxels with another label (label 0 and
+///    fixed labels included) in their 26-neighborhood; these are the only
+///    voxels whose label can change: every other voxel is at least two
+///    voxels from the voxels of another label, so its distance to their
+///    region (2*dx less their phi, about 1.5*dx) exceeds the motion cap. A
+///    voxel with phi <= 1.5*dx and no
+///    other label within one voxel keeps its label in the update, and its new
+///    phi depends on the speed of a label that is not its candidate, so it is
+///    left to the redistance (neither projected nor frozen), as is a voxel
+///    whose only candidates are its own label or passive label 0;
+/// -# the candidates are the own label and the labels of all 26 neighbors
+///    (fixed labels and label 0 make passive label 0 participate, as above);
+/// -# psi_l is -phi for the own label; +phi for a face-neighbor label when
+///    it is the only other label in the 26-neighborhood (phi is then the
+///    distance to their interface); otherwise (edge and corner labels, and
+///    every label at a junction, where phi may be the distance to a third
+///    label's interface and +phi only a lower bound that would let a label
+///    race along another one's interface) psi_l is the closest-point
+///    estimate lsmo_internal::closestPointPsi (local planes through the
+///    region's boundary voxels, within [phi, Lipschitz bound], with the
+///    phi floor of topology-preserving labels);
+/// -# a second TVD-RK2 stage projects (psi_l^n + psi_l^(1) + dt*F_l^(1))/2
+///    with psi_l^n by the same rule on the time-n state; its candidates are
+///    restricted to the time-n label and time-n 26-neighbor labels (and the
+///    current label), so no label advances more than one voxel per step.
+/// Topology preservation (simple-point test in colored passes), orphan
+/// cleanup, the phi floor, band maintenance and the incremental redistance
+/// are unchanged.
+///
 /// <b>Operator splitting.</b> With a split speed functor (one that also
 /// provides hyperbolic() and parabolic(), see SpeedT concept) and
 /// setSplitting(true) (the default), a step is split only when the
 /// curvature limit binds: when parabolicStableDt < min(maxDt,
-/// 0.5*cfl*dx/max|F_h|) and the kinematic limit, with F_h the hyperbolic
+/// m*cfl*dx/max|F_h|) and the kinematic limit, with F_h the hyperbolic
 /// speeds on the state at the start of the step (evaluated only if
 /// parabolicStableDt < maxDt).
 /// Otherwise it is the unsplit update above, unchanged. A split step is a
 /// Strang step: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2), with
-/// dt = min(maxDt, 0.5*cfl*dx/max|F_h|) (and the kinematic limit), so the
+/// dt = min(maxDt, m*cfl*dx/max|F_h|) (and the kinematic limit), so the
 /// hyperbolic terms (advection, pressure, inactive-label retreat) are not
 /// held to the much smaller curvature limit.
 /// Each parabolic half takes n = ceil((dt/2)/parabolicStableDt) equal
@@ -3003,7 +3074,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// above (steps 1-6: projection with passive label 0 and fixed walls,
 /// topology preservation, orphan cleanup, the phi floor, incremental
 /// redistance, band maintenance), each evaluated on the state the previous
-/// one left and each limited to half a voxel of motion: if its own speeds
+/// one left and each limited to the motion cap m*cfl*dx: if its own speeds
 /// require it, an update takes a shorter time step and the part continues
 /// with more updates until its time is covered. An update whose speeds are
 /// all zero is skipped. (If the first parabolic half raises max|F_h|, the
@@ -3034,7 +3105,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// changes V_l by about -<F_l>*A_l per unit time: the first term cancels
 /// that predicted change and the second removes a fraction of the error
 /// per step. The correction lambda_l*dt is limited to the motion cap
-/// 0.5*cfl*dx, is added to the evaluated speeds, and dt is reduced if the
+/// m*cfl*dx, is added to the evaluated speeds, and dt is reduced if the
 /// motion limit of the new speeds requires it (never increased). The same
 /// lambda_l serves every sub-update and stage of the step (all parts of a
 /// split step). lambda_l is 0 for that step if V_l = 0 (a vanished label)
@@ -3087,7 +3158,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// can lose volume, gain cavities or, under 6-adjacency, split) until the
 /// protected label lets them go. The time step
 /// is also limited so that the moved
-/// object's rest bounding box corners move at most 0.5*cfl*dx per step.
+/// object's rest bounding box corners move at most m*cfl*dx per step.
 ///
 /// @par SpeedT concept
 /// @code
@@ -3203,7 +3274,8 @@ public:
     /// @brief Strang splitting of a split speed functor's hyperbolic and
     /// parabolic parts (default true; see the class documentation): a step
     /// is split only when speed.parabolicStableDt(dx) is below the
-    /// hyperbolic dt min(maxDt, 0.5*cfl*dx/max|F_h|, kinematic limit);
+    /// hyperbolic dt min(maxDt, m*cfl*dx/max|F_h|, kinematic limit), m =
+    /// maxInterfaceMotion();
     /// otherwise it is the
     /// unsplit update. Ignored for a functor that only provides operator().
     void setSplitting(bool on) { mSplitting = on; }
@@ -3211,6 +3283,22 @@ public:
     /// functor is split. A step is then split only when the parabolic limit
     /// binds (parabolicStableDt below the hyperbolic dt, see setSplitting()).
     bool splitting() const { return mSplitting && kSplitSpeed; }
+    /// @brief Largest interface motion per step, in voxels: 0.5 (the
+    /// default) or 1.0 (see the class documentation, Full-voxel motion).
+    /// Every update's time step keeps max|F|*dt within this times cfl*dx,
+    /// as do kinematic objects and the volume-constraint correction.
+    /// @throw ValueError for any other value (the setting is unchanged).
+    void setMaxInterfaceMotion(double voxels)
+    {
+        if (voxels != lsmo_internal::kHalfVoxelMotion
+            && voxels != lsmo_internal::kFullVoxelMotion) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: max interface motion must be "
+                << lsmo_internal::kHalfVoxelMotion << " or " << lsmo_internal::kFullVoxelMotion
+                << " voxels (got " << voxels << ")");
+        }
+        mMaxMotion = voxels;
+    }
+    double maxInterfaceMotion() const { return mMaxMotion; }
     /// @brief Labels whose digital topology is preserved (default
     /// none): a label change a -> b at a voxel is applied only if the voxel is
     /// a simple point of every protected label in {a, b}.
@@ -3437,8 +3525,10 @@ public:
     }
 
 private:
-    /// Own label + 6 face labels.
+    /// Own label + 6 face labels (half-voxel motion).
     static constexpr int kMaxCandidates = 7;
+    /// Own label + 26 neighbor labels (full-voxel motion).
+    static constexpr int kMaxFullCandidates = 27;
     static constexpr bool kSplitSpeed = lsmo_internal::IsSplitSpeed<SpeedT>::value;
 
     /// The part of the speed a sub-update evaluates: operator(), or
@@ -3458,7 +3548,7 @@ private:
     /// Candidate labels of one voxel being built.
     struct CandidateSet
     {
-        std::array<int32_t, kMaxCandidates> label;
+        std::array<int32_t, kMaxFullCandidates> label;
         int n = 0;
         bool zero = false;
     };
@@ -3479,6 +3569,10 @@ private:
     {
         std::vector<VoxelEntry> entries;
         std::vector<Candidate> cand;
+        /// full-voxel motion: the projection base of each candidate (psi_l
+        /// for forward Euler, (psi_l^n + psi_l^(1))/2 for a second TVD-RK2
+        /// stage), parallel to cand; empty at half-voxel motion
+        std::vector<float> base;
         float maxSpeed = 0.0f;
         bool any = false;
     };
@@ -3596,7 +3690,10 @@ private:
             std::array<float, kLeafSize> phi;
             std::array<LabelT, kLeafSize> label;
         };
+        using MaskT = typename FloatTreeT::LeafNodeType::NodeMaskType;
         std::vector<Leaf> leaves;
+        /// active voxels of each leaf (kept at full-voxel motion only)
+        std::vector<MaskT> masks;
         std::unordered_map<Coord, size_t, lsmo_internal::CoordHash> index;
 
         /// The leaf at @a origin, null if there was none at time n.
@@ -3605,15 +3702,85 @@ private:
             const auto it = index.find(origin);
             return it == index.end() ? nullptr : &leaves[it->second];
         }
+
+        /// Time-n voxel lookups through the last leaf found (needs masks):
+        /// phi and activity (background, inactive where no leaf was kept)
+        /// and the label (that of @a current there).
+        template<typename LabelAccT>
+        struct View
+        {
+            View(const StageState& s, LabelAccT& current, float background)
+                : st(s), cur(current), bg(background) {}
+            View(const View&) = delete;
+            View& operator=(const View&) = delete;
+            /// Slot of the leaf of @a p, kNone if none was kept.
+            size_t slotOf(const Coord& p)
+            {
+                const Coord o = LeafMasks::originOf(p);
+                if (o != origin || !cached) {
+                    const auto it = st.index.find(o);
+                    origin = o;
+                    slot = it == st.index.end() ? kNone : it->second;
+                    cached = true;
+                }
+                return slot;
+            }
+            float phi(const Coord& p)
+            {
+                const size_t i = this->slotOf(p);
+                return i == kNone ? bg : st.leaves[i].phi[BoolLeafT::coordToOffset(p)];
+            }
+            bool active(const Coord& p)
+            {
+                const size_t i = this->slotOf(p);
+                return i != kNone && st.masks[i].isOn(BoolLeafT::coordToOffset(p));
+            }
+            int32_t label(const Coord& p)
+            {
+                const size_t i = this->slotOf(p);
+                return i == kNone ? static_cast<int32_t>(cur.getValue(p))
+                    : static_cast<int32_t>(st.leaves[i].label[BoolLeafT::coordToOffset(p)]);
+            }
+
+            static constexpr size_t kNone = std::numeric_limits<size_t>::max();
+            const StageState& st;
+            LabelAccT& cur;
+            float bg;
+            Coord origin;
+            size_t slot = kNone;
+            bool cached = false;
+        };
+        /// The phi accessor interface of closestPointPsi over a View.
+        template<typename ViewT>
+        struct PhiReader
+        {
+            float getValue(const Coord& p) const { return view.phi(p); }
+            bool probeValue(const Coord& p, float& v) const
+            {
+                v = view.phi(p);
+                return view.active(p);
+            }
+            ViewT& view;
+        };
+        /// The label accessor interface of closestPointPsi over a View.
+        template<typename ViewT>
+        struct LabelReader
+        {
+            int32_t getValue(const Coord& p) const { return view.label(p); }
+            ViewT& view;
+        };
+
         void release()
         {
             std::vector<Leaf>().swap(leaves);
+            std::vector<MaskT>().swap(masks);
             decltype(index)().swap(index);
         }
         size_t memUsage() const
         {
             // nodes (value plus about two pointers and a hash) and buckets
-            return leaves.capacity() * sizeof(Leaf) + index.size()
+            return leaves.capacity() * sizeof(Leaf) + masks.capacity() * sizeof(MaskT)
+                + index.size()
                 * (sizeof(typename decltype(index)::value_type) + 3 * sizeof(void*))
                 + index.bucket_count() * sizeof(void*);
         }
@@ -3668,6 +3835,7 @@ private:
             for (LeafData& d : data) {
                 recycle(d.entries);
                 recycle(d.cand);
+                recycle(d.base);
                 d.maxSpeed = 0.0f;
                 d.any = false;
             }
@@ -3704,7 +3872,9 @@ private:
         size_t memUsage() const
         {
             size_t n = vectorBytes(data);
-            for (const LeafData& d : data) n += vectorBytes(d.entries) + vectorBytes(d.cand);
+            for (const LeafData& d : data) {
+                n += vectorBytes(d.entries) + vectorBytes(d.cand) + vectorBytes(d.base);
+            }
             n += vectorBytes(deferred);
             n += size_t(freeze.memUsage()) + dirty.memUsage() + prevSeeds.memUsage();
             n += stage.memUsage();
@@ -3851,6 +4021,10 @@ private:
     void enforcePhiFloor();
 
     bool isProtected(int32_t l) const { return !mProtected.empty() && mProtected.count(l) != 0; }
+    /// Whether setMaxInterfaceMotion() is full-voxel motion.
+    bool fullMotion() const { return mMaxMotion == lsmo_internal::kFullVoxelMotion; }
+    /// The motion cap of an update (world units): maxInterfaceMotion()*cfl*dx.
+    double motionCap() const { return mMaxMotion * double(mCfl) * mMls.voxelSize(); }
     /// Whether a change @a from -> @a to involves a protected label.
     bool involvesProtected(int32_t from, int32_t to) const
     {
@@ -3883,6 +4057,19 @@ private:
     template<typename AcceptT, typename RejectT>
     void coloredPasses(const std::vector<std::vector<Deferred>>& deferred,
         const LabelTreeT& labels, const AcceptT& accept, const RejectT& reject) const;
+
+    /// Number of distinct labels other than @a own among the @a n labels
+    /// @a nb (at most two are counted).
+    static int otherLabels(int32_t own, const int32_t* nb, int n)
+    {
+        int32_t first = own;
+        for (int k = 0; k < n; ++k) {
+            if (nb[k] == own) continue;
+            if (first == own) first = nb[k];
+            else if (nb[k] != first) return 2;
+        }
+        return first == own ? 0 : 1;
+    }
 
     /// Add @a l to the candidates @a c: label 0 and fixed labels only make
     /// passive label 0 participate (a fixed label can never be captured).
@@ -3961,16 +4148,16 @@ private:
         }
     }
     /// Steps 1-2 of the class documentation on the current state: freeze
-    /// mask, projected set (voxels with phi <= @a projectedVoxels*dx or a
-    /// face neighbor of another label), candidates and their @a term speeds
-    /// (scratch). With @a stage0 (the time-n state of a TVD-RK2 update) the
-    /// candidates are those of its second stage.
-    Evaluation evaluate(Term term,
-        double projectedVoxels = lsmo_internal::kMaxInterfaceMotionVoxels,
-        const StageState* stage0 = nullptr);
-    /// @a dt limited so that interfaces move at most half a voxel.
+    /// mask, projected set, candidates and their @a term speeds (scratch;
+    /// at full-voxel motion also the projection base of every candidate).
+    /// With @a stage0 (the time-n state of a TVD-RK2 update) the projected
+    /// set and candidates are those of its second stage.
+    Evaluation evaluate(Term term, const StageState* stage0 = nullptr);
+    /// @a dt limited so that interfaces move at most maxInterfaceMotion()
+    /// times cfl*dx.
     float motionLimit(const Evaluation& e, float dt) const;
-    /// @a dt limited so that kinematic objects move at most half a voxel.
+    /// @a dt limited so that kinematic objects move at most
+    /// maxInterfaceMotion() times cfl*dx.
     float kinematicLimit(float dt) const;
     /// Steps 4-6 with time step @a dt, on the last evaluate(); kinematic
     /// labels are stamped at @a stampTime if @a stamp. With @a stage0 (the
@@ -4009,8 +4196,8 @@ private:
     float finishInterrupted(float elapsed);
 
     /// Two-smallest projection of @a e with candidates @a cand: v_l =
-    /// base(l) + dt*F_l (base(l) = psi_l of the voxel for forward Euler);
-    /// false if @a e has no non-zero candidate.
+    /// base(k, l) + dt*F_l for the k-th candidate l (base = psi_l of the
+    /// voxel for forward Euler); false if @a e has no non-zero candidate.
     /// An exact tie (phi 0) gets phi = @a barrier instead.
     template<typename BaseT>
     static bool project(const VoxelEntry& e, const Candidate* cand, float dt, const BaseT& base,
@@ -4031,7 +4218,7 @@ private:
         };
         for (int i = 0; i < e.n; ++i) {
             const int32_t l = cand[i].first;
-            const float v = base(l) + dt * cand[i].second;
+            const float v = base(i, l) + dt * cand[i].second;
             consider(l, v);
             minV = std::min(minV, v);
         }
@@ -4074,6 +4261,8 @@ private:
     float mTolerance;
     bool mFullRedistance = false;
     bool mSplitting = true;
+    /// largest interface motion per step (voxels)
+    double mMaxMotion = lsmo_internal::kDefaultMaxInterfaceMotionVoxels;
     /// whether the last step() stopped early on an interrupt
     bool mInterrupted = false;
     int mRedistanceIterations = 0;
@@ -4128,7 +4317,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     // 1-2. projected set, candidates and speeds, all on time-n data
     Evaluation e = this->evaluate(Term::Full);
 
-    // 3. time step: interfaces move at most half a voxel, so only projected
+    // 3. time step: interfaces move at most the motion cap, so only projected
     // voxels can change label
     float dt = std::min(maxDt, mSpeed.stableDt(float(mMls.voxelSize())));
     if (!e.any && mKinematic.empty()) {
@@ -4153,11 +4342,15 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 typename LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::Evaluation
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
-    double projectedVoxels, const StageState* stage0)
+    const StageState* stage0)
 {
     FloatTreeT& phi = mMls.phi()->tree();
     LabelTreeT& labels = mMls.labels()->tree();
     const double dx = mMls.voxelSize();
+    // half-voxel motion: depth of the projected set (twice as deep for the
+    // second TVD-RK2 stage)
+    const double projectedVoxels =
+        (stage0 ? lsmo_internal::kRk2StageMotionFactor : 1.0) * mMaxMotion;
     const float projectedPhi = float(projectedVoxels * dx);
     const Coord* offs = lsmo_internal::faceOffsets();
 
@@ -4181,14 +4374,21 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
     scratch.resetData(leafCount);
     std::vector<LeafData>& data = scratch.data;
     constexpr Index kLeafSize = FloatTreeT::LeafNodeType::SIZE;
+    const bool full = this->fullMotion();
+    const float bg = phi.background();
+    const double phiFloor = this->phiFloor();
     forEachIndex(leafCount, [&](size_t i) {
         const auto& leaf = leafs.leaf(i);
         LeafData& d = data[i];
         auto* maskLeaf = freeze.probeLeaf(leaf.origin());
         tree::ValueAccessor<const LabelTreeT> lab(labels);
         // staged on the stack so that the pooled lists get their exact size
+        // (at full-voxel motion the candidate labels and their projection
+        // bases are staged in vectors: up to 27 labels per voxel)
         VoxelEntry entries[kLeafSize];
         int32_t candLabels[kLeafSize * kMaxCandidates];
+        std::vector<int32_t> fullLabels;
+        std::vector<float> fullBase;
         size_t numEntries = 0, numCand = 0;
         // TVD-RK2 second stage: time-n label of voxel q (its current label
         // if q had no leaf at time n), through the last leaf looked up
@@ -4201,6 +4401,15 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
             return leaf0 ? static_cast<int32_t>(leaf0->label[BoolLeafT::coordToOffset(q)])
                          : current;
         };
+        // full-voxel motion: phi for closestPointPsi, and the time-n state
+        // of a second TVD-RK2 stage in the same accessor form
+        // (non-registering: the tree is not modified during the evaluation)
+        tree::ValueAccessor<const FloatTreeT, /*IsSafe=*/false> phiAcc(phi);
+        using ViewT = typename StageState::template View<tree::ValueAccessor<const LabelTreeT>>;
+        std::unique_ptr<ViewT> view0;
+        if (full && stage0) view0.reset(new ViewT(*stage0, lab, bg));
+        const Coord* ring = lsmo_internal::edgeCornerOffsets();
+        constexpr int kNear = 6 + lsmo_internal::kEdgeCornerNeighbors;
         for (auto it = leaf.cbeginValueOn(); it; ++it) {
             const Coord p = it.getCoord();
             const int32_t own = static_cast<int32_t>(lab.getValue(p));
@@ -4208,11 +4417,87 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
                 if (maskLeaf) maskLeaf->setValueOn(it.pos());
                 continue;
             }
-            int32_t nb[6];
+            int32_t nb[kNear]; // face labels, then edge and corner labels
             bool seed = false;
             for (int f = 0; f < 6; ++f) {
                 nb[f] = static_cast<int32_t>(lab.getValue(p + offs[f]));
                 seed |= nb[f] != own;
+            }
+            if (full) {
+                // Full-voxel motion: only voxels with another label (label
+                // 0 and fixed labels included) in their 26-neighborhood can
+                // change label; the others are redistanced (see the class
+                // documentation, Full-voxel motion).
+                bool nearOther = seed;
+                for (int k = 0; k < lsmo_internal::kEdgeCornerNeighbors; ++k) {
+                    nb[6 + k] = static_cast<int32_t>(lab.getValue(p + ring[k]));
+                    nearOther |= nb[6 + k] != own;
+                }
+                if (!nearOther) continue;
+                CandidateSet c;
+                this->addCandidate(c, own);
+                int32_t near0[1 + kNear];
+                if (stage0) {
+                    // Second stage: the labels a forward Euler step from
+                    // time n could give the voxel (its time-n label and
+                    // time-n 26-neighbor labels), and the current one.
+                    near0[0] = view0->label(p);
+                    for (int k = 0; k < kNear; ++k) {
+                        near0[1 + k] = view0->label(p + (k < 6 ? offs[k] : ring[k - 6]));
+                    }
+                    this->addCandidate(c, near0[0]);
+                    for (int k = 0; k < kNear; ++k) {
+                        if (std::find(near0, near0 + 1 + kNear, nb[k]) != near0 + 1 + kNear) {
+                            this->addCandidate(c, nb[k]);
+                        }
+                    }
+                } else {
+                    for (int k = 0; k < kNear; ++k) this->addCandidate(c, nb[k]);
+                }
+                // own label only (or passive label 0 only): cannot change
+                // label, and its new phi depends on the speed of a label
+                // that is not a candidate
+                if (c.n == 0 || (c.n == 1 && !c.zero)) continue;
+                if (maskLeaf) maskLeaf->setValueOn(it.pos());
+                VoxelEntry& e = entries[numEntries++];
+                e.offset = uint16_t(it.pos());
+                e.n = uint8_t(c.n);
+                e.zero = c.zero;
+                // psi_l: -phi for the own label; +phi for a face label if
+                // it is the only other label in the 26-neighborhood (phi is
+                // then the distance to their interface); else, at junctions
+                // and for edge and corner labels, closestPointPsi
+                const float phiP = *it;
+                const bool junction = otherLabels(own, nb, kNear) > 1;
+                auto psiNow = [&](int32_t l) {
+                    if (l == own) return -phiP;
+                    if (!junction && std::find(nb, nb + 6, l) != nb + 6) return phiP;
+                    return lsmo_internal::closestPointPsi(phiAcc, lab, p, l, dx, phiFloor);
+                };
+                const bool junction0 = stage0 && otherLabels(near0[0], near0 + 1, kNear) > 1;
+                for (int k = 0; k < c.n; ++k) {
+                    const int32_t l = c.label[k];
+                    fullLabels.push_back(l);
+                    if (!stage0) {
+                        fullBase.push_back(psiNow(l));
+                        continue;
+                    }
+                    // (psi_l^n + psi_l^(1)) / 2, psi_l^n by the same rule on
+                    // the time-n state
+                    const int32_t own0 = near0[0];
+                    float psi0;
+                    if (l == own0) {
+                        psi0 = -view0->phi(p);
+                    } else if (!junction0 && std::find(near0 + 1, near0 + 7, l) != near0 + 7) {
+                        psi0 = view0->phi(p);
+                    } else {
+                        typename StageState::template PhiReader<ViewT> phi0{*view0};
+                        typename StageState::template LabelReader<ViewT> lab0{*view0};
+                        psi0 = lsmo_internal::closestPointPsi(phi0, lab0, p, l, dx, phiFloor);
+                    }
+                    fullBase.push_back(lsmo_internal::kRk2AverageWeight * (psiNow(l) + psi0));
+                }
+                continue;
             }
             if (!seed && *it > projectedPhi) continue;
             if (maskLeaf) maskLeaf->setValueOn(it.pos());
@@ -4246,9 +4531,13 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
         }
         if (numEntries == 0) return;
         d.entries.assign(entries, entries + numEntries);
+        if (full) {
+            numCand = fullLabels.size();
+            d.base.assign(fullBase.begin(), fullBase.end());
+        }
         d.cand.reserve(numCand);
         StencilT stencil(mMls, mSpatialScheme);
-        const int32_t* l = candLabels;
+        const int32_t* l = full ? fullLabels.data() : candLabels;
         for (size_t k = 0; k < numEntries; ++k) {
             const Coord p = leaf.offsetToGlobalCoord(entries[k].offset);
             for (int j = 0; j < entries[k].n; ++j, ++l) {
@@ -4276,8 +4565,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::motionLimit(
     const Evaluation& e, float dt) const
 {
     if (e.any && e.maxSpeed > 0.0f) {
-        dt = std::min(dt, float(lsmo_internal::kMaxInterfaceMotionVoxels * mCfl
-            * mMls.voxelSize() / e.maxSpeed));
+        dt = std::min(dt, float(mMaxMotion * mCfl * mMls.voxelSize() / e.maxSpeed));
     }
     return dt;
 }
@@ -4288,8 +4576,8 @@ float
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::kinematicLimit(float dt) const
 {
     if (mKinematic.empty()) return dt;
-    // kinematic objects move at most kMaxInterfaceMotionVoxels*cfl*dx per step
-    const double limit = lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * mMls.voxelSize();
+    // kinematic objects move at most maxInterfaceMotion()*cfl*dx per step
+    const double limit = this->motionCap();
     for (int iter = 0; iter < lsmo_internal::kMaxKinematicShrinkIterations; ++iter) {
         const double d = this->kinematicDisplacement(mTime, mTime + double(dt));
         if (d <= limit) break;
@@ -4341,23 +4629,31 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
             constexpr float kHalf = lsmo_internal::kRk2AverageWeight;
             const float barrier = float(lsmo_internal::kBarrierPhiFraction * mMls.voxelSize());
             const Candidate* cand = d.cand.data();
+            // full-voxel motion: the bases evaluate() computed
+            const float* base = d.base.empty() ? nullptr : d.base.data();
+            OPENVDB_ASSERT(!base || d.base.size() == d.cand.size());
             for (const VoxelEntry& e : d.entries) {
                 const int32_t own = static_cast<int32_t>(labN.getValue(e.offset));
                 const float phiN = leaf.getValue(e.offset);
                 int32_t l; float v;
                 bool moved;
-                if (stage0) {
+                if (base) {
+                    const float* b = base;
+                    moved = project(e, cand, stage0 ? kHalf * dt : dt,
+                        [&](int k, int32_t) { return b[k]; }, barrier, l, v);
+                    base += e.n;
+                } else if (stage0) {
                     // v_l = (psi_l^n + psi_l^(1) + dt*F_l^(1)) / 2
                     const float phi0 = leaf0 ? leaf0->phi[e.offset] : bg;
                     const int32_t own0 =
                         leaf0 ? static_cast<int32_t>(leaf0->label[e.offset]) : own;
-                    moved = project(e, cand, kHalf * dt, [&](int32_t c) {
+                    moved = project(e, cand, kHalf * dt, [&](int, int32_t c) {
                         return kHalf * (((c == own) ? -phiN : phiN)
                             + ((c == own0) ? -phi0 : phi0));
                     }, barrier, l, v);
                 } else {
                     moved = project(e, cand, dt,
-                        [&](int32_t c) { return (c == own) ? -phiN : phiN; }, barrier, l, v);
+                        [&](int, int32_t c) { return (c == own) ? -phiN : phiN; }, barrier, l, v);
                 }
                 cand += e.n;
                 if (!moved) continue;
@@ -4408,11 +4704,9 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::integrate(
     this->update(dt, /*any=*/true, /*stamp=*/false, 0.0);
     // stage 2 on u1: a projected set twice as deep and twice the motion cap
     // (its values move by at most |u0 - u1|/2 + dt*|F(u1)|/2)
-    const Evaluation e2 = this->evaluate(term,
-        lsmo_internal::kRk2StageMotionFactor * lsmo_internal::kMaxInterfaceMotionVoxels,
-        &mScratch.stage);
-    const double cap = lsmo_internal::kRk2StageMotionFactor
-        * lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * mMls.voxelSize();
+    const Evaluation e2 = this->evaluate(term, &mScratch.stage);
+    const double cap = lsmo_internal::kRk2StageMotionFactor * mMaxMotion * mCfl
+        * mMls.voxelSize();
     if (e2.any && double(dt) * double(e2.maxSpeed) <= cap) {
         this->update(dt, /*any=*/true, stamp, stampTime, &mScratch.stage);
     } else {
@@ -4434,6 +4728,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::takeStage()
     tree::LeafManager<const FloatTreeT> leafs(phi);
     const size_t n = leafs.leafCount();
     st.leaves.resize(n);
+    if (this->fullMotion()) st.masks.resize(n);
     st.index.clear();
     st.index.reserve(n);
     for (size_t i = 0; i < n; ++i) st.index.emplace(leafs.leaf(i).origin(), i);
@@ -4441,6 +4736,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::takeStage()
         const auto& leaf = leafs.leaf(i);
         const auto* labLeaf = labels.probeConstLeaf(leaf.origin());
         typename StageState::Leaf& out = st.leaves[i];
+        if (!st.masks.empty()) st.masks[i] = leaf.getValueMask();
         for (Index k = 0; k < StageState::kLeafSize; ++k) {
             out.phi[k] = leaf.getValue(k);
             out.label[k] = labLeaf ? labLeaf->getValue(k)
@@ -4654,7 +4950,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyVolumeMultipliers(
     mLambda.clear();
     if (!e.any || !(dt > 0.0f)) return e;
     // the correction lambda*dt is limited to the motion cap
-    const double cap = lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * mMls.voxelSize();
+    const double cap = this->motionCap();
     for (size_t s = 0; s < mStepLabels.size(); ++s) {
         const int32_t l = mStepLabels[s];
         if (this->isFixed(l) || !mSpeed.isActive(l)) continue;
