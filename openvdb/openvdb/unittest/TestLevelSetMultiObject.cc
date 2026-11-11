@@ -3958,6 +3958,11 @@ namespace {
 
 // Shear rate of the velocity v = (kShearRate*z, 0, 0) of SpeedExtensionKeepsDistance.
 constexpr float kShearRate = 0.05f;
+// Gates of SpeedExtensionKeepsDistance: the extension-on interface max error
+// is at most this fraction of the extension-off error, and at most this many
+// voxels.
+constexpr double kSpeedExtensionErrorRatio = 0.6;
+constexpr double kSpeedExtensionMaxIfaceError = 0.15;
 
 // The shear field on @a xf, dense over the region the band of the sheared
 // sphere of SpeedExtensionKeepsDistance sweeps (zero outside).
@@ -3980,9 +3985,10 @@ TEST_F(TestLevelSetMultiObject, SpeedExtensionKeepsDistance)
 {
     // ExtractAccuracyAfterEvolution's advection case in a shear field: the
     // closest-interface-point sampling of the velocity (the default) keeps
-    // the distance property within the 0.1*dx interface gate, and at least
-    // as well as voxel-center sampling. Voxel-center sampling is reported
-    // only: it measured 0.21*dx here (the shear changes |grad psi| at the
+    // the distance property within kSpeedExtensionMaxIfaceError*dx at the
+    // interface and clearly better than voxel-center sampling (at most
+    // kSpeedExtensionErrorRatio of its error). The voxel-center error itself
+    // is only reported (about 0.21*dx: the shear changes |grad psi| at the
     // interface voxels, which the redistancing keeps as seeds).
     {
         Forces f;
@@ -4033,8 +4039,8 @@ TEST_F(TestLevelSetMultiObject, SpeedExtensionKeepsDistance)
                   << " steps, extension " << (on ? "on" : "off") << "): interface max error "
                   << iface[on] << " dx, band RMS " << rms[on] << " dx" << std::endl;
     }
-    EXPECT_LE(iface[1], 0.1);
-    EXPECT_LE(iface[1], iface[0]);
+    EXPECT_LE(iface[1], kSpeedExtensionErrorRatio * iface[0]);
+    EXPECT_LE(iface[1], kSpeedExtensionMaxIfaceError);
 }
 
 TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)

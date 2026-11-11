@@ -1949,8 +1949,10 @@ public:
     /// direct read of sampleAtCenter() does not apply). Where the closest
     /// point is undefined this is sampleAtCenter(@a grid, @a forceSampling).
     /// The value is cached per grid and point until the stencil moves to
-    /// another voxel; labels sharing the closest point (the two sides of an
-    /// interface, whose psi differ only in sign) share the sample.
+    /// another voxel (the point depends on the psi read by moveTo(), so a
+    /// stencil over another evolution stage samples anew); labels sharing
+    /// the closest point (the two sides of an interface, whose psi differ
+    /// only in sign) share the sample.
     float sampleAtClosestPoint(const FloatGrid& grid, bool forceSampling = false) const
     {
         return this->sample(grid, mScalarCache, forceSampling, /*closest=*/true);
@@ -2199,7 +2201,8 @@ private:
 /// interface correction (see the note below). The cost is one BoxSampler
 /// interpolation (8 voxel reads) per field and voxel instead of one direct
 /// read for fields on the level set's transform; the sample is shared by
-/// the labels of an interface. Where |grad psi|^2 < 1e-8 the voxel center is
+/// the labels of an interface, but not across TVD-RK2 stages (each stage
+/// samples at the closest point of its own psi). Where |grad psi|^2 < 1e-8 the voxel center is
 /// used. Off, fields are sampled at the voxel center, as in the reference
 /// implementation.
 ///
