@@ -3371,6 +3371,250 @@ TEST_F(TestLevelSetMultiObject, Weno5ReducesVortexLoss)
 
 
 ////////////////////////////////////////
+// Volume constraints
+
+namespace {
+
+// (LabelSpeed: per-label constant dpsi/dt, defined above.)
+bool allPhiFinite(const MLS& m)
+{
+    for (auto it = m.phi()->tree().cbeginValueAll(); it; ++it) {
+        if (!std::isfinite(*it)) return false;
+    }
+    return true;
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, VolumeConstraintApi)
+{
+    using Evolver = tools::LevelSetMultiObject<MLS, LabelSpeed>;
+    // labelVolume: a sphere of radius 8 (dx 1 and 0.5) within 1% of 4/3 pi r^3;
+    // an absent label has volume 0
+    const double r = 8.0;
+    const double exact = 4.0 / 3.0 * math::pi<double>() * r * r * r;
+    for (const double dx : {1.0, 0.5}) {
+        auto m = makeSphere(r, Vec3d(0.0), dx);
+        LabelSpeed speed;
+        Evolver e(*m, speed);
+        const double v = e.labelVolume(1);
+        std::cout << "VolumeConstraintApi: dx " << dx << " sphere volume " << v << " (exact "
+                  << exact << ")" << std::endl;
+        EXPECT_NEAR(v, exact, 0.01 * exact) << "dx " << dx;
+        EXPECT_EQ(e.labelVolume(7), 0.0);
+    }
+
+    auto m = makeSphere(r);
+    LabelSpeed speed;
+    speed.fixed = {2};
+    Evolver e(*m, speed);
+    EXPECT_DOUBLE_EQ(e.volumeRelaxation(), 0.5);
+    EXPECT_THROW(e.setVolumeConstraint(0, 1.0), ValueError);  // passive label 0
+    EXPECT_THROW(e.preserveInitialVolume(0), ValueError);
+    EXPECT_THROW(e.setVolumeConstraint(2, 1.0), ValueError);  // fixed
+    EXPECT_THROW(e.setVolumeConstraint(1, -1.0), ValueError); // negative target
+    EXPECT_THROW(e.setVolumeConstraint(1, std::numeric_limits<double>::quiet_NaN()), ValueError);
+    EXPECT_THROW(e.setVolumeRelaxation(0.0), ValueError);
+    EXPECT_THROW(e.setVolumeRelaxation(1.5), ValueError);
+    auto still = [](double) { return math::Mat4d::identity(); };
+    e.setKinematicLabel(3, tools::createLevelSetSphere<FloatGrid>(2.0f, Vec3f(20.0f), 1.0f), still);
+    EXPECT_THROW(e.setVolumeConstraint(3, 1.0), ValueError);  // kinematic
+    EXPECT_THROW(e.preserveInitialVolume(3), ValueError);
+    e.clearKinematicLabel(3);
+    e.preserveInitialVolume(1);
+    EXPECT_THROW(e.setKinematicLabel(1, tools::createLevelSetSphere<FloatGrid>(2.0f,
+        Vec3f(20.0f), 1.0f), still), ValueError); // constrained labels cannot become kinematic
+    EXPECT_EQ(e.volumeConstraints().size(), size_t(1));
+    EXPECT_DOUBLE_EQ(e.volumeConstraints().at(1), e.labelVolume(1));
+
+    // Growth to a target with zero speed: the constraint alone moves the
+    // interface, to within 1% of the target of a radius-9 sphere's volume.
+    const double target = 4.0 / 3.0 * math::pi<double>() * 729.0;
+    e.setVolumeConstraint(1, target);
+    for (int n = 0; n < 20; ++n) {
+        const float dt = e.step(1.0f);
+        ASSERT_TRUE(std::isfinite(dt) && dt > 0.0f);
+    }
+    std::string msg;
+    ASSERT_TRUE(m->validate(&msg)) << msg;
+    const double v = e.labelVolume(1);
+    std::cout << "VolumeConstraintApi: grown to " << v << " (target " << target << ")" << std::endl;
+    EXPECT_NEAR(v, target, 0.01 * target);
+    EXPECT_NEAR(meanRadius(zeroCrossings(*m->extractSignedDistance(1)), Vec3d(0.0)), 9.0, 0.25);
+
+    // Cleared: zero speed leaves the volume where it is.
+    e.clearVolumeConstraints();
+    EXPECT_TRUE(e.volumeConstraints().empty());
+    for (int n = 0; n < 5; ++n) e.step(1.0f);
+    EXPECT_NEAR(e.labelVolume(1), v, 1e-3 * v);
+}
+
+TEST_F(TestLevelSetMultiObject, VolumeConstraintCancelsDrift)
+{
+    // A sphere of radius 8 under a uniform shrinking speed (dpsi/dt = 0.5)
+    // for t = 10: unconstrained it loses most of its volume; constrained to
+    // its initial volume the mean-speed term cancels the drift, so it ends
+    // within 2% (a proportional correction alone would lag by about one
+    // step's drift divided by the relaxation).
+    double change[2] = {0.0, 0.0};
+    for (int k = 0; k < 2; ++k) {
+        auto m = makeSphere(8.0);
+        LabelSpeed speed;
+        speed.speeds[1] = 0.5f;
+        tools::LevelSetMultiObject<MLS, LabelSpeed> e(*m, speed);
+        const double v0 = e.labelVolume(1);
+        if (k == 1) e.preserveInitialVolume(1);
+        e.advect(0.0, 10.0);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        change[k] = e.labelVolume(1) / v0 - 1.0;
+        std::cout << "VolumeConstraintCancelsDrift: " << (k ? "constrained" : "unconstrained")
+                  << " volume change " << 100.0 * change[k] << "%" << std::endl;
+    }
+    EXPECT_LT(change[0], -0.5);
+    EXPECT_LE(std::abs(change[1]), 0.02);
+}
+
+TEST_F(TestLevelSetMultiObject, VolumeConstraintVanishingLabel)
+{
+    // Three separate spheres: label 1 (radius 4) vanishes under a strong
+    // inward speed (dpsi/dt = 2) while label 2 (radius 6, zero speed) keeps
+    // its initial volume; label 3 (radius 4, zero speed) is driven to a
+    // target volume of 0 by its own constraint and vanishes too. Every step
+    // keeps phi and the volumes finite and validate() true; the vanished
+    // labels then have volume 0 (their constraint is skipped).
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(4.0f, Vec3f(-14.0f, 0.0f, 0.0f), 1.0f);
+    in[2] = tools::createLevelSetSphere<FloatGrid>(6.0f, Vec3f(0.0f), 1.0f);
+    in[3] = tools::createLevelSetSphere<FloatGrid>(4.0f, Vec3f(14.0f, 0.0f, 0.0f), 1.0f);
+    auto m = MLS::fromSignedGrids(in);
+    LabelSpeed speed;
+    speed.speeds[1] = 2.0f;
+    tools::LevelSetMultiObject<MLS, LabelSpeed> e(*m, speed);
+    e.preserveInitialVolume(2);
+    e.setVolumeConstraint(3, 0.0);
+    const double v2 = e.labelVolume(2);
+    int gone1 = -1, gone3 = -1;
+    for (int n = 0; n < 60; ++n) {
+        const float dt = e.step(1.0f);
+        ASSERT_TRUE(std::isfinite(dt) && dt > 0.0f) << "step " << n;
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+        ASSERT_TRUE(allPhiFinite(*m)) << "step " << n;
+        for (int32_t l = 1; l <= 3; ++l) {
+            ASSERT_TRUE(std::isfinite(e.labelVolume(l))) << "step " << n << " label " << l;
+        }
+        const auto ls = m->labelSet();
+        if (gone1 < 0 && !std::count(ls.begin(), ls.end(), 1)) gone1 = n;
+        if (gone3 < 0 && !std::count(ls.begin(), ls.end(), 3)) gone3 = n;
+    }
+    std::cout << "VolumeConstraintVanishingLabel: label 1 gone at step " << gone1
+              << ", label 3 at step " << gone3 << ", label 2 volume " << v2 << " -> "
+              << e.labelVolume(2) << std::endl;
+    EXPECT_GE(gone1, 0) << "label 1 did not vanish";
+    EXPECT_GE(gone3, 0) << "label 3 did not vanish";
+    EXPECT_EQ(e.labelVolume(1), 0.0);
+    EXPECT_EQ(e.labelVolume(3), 0.0);
+    EXPECT_NEAR(e.labelVolume(2), v2, 0.02 * v2);
+    EXPECT_EQ(countOrphans(*m), Index64(0));
+}
+
+TEST_F(TestLevelSetMultiObject, VolumeConstraintVortex)
+{
+    // The VortexEightObjects run (default schemes, same schedule) three
+    // times: unconstrained (baseline), with every label constrained to its
+    // initial volume (preserveInitialVolume, default relaxation 0.5), and
+    // mixed, with the contact pairs 1-5 and 2-6 constrained and 3-7, 4-8
+    // not. Volumes are the evolver's labelVolume().
+    // Gates: constrained labels end within 2% of their initial volume
+    // (all-constrained and mixed runs); >= 4 contact pairs at every chunk
+    // after first contact and validate() at every chunk; in the mixed run
+    // the unconstrained labels (which touch only each other) end within 1
+    // percentage point of their baseline volume change.
+    const Vortex vortex;
+    const std::map<int32_t, FloatGrid::ConstPtr> in = vortex.inputs();
+    Vec3SGrid::Ptr vel = vortex.velocity();
+    struct Run
+    {
+        std::map<int32_t, double> v0, v1, worst;
+        std::map<int32_t, Index64> n0, n1;
+        size_t steps = 0;
+        double t = 0.0, tContact = -1.0, secs = 0.0;
+        size_t minPairsAfter = 0;
+    };
+    auto run = [&](const std::set<int32_t>& constrained, const char* name) {
+        Run res;
+        auto m = MLS::fromSignedGrids(in, 3);
+        res.n0 = labelVoxelCounts(*m);
+        Vortex::Evolver* ev = nullptr;
+        res.minPairsAfter = std::numeric_limits<size_t>::max();
+        const auto start = std::chrono::steady_clock::now();
+        res.t = vortex.run(*m, vel, res.steps, res.tContact,
+            [&](double tc, size_t, const std::set<std::pair<int32_t, int32_t>>& p, int after) {
+                std::string msg;
+                if (!m->validate(&msg)) {
+                    ADD_FAILURE() << name << " t " << tc << ": " << msg;
+                    return false;
+                }
+                if (!allPhiFinite(*m)) {
+                    ADD_FAILURE() << name << " t " << tc << ": NaN or inf phi";
+                    return false;
+                }
+                if (after >= 1) res.minPairsAfter = std::min(res.minPairsAfter, p.size());
+                for (int32_t l = 1; l <= 8; ++l) {
+                    const double v = ev->labelVolume(l);
+                    res.v1[l] = v;
+                    res.worst[l] = std::max(res.worst[l], std::abs(v / res.v0[l] - 1.0));
+                }
+                return true;
+            },
+            [&](Vortex::Evolver& e) {
+                ev = &e;
+                for (int32_t l = 1; l <= 8; ++l) res.v0[l] = e.labelVolume(l);
+                for (const int32_t l : constrained) e.preserveInitialVolume(l);
+            });
+        res.secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        res.n1 = labelVoxelCounts(*m);
+        std::cout << "VolumeConstraintVortex: " << name << ": t " << res.t << ", " << res.steps
+                  << " steps, " << res.secs << " s (" << 1e3 * res.secs / double(res.steps)
+                  << " ms/step), first contact " << res.tContact << ", min pairs after contact "
+                  << res.minPairsAfter << std::endl;
+        for (int32_t l = 1; l <= 8; ++l) {
+            std::cout << "VolumeConstraintVortex: " << name << ": label " << l
+                      << (constrained.count(l) ? " (constrained)" : "") << " volume "
+                      << res.v0[l] << " -> " << res.v1[l] << " ("
+                      << 100.0 * (res.v1[l] / res.v0[l] - 1.0) << "%, worst over chunks "
+                      << 100.0 * res.worst[l] << "%), voxels " << res.n0[l] << " -> "
+                      << (res.n1.count(l) ? res.n1[l] : 0) << std::endl;
+        }
+        return res;
+    };
+    const Run base = run({}, "unconstrained");
+    ASSERT_FALSE(::testing::Test::HasFailure());
+    const Run all = run({1, 2, 3, 4, 5, 6, 7, 8}, "all constrained");
+    ASSERT_FALSE(::testing::Test::HasFailure());
+    const std::set<int32_t> mixedSet{1, 2, 5, 6};
+    const Run mixed = run(mixedSet, "mixed");
+    ASSERT_FALSE(::testing::Test::HasFailure());
+
+    EXPECT_GE(all.tContact, 0.0);
+    EXPECT_GE(all.minPairsAfter, size_t(4));
+    EXPECT_GE(mixed.minPairsAfter, size_t(4));
+    EXPECT_EQ(all.t, Vortex::kEndTime);
+    for (int32_t l = 1; l <= 8; ++l) {
+        EXPECT_LE(std::abs(all.v1.at(l) / all.v0.at(l) - 1.0), 0.02) << "label " << l;
+        const double change = mixed.v1.at(l) / mixed.v0.at(l) - 1.0;
+        if (mixedSet.count(l)) {
+            EXPECT_LE(std::abs(change), 0.02) << "mixed, label " << l;
+        } else {
+            const double baseChange = base.v1.at(l) / base.v0.at(l) - 1.0;
+            EXPECT_LE(std::abs(change - baseChange), 0.01) << "mixed, unconstrained label " << l;
+        }
+    }
+}
+
+
+////////////////////////////////////////
 // Topology-preserving evolution
 
 namespace {

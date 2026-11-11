@@ -198,6 +198,12 @@ constexpr int kWeno5StencilRadius = 3;
 constexpr double kRk2StageMotionFactor = 2.0;
 /// TVD-RK2: weight of each of the two stage values in their average.
 constexpr float kRk2AverageWeight = 0.5f;
+/// Default relaxation of the volume constraints: the fraction of a label's
+/// volume error corrected per step (dimensionless).
+constexpr double kDefaultVolumeRelaxation = 0.5;
+/// A volume constraint is skipped for a step when the label's interface area
+/// times the step's time step is at most this (world area times time).
+constexpr double kVolumeConstraintMinAreaDt = 1e-12;
 /// Primes of CoordHash, one per component (the usual spatial-hash primes).
 constexpr uint64_t kCoordHashPrimeX = 73856093u;
 constexpr uint64_t kCoordHashPrimeY = 19349669u;
@@ -3012,6 +3018,44 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// advanced: the parabolic time done if the hyperbolic part has not run,
 /// else dt (the parabolic part then lags by less than dt/2).
 ///
+/// <b>Volume constraints</b> (optional, off by default;
+/// setVolumeConstraint(), preserveInitialVolume()). A constrained label l
+/// gets a uniform normal speed lambda_l (a Lagrange-multiplier pressure)
+/// added to its hyperbolic speed (to operator() for an unsplit functor),
+/// so it takes part in the motion limit and in every stage of a TVD-RK2
+/// update. At the start of each step the volume V_l, the interface area
+/// A_l and the mean speed <F_l> are measured on the time-n state; the
+/// step's time step dt is chosen from the speeds without lambda (as above),
+/// then lambda_l = -<F_l> + relaxation*(V_l - V_target)/(A_l*dt)
+/// (setVolumeRelaxation(), default 0.5). <F_l> is the area-weighted mean,
+/// over the label's interface voxels (weights: their faces' terms of A_l
+/// below), of the label's own full speed dpsi_l/dt (operator(): hyperbolic
+/// plus parabolic parts). Since positive speeds shrink a label, the flow
+/// changes V_l by about -<F_l>*A_l per unit time: the first term cancels
+/// that predicted change and the second removes a fraction of the error
+/// per step. The correction lambda_l*dt is limited to the motion cap
+/// 0.5*cfl*dx, is added to the evaluated speeds, and dt is reduced if the
+/// motion limit of the new speeds requires it (never increased). The same
+/// lambda_l serves every sub-update and stage of the step (all parts of a
+/// split step). lambda_l is 0 for that step if V_l = 0 (a vanished label)
+/// or A_l*dt <= 1e-12, and for labels that are fixed or inactive.
+/// - V_l = dx^3 * (N_l + C_l): N_l the voxels of label l in the label tree
+///   (tiles by their voxel count) and C_l the sub-voxel correction: every
+///   active voxel p with phi < 0.5*dx and a face neighbor of another label
+///   gives the part 1/2 - phi(p)/dx of itself, the part beyond its
+///   interface, to the label b of its smallest-phi such neighbor (ties: the
+///   lower label); C_l is what label l receives minus what it gives. This is
+///   exact for a planar interface between voxel centers and keeps the
+///   volumes of all labels summing to the voxel count times dx^3.
+/// - A_l = dx * sum, over the faces between a voxel p of label l and a face
+///   neighbor q of another label, of min(phi(p) + phi(q), dx): for a
+///   distance field phi(p) + phi(q) = dx*|n_axis| (the gradient component
+///   |d psi_l/d axis| times dx), so each face contributes |n_axis|*dx^2 and
+///   the sum is exact for planar interfaces.
+/// Both are sums over leaves reduced in leaf order, so they do not depend on
+/// the grain size. The mean speed needs one more speed evaluation per
+/// interface voxel of each constrained label and step.
+///
 /// <b>Kinematic labels</b> (setKinematicLabel()) are rigid obstacles whose
 /// region is prescribed: a signed distance grid of the object in its rest
 /// pose and a rigid motion of time. They are treated like fixed labels by
@@ -3229,7 +3273,8 @@ public:
     /// labels, nor change their phi.
     /// @throw ValueError if @a label is 0 or outside the range of the label
     /// tree's value type, @a sdf is null, @a motion is empty, @a label is
-    /// topology-preserving or label 0 is.
+    /// topology-preserving or volume-constrained, or label 0 is
+    /// topology-preserving.
     void setKinematicLabel(int32_t label, FloatGrid::ConstPtr sdf,
         std::function<math::Mat4d(double)> motion)
     {
@@ -3248,6 +3293,10 @@ public:
                 "LevelSetMultiObject: no kinematic labels while label 0 is topology-preserving");
         }
         if (!motion) OPENVDB_THROW(ValueError, "LevelSetMultiObject: empty kinematic motion");
+        if (mVolumeTargets.count(label)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: volume-constrained label " << label
+                << " cannot be kinematic");
+        }
         Kinematic k;
         k.sdf = std::move(sdf);
         k.motion = std::move(motion);
@@ -3265,6 +3314,56 @@ public:
     }
     /// @brief Make @a label an ordinary label again (its voxels stay).
     void clearKinematicLabel(int32_t label) { mKinematic.erase(label); mPrimed = false; }
+
+    /// @brief Constrain the volume of @a label to @a targetVolume (world
+    /// units cubed): each step adds the uniform normal speed lambda of the
+    /// class documentation (Volume constraints) to the label's hyperbolic
+    /// speed. Off by default; replaces an earlier target of the label.
+    /// @throw ValueError if @a label is 0, fixed (speed.isFixed) or
+    /// kinematic, or if @a targetVolume is negative or not finite.
+    void setVolumeConstraint(int32_t label, double targetVolume)
+    {
+        this->checkConstrainable(label);
+        if (!(targetVolume >= 0.0) || !std::isfinite(targetVolume)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: volume target of label " << label
+                << " must be finite and non-negative");
+        }
+        mVolumeTargets[label] = targetVolume;
+    }
+    /// @brief setVolumeConstraint(@a label, labelVolume(@a label)).
+    /// @throw ValueError as setVolumeConstraint().
+    void preserveInitialVolume(int32_t label)
+    {
+        this->checkConstrainable(label);
+        this->setVolumeConstraint(label, this->labelVolume(label));
+    }
+    /// @brief Remove every volume constraint.
+    void clearVolumeConstraints() { mVolumeTargets.clear(); mLambda.clear(); }
+    /// @brief The volume targets by label.
+    const std::map<int32_t, double>& volumeConstraints() const { return mVolumeTargets; }
+    /// @brief Fraction of a constrained label's volume error corrected per
+    /// step (default 0.5).
+    /// @throw ValueError unless 0 < @a relaxation <= 1 (larger values
+    /// overshoot the target).
+    void setVolumeRelaxation(double relaxation)
+    {
+        if (!(relaxation > 0.0 && relaxation <= 1.0)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: volume relaxation must be in (0, 1]");
+        }
+        mVolumeRelaxation = relaxation;
+    }
+    double volumeRelaxation() const { return mVolumeRelaxation; }
+    /// @brief Volume of the region of @a label (world units cubed; 0 if the
+    /// label has no voxel): its voxel count times dx^3 plus the sub-voxel
+    /// interface correction of the class documentation (Volume
+    /// constraints). The volumes of all labels, 0 included, sum to the
+    /// voxel count of the label tree times dx^3.
+    double labelVolume(int32_t label) const
+    {
+        std::vector<double> volume, area;
+        this->measureVolumes(std::vector<int32_t>{label}, volume, area);
+        return volume[0];
+    }
     /// @brief Time of the current state (set by advect(); step() advances it
     /// by the time step taken). Kinematic labels are stamped at this time
     /// plus the step.
@@ -3802,11 +3901,53 @@ private:
         }
         s.moveTo(ijk, label);
         if constexpr (kSplitSpeed) {
-            if (term == Term::Hyperbolic) return mSpeed.hyperbolic(ijk, label, s);
+            if (term == Term::Hyperbolic) {
+                return mSpeed.hyperbolic(ijk, label, s) + this->multiplier(label);
+            }
             if (term == Term::Parabolic) return mSpeed.parabolic(ijk, label, s);
         }
-        return mSpeed(ijk, label, s);
+        return mSpeed(ijk, label, s) + this->multiplier(label);
     }
+
+    /// The volume-constraint speed lambda of @a label in the current step
+    /// (0 if none).
+    float multiplier(int32_t label) const
+    {
+        if (mLambda.empty()) return 0.0f;
+        const auto it = mLambda.find(label);
+        return it == mLambda.end() ? 0.0f : it->second;
+    }
+    /// @throw ValueError if @a label cannot be volume-constrained.
+    void checkConstrainable(int32_t label) const
+    {
+        if (label == 0) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: passive label 0 cannot be"
+                " volume-constrained");
+        }
+        if (this->isKinematic(label)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: kinematic label " << label
+                << " cannot be volume-constrained");
+        }
+        if (this->isFixed(label)) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: fixed label " << label
+                << " cannot be volume-constrained");
+        }
+    }
+    /// Volume (labelVolume()) and interface area estimate of each label of
+    /// @a labels (see the class documentation, Volume constraints).
+    /// With @a meanSpeed, also the area-weighted mean over each label's
+    /// interface voxels of its own full speed (operator(), the sum of the
+    /// hyperbolic and parabolic parts) on the current state.
+    void measureVolumes(const std::vector<int32_t>& labels, std::vector<double>& volume,
+        std::vector<double>& area, std::vector<double>* meanSpeed = nullptr) const;
+    /// Start of a step: clear the multipliers and measure the constrained
+    /// labels on the time-n state. @return whether any label is constrained.
+    bool beginVolumeStep();
+    /// The multipliers of the step for the time step @a dt chosen from the
+    /// speeds without them; @a e (the evaluation those speeds came from,
+    /// whose candidate speeds are in the scratch) gets them added.
+    /// @return @a e with the multipliers.
+    Evaluation applyVolumeMultipliers(const Evaluation& e, float dt);
 
     /// Stable time step of the parabolic part (speed.stableDt if the
     /// functor has no parabolicStableDt).
@@ -3943,6 +4084,15 @@ private:
     /// whether the pair was last redistanced by this evolver (incremental
     /// redistancing needs a redistanced state outside the dirty region)
     bool mPrimed = false;
+    /// volume targets (ordered: the measurement visits them in label order)
+    std::map<int32_t, double> mVolumeTargets;
+    /// lambda of the current step per constrained label (hashed: looked up
+    /// for every speed evaluation)
+    std::unordered_map<int32_t, float> mLambda;
+    double mVolumeRelaxation = lsmo_internal::kDefaultVolumeRelaxation;
+    /// labels, volumes and areas measured at the start of the current step
+    std::vector<int32_t> mStepLabels;
+    std::vector<double> mStepVolumes, mStepAreas, mStepMeanSpeeds;
     Scratch mScratch;
     size_t mPeakScratchBytes = 0;
 };
@@ -3955,20 +4105,28 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     mInterrupted = false;
     if (!(maxDt > 0.0f)) return 0.0f;
     mPeakScratchBytes = 0;
+    // volume constraints: volumes and areas on the time-n state, the
+    // multipliers once the time step is known (fixed for the whole step)
+    const bool constrained = this->beginVolumeStep();
     if (this->splitting()) {
         // split only if the parabolic limit is below the hyperbolic dt
         const float pStable = this->parabolicStableDt();
         if (pStable > 0.0f && pStable < maxDt) { // false for +inf
-            const Evaluation h = this->evaluate(Term::Hyperbolic);
+            Evaluation h = this->evaluate(Term::Hyperbolic);
             if (h.any) {
-                const float dt = this->kinematicLimit(this->motionLimit(h, maxDt));
+                float dt = this->kinematicLimit(this->motionLimit(h, maxDt));
+                if (constrained) {
+                    h = this->applyVolumeMultipliers(h, dt);
+                    dt = std::min(dt, this->kinematicLimit(this->motionLimit(h, maxDt)));
+                }
                 if (pStable < dt) return this->splitStep(dt);
+                mLambda.clear(); // unsplit: recomputed for its own time step
             }
         }
     }
 
     // 1-2. projected set, candidates and speeds, all on time-n data
-    const Evaluation e = this->evaluate(Term::Full);
+    Evaluation e = this->evaluate(Term::Full);
 
     // 3. time step: interfaces move at most half a voxel, so only projected
     // voxels can change label
@@ -3978,6 +4136,11 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
         return dt; // no non-zero candidate anywhere: nothing moves
     }
     dt = this->kinematicLimit(this->motionLimit(e, dt));
+    if (constrained) {
+        const float dt0 = dt;
+        e = this->applyVolumeMultipliers(e, dt0);
+        dt = std::min(dt0, this->kinematicLimit(this->motionLimit(e, dt0)));
+    }
 
     // 4-6. projection, deferred changes, kinematic labels at t_{n+1}, orphan
     // cleanup, band maintenance (per stage for TVD-RK2)
@@ -4351,6 +4514,175 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::finishInterrupted(float
     mInterrupted = true;
     mTime += elapsed;
     return elapsed;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::measureVolumes(
+    const std::vector<int32_t>& labels, std::vector<double>& volume,
+    std::vector<double>& area, std::vector<double>* meanSpeed) const
+{
+    const size_t k = labels.size();
+    volume.assign(k, 0.0);
+    area.assign(k, 0.0);
+    if (meanSpeed) meanSpeed->assign(k, 0.0);
+    if (k == 0) return;
+    std::unordered_map<int32_t, size_t> slots;
+    for (size_t s = 0; s < k; ++s) slots.emplace(labels[s], s);
+    constexpr size_t kNone = std::numeric_limits<size_t>::max();
+    auto slotOf = [&](int32_t l) {
+        const auto it = slots.find(l);
+        return it == slots.end() ? kNone : it->second;
+    };
+    const FloatTreeT& phi = mMls.phi()->tree();
+    const LabelTreeT& labelTree = mMls.labels()->tree();
+    const double dx = mMls.voxelSize();
+    const float halfDx = float(0.5 * dx);
+    const Coord* offs = lsmo_internal::faceOffsets();
+
+    // Per-leaf partial sums, reduced serially in leaf order (independent of
+    // the grain size): voxel counts per label leaf; sub-voxel corrections
+    // (voxels), face areas (world) and area-weighted speeds per phi leaf.
+    tree::LeafManager<const LabelTreeT> labelLeafs(labelTree);
+    tree::LeafManager<const FloatTreeT> phiLeafs(phi);
+    std::vector<double> counts(labelLeafs.leafCount() * k, 0.0);
+    constexpr size_t kSums = 3; // correction, area, area-weighted speed
+    std::vector<double> sums(phiLeafs.leafCount() * kSums * k, 0.0);
+    forEachIndex(labelLeafs.leafCount(), [&](size_t i) {
+        const auto& leaf = labelLeafs.leaf(i);
+        double* out = &counts[i * k];
+        int32_t last = 0;
+        size_t lastSlot = slotOf(0);
+        for (Index n = 0; n < LabelTreeT::LeafNodeType::SIZE; ++n) {
+            const int32_t a = static_cast<int32_t>(leaf.getValue(n));
+            if (a != last) { last = a; lastSlot = slotOf(a); }
+            if (lastSlot != kNone) out[lastSlot] += 1.0;
+        }
+    });
+    forEachIndex(phiLeafs.leafCount(), [&](size_t i) {
+        const auto& leaf = phiLeafs.leaf(i);
+        double* corr = &sums[i * kSums * k];
+        double* faces = corr + k;
+        double* speeds = faces + k;
+        std::unique_ptr<StencilT> stencil;
+        tree::ValueAccessor<const FloatTreeT> phiAcc(phi);
+        tree::ValueAccessor<const LabelTreeT> lab(labelTree);
+        for (auto it = leaf.cbeginValueOn(); it; ++it) {
+            const Coord p = it.getCoord();
+            const int32_t a = static_cast<int32_t>(lab.getValue(p));
+            const size_t sa = slotOf(a);
+            const float phiP = *it;
+            // the face neighbor of another label with the smallest phi
+            bool other = false;
+            int32_t b = 0;
+            float phiB = 0.0f;
+            double faceArea = 0.0;
+            for (int f = 0; f < 6; ++f) {
+                const Coord q = p + offs[f];
+                const int32_t c = static_cast<int32_t>(lab.getValue(q));
+                if (c == a) continue;
+                const float phiQ = phiAcc.getValue(q);
+                faceArea += std::min(double(phiP) + double(phiQ), dx) * dx;
+                if (!other || phiQ < phiB || (phiQ == phiB && c < b)) {
+                    other = true;
+                    b = c;
+                    phiB = phiQ;
+                }
+            }
+            if (sa != kNone && faceArea > 0.0) {
+                faces[sa] += faceArea;
+                if (meanSpeed && mSpeed.isActive(a)) {
+                    if (!stencil) stencil.reset(new StencilT(mMls, mSpatialScheme));
+                    speeds[sa] += faceArea
+                        * double(this->evalSpeed(*stencil, p, a, Term::Full));
+                }
+            }
+            if (!other || !(phiP < halfDx)) continue;
+            // the part 1/2 - phi/dx of the voxel beyond its interface
+            // belongs to label b
+            const double frac = 0.5 - double(phiP) / dx;
+            if (sa != kNone) corr[sa] -= frac;
+            const size_t sb = slotOf(b);
+            if (sb != kNone) corr[sb] += frac;
+        }
+    });
+    std::vector<double> voxels(k, 0.0);
+    for (size_t i = 0; i < labelLeafs.leafCount(); ++i) {
+        for (size_t s = 0; s < k; ++s) voxels[s] += counts[i * k + s];
+    }
+    // tiles of the label tree (above the leaf level)
+    auto tile = labelTree.cbeginValueAll();
+    tile.setMaxDepth(LabelTreeT::ValueAllCIter::LEAF_DEPTH - 1);
+    for (; tile; ++tile) {
+        const size_t s = slotOf(static_cast<int32_t>(*tile));
+        if (s != kNone) voxels[s] += double(tile.getVoxelCount());
+    }
+    for (size_t i = 0; i < phiLeafs.leafCount(); ++i) {
+        for (size_t s = 0; s < k; ++s) {
+            voxels[s] += sums[i * kSums * k + s];
+            area[s] += sums[i * kSums * k + k + s];
+            if (meanSpeed) (*meanSpeed)[s] += sums[i * kSums * k + 2 * k + s];
+        }
+    }
+    for (size_t s = 0; s < k; ++s) {
+        volume[s] = std::max(0.0, voxels[s]) * dx * dx * dx;
+        if (meanSpeed) (*meanSpeed)[s] = area[s] > 0.0 ? (*meanSpeed)[s] / area[s] : 0.0;
+    }
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+bool
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::beginVolumeStep()
+{
+    mLambda.clear();
+    if (mVolumeTargets.empty()) return false;
+    mStepLabels.clear();
+    for (const auto& kv : mVolumeTargets) mStepLabels.push_back(kv.first);
+    // (mLambda is empty here, so the mean speeds are those of the functor)
+    this->measureVolumes(mStepLabels, mStepVolumes, mStepAreas, &mStepMeanSpeeds);
+    return true;
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+typename LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::Evaluation
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::applyVolumeMultipliers(
+    const Evaluation& e, float dt)
+{
+    mLambda.clear();
+    if (!e.any || !(dt > 0.0f)) return e;
+    // the correction lambda*dt is limited to the motion cap
+    const double cap = lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * mMls.voxelSize();
+    for (size_t s = 0; s < mStepLabels.size(); ++s) {
+        const int32_t l = mStepLabels[s];
+        if (this->isFixed(l) || !mSpeed.isActive(l)) continue;
+        const double v = mStepVolumes[s], a = mStepAreas[s];
+        if (!(v > 0.0) || !(a * double(dt) > lsmo_internal::kVolumeConstraintMinAreaDt)) continue;
+        // cancel the mean speed (predicted dV/dt = -<F>*A), then correct a
+        // fraction of the error (positive speeds shrink the label)
+        const double shift = std::clamp(-mStepMeanSpeeds[s] * double(dt)
+            + mVolumeRelaxation * (v - mVolumeTargets.at(l)) / a, -cap, cap);
+        const float lambda = float(shift / double(dt));
+        if (lambda != 0.0f && std::isfinite(lambda)) mLambda.emplace(l, lambda);
+    }
+    if (mLambda.empty()) return e;
+    // add lambda to the candidate speeds evaluated without it
+    std::vector<LeafData>& data = mScratch.data;
+    forEachIndex(data.size(), [&](size_t i) {
+        LeafData& d = data[i];
+        if (d.cand.empty()) return;
+        d.maxSpeed = 0.0f;
+        for (Candidate& c : d.cand) {
+            c.second += this->multiplier(c.first);
+            d.maxSpeed = std::max(d.maxSpeed, std::abs(c.second));
+        }
+    });
+    Evaluation result;
+    result.any = e.any;
+    for (const LeafData& d : data) result.maxSpeed = std::max(result.maxSpeed, d.maxSpeed);
+    return result;
 }
 
 
