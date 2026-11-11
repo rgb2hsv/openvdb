@@ -4315,20 +4315,15 @@ TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
     // Every TVD-RK2 stage is a full update (projection with passive label 0
     // and fixed walls, topology protection, phi floor): with the default
     // schemes a protected cube keeps its topology through the kinematic
-    // spheres (TopologyCubeThroughSpheres runs the whole path), and a fixed
-    // label never changes (FixedLabels).
+    // spheres (TopologySerialMatchesParallel checks the first kSerialCheckEnd
+    // of the path under both rules, TopologyCubeThroughSpheres the whole
+    // path), and a fixed label never changes (FixedLabels).
     {
         auto m = makeSphere(8.0);
         Forces forces;
         tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
         ASSERT_EQ(lsmo.spatialScheme(), math::HJWENO5_BIAS);
         ASSERT_EQ(lsmo.temporalScheme(), math::TVD_RK2);
-    }
-    for (Conn rule : {Conn::FG26_BG6, Conn::FG6_BG26}) {
-        SCOPED_TRACE(lsmo_test::connectivityName(rule));
-        const CubeRunResult prot = runCubeThroughSpheres(true, rule, 1, 30.0);
-        EXPECT_FALSE(prot.changed);
-        EXPECT_NEAR(prot.frontShift, 30.0, 2.0 * kCubeDx);
     }
     // fixed label 2 next to growing label 1
     auto m = makeTwoSpheres(1.0);
@@ -4352,34 +4347,6 @@ TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
             || std::memcmp(&phi, &kv.second, sizeof(float)) != 0) ++changed;
     }
     EXPECT_EQ(changed, Index64(0));
-}
-
-TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
-{
-    // The colored passes make the protected result independent of the
-    // thread count: serial and parallel runs well past the cube's first
-    // contact with the spheres (to t = 72) are bit-identical.
-    const CubeRunResult a = runCubeThroughSpheres(true, Conn::FG26_BG6, 0, 72.0);
-    ASSERT_TRUE(a.state);
-    for (int grain : {1, 64}) {
-        SCOPED_TRACE("grain " + std::to_string(grain));
-        const CubeRunResult b = runCubeThroughSpheres(true, Conn::FG26_BG6, grain, 72.0);
-        ASSERT_TRUE(b.state);
-        const LabelTree& la = a.state->labels()->tree();
-        const LabelTree& lb = b.state->labels()->tree();
-        const FloatTree& pa = a.state->phi()->tree();
-        const FloatTree& pb = b.state->phi()->tree();
-        ASSERT_TRUE(la.hasSameTopology(lb));
-        Index64 diff = 0;
-        for (auto it = pa.cbeginValueOn(); it; ++it) {
-            const float v = pb.getValue(it.getCoord());
-            if (std::memcmp(&v, &*it, sizeof(float)) != 0) ++diff;
-        }
-        for (auto it = la.cbeginValueAll(); it; ++it) {
-            if (lb.getValue(it.getCoord()) != *it) ++diff;
-        }
-        EXPECT_EQ(diff, Index64(0));
-    }
 }
 
 
@@ -4426,10 +4393,14 @@ stateHash(const MLS& m)
     return h;
 }
 
+// Steps of the recorded partition hash, and of the grain-size check run
+// when the hash is not compared (the serial run is the costly one).
+constexpr int kPartitionSteps = 75, kPartitionGrainSteps = 25;
+
 // The PartitionInvariant scenario (random constant speeds on a 4-label
-// checker, 75 steps) at grain size @a grainSize.
+// checker, @a steps steps) at grain size @a grainSize.
 MLS::Ptr
-runPartitionScenario(int grainSize)
+runPartitionScenario(int grainSize, int steps)
 {
     Int32Grid::Ptr labels = Int32Grid::create(0);
     {
@@ -4442,9 +4413,16 @@ runPartitionScenario(int grainSize)
     RandomSpeed speed({1, 2, 3, 4}, 20261108u);
     tools::LevelSetMultiObject<MLS, RandomSpeed> lsmo(*m, speed);
     lsmo.setGrainSize(grainSize);
-    for (int n = 0; n < 75; ++n) lsmo.step(1.0f);
+    for (int n = 0; n < steps; ++n) lsmo.step(1.0f);
     return m;
 }
+
+// End time of the serial vs parallel cube checks and of the recorded cube
+// hashes: the control cube (unprotected) first changes topology at t = 32
+// for FG26_BG6 and t = 34 for FG6_BG26 in TopologyCubeThroughSpheres, and
+// the spheres enter the cube from about t = 5, so 40 is well past contact,
+// with the protected claim and wrap passes active.
+constexpr double kSerialCheckEnd = 40.0;
 
 // The protected runCubeThroughSpheres scenario under @a rule, evolution
 // only (same setup and chunks of 2, no per-chunk checks), to @a tEnd.
@@ -4485,24 +4463,67 @@ evolveCubeThroughSpheres(Conn rule, int grainSize, double tEnd)
 
 } // anonymous namespace
 
+TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
+{
+    // The colored passes make the protected result independent of the
+    // thread count: runs of the protected cube past its first contact with
+    // the spheres are bit-identical serially and at grain sizes 1 and 64
+    // under both rules (a hash of every value and activity bit, and a
+    // voxel-by-voxel count). The grain-1 runs also assert the per-chunk gates of
+    // runCubeThroughSpheres with the default TVD-RK2
+    // (Rk2StagesRespectProtection).
+    for (Conn rule : {Conn::FG26_BG6, Conn::FG6_BG26}) {
+        SCOPED_TRACE(lsmo_test::connectivityName(rule));
+        const CubeRunResult checked = runCubeThroughSpheres(true, rule, 1, kSerialCheckEnd);
+        EXPECT_FALSE(checked.changed);
+        EXPECT_NEAR(checked.frontShift, kSerialCheckEnd, 2.0 * kCubeDx);
+        const MLS::Ptr a = checked.state;
+        ASSERT_TRUE(a);
+        std::vector<std::pair<int, MLS::Ptr>> others;
+        others.emplace_back(0, evolveCubeThroughSpheres(rule, 0, kSerialCheckEnd));
+        others.emplace_back(64, evolveCubeThroughSpheres(rule, 64, kSerialCheckEnd));
+        for (const auto& [grain, b] : others) {
+            SCOPED_TRACE("grain " + std::to_string(grain));
+            ASSERT_TRUE(b);
+            EXPECT_EQ(stateHash(*a), stateHash(*b));
+            const LabelTree& la = a->labels()->tree();
+            const LabelTree& lb = b->labels()->tree();
+            const FloatTree& pa = a->phi()->tree();
+            const FloatTree& pb = b->phi()->tree();
+            ASSERT_TRUE(la.hasSameTopology(lb));
+            Index64 diff = 0;
+            for (auto it = pa.cbeginValueOn(); it; ++it) {
+                const float v = pb.getValue(it.getCoord());
+                if (std::memcmp(&v, &*it, sizeof(float)) != 0) ++diff;
+            }
+            for (auto it = la.cbeginValueAll(); it; ++it) {
+                if (lb.getValue(it.getCoord()) != *it) ++diff;
+            }
+            EXPECT_EQ(diff, Index64(0));
+        }
+    }
+}
+
 TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
 {
     // Hashes of the phi and label trees recorded with the ordered containers
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
     // grain size. (A legitimate numerical change elsewhere re-records them.)
-    // (re-recorded for the HJWENO5 / TVD-RK2 defaults, and the vortex for
-    // the speed extension; the cube and partition fields are uniform)
+    // (re-recorded for the HJWENO5 / TVD-RK2 defaults, the vortex for the
+    // speed extension, and the cube at kSerialCheckEnd; the cube and
+    // partition fields are uniform.) The hashes are bit-exact floating
+    // point results of this platform's compiler and libm (FMA contraction
+    // and math library differences change them), so they are compared only
+    // with OPENVDB_MOGAC_CHECK_HASHES=1; LSMO_RECORD_HASHES prints them.
+    // Grain independence is always asserted (here for the partition,
+    // TopologySerialMatchesParallel for the cube).
     constexpr uint64_t kVortexHash = 0x92f2ad31e78a693aull;
-    constexpr uint64_t kCubeHash[2] = {0xe768c85d9259c2a7ull, 0x77c900ec3774e44bull}; // FG26, FG6
+    constexpr uint64_t kCubeHash[2] = {0xda6e69f03bfe6e26ull, 0xa984ae7bcc6bda5eull}; // FG26, FG6
     constexpr uint64_t kPartitionHash = 0x1ce11d129535607eull;
-    // end times of the recorded cube runs and of the serial vs parallel check
-    // (the control cube, unprotected, first changes topology at t = 32 for
-    // FG26_BG6 and t = 34 for FG6_BG26 in TopologyCubeThroughSpheres; the
-    // spheres enter the cube from about t = 5, so 40 is well past contact,
-    // with the protected claim and wrap passes active)
-    constexpr double kCubeHashEnd = 72.0, kSerialCheckEnd = 40.0;
     const bool record = std::getenv("LSMO_RECORD_HASHES") != nullptr;
+    const char* checkEnv = std::getenv("OPENVDB_MOGAC_CHECK_HASHES");
+    const bool committed = record || (checkEnv && std::string(checkEnv) == "1");
     auto check = [&](const char* what, uint64_t h, uint64_t expected) {
         if (record) {
             std::cout << "HashedContainers: " << what << " 0x" << std::hex << h << std::dec
@@ -4511,6 +4532,26 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
             EXPECT_EQ(h, expected) << what;
         }
     };
+
+    // the partition at every grain size (always asserted; over the first
+    // kPartitionGrainSteps steps unless the hash is compared)
+    uint64_t partition[3] = {0, 0, 0};
+    const int grains[3] = {0, 1, 64};
+    for (int g = 0; g < 3; ++g) {
+        partition[g] = stateHash(*runPartitionScenario(grains[g],
+            committed ? kPartitionSteps : kPartitionGrainSteps));
+    }
+    EXPECT_EQ(partition[0], partition[1]);
+    EXPECT_EQ(partition[0], partition[2]);
+    if (!committed) {
+        std::cout << "HashedContainers: committed hashes not compared (set "
+                     "OPENVDB_MOGAC_CHECK_HASHES=1)" << std::endl;
+        return;
+    }
+    for (int g = 0; g < 3; ++g) {
+        check(("partition grain " + std::to_string(grains[g])).c_str(), partition[g],
+            kPartitionHash);
+    }
 
     // label grid memory (informational): the 16-bit labels against the same
     // labels in a 32-bit grid
@@ -4532,25 +4573,14 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
 
     const Conn rules[2] = {Conn::FG26_BG6, Conn::FG6_BG26};
     for (int r = 0; r < 2; ++r) {
-        // protected cube through the kinematic spheres, well past first
-        // contact; serial runs match grain 64 (TopologySerialMatchesParallel,
-        // FG26_BG6; the serial runs of both rules matched when recording)
+        // protected cube through the kinematic spheres, past first contact
+        // (grain independent: TopologySerialMatchesParallel)
         const std::string name = "cube " + lsmo_test::connectivityName(rules[r]);
-        const MLS::Ptr cube = evolveCubeThroughSpheres(rules[r], 64, kCubeHashEnd);
+        const MLS::Ptr cube = evolveCubeThroughSpheres(rules[r], 64, kSerialCheckEnd);
         printLabelMemory(name, *cube);
         check(name.c_str(), stateHash(*cube), kCubeHash[r]);
     }
-    // serial vs parallel for FG6_BG26 (TopologySerialMatchesParallel covers
-    // FG26_BG6), bit for bit: a hash of every value and activity bit
-    EXPECT_EQ(stateHash(*evolveCubeThroughSpheres(Conn::FG6_BG26, 0, kSerialCheckEnd)),
-        stateHash(*evolveCubeThroughSpheres(Conn::FG6_BG26, 64, kSerialCheckEnd)));
-
-    for (int grain : {0, 64}) {
-        check(("partition grain " + std::to_string(grain)).c_str(),
-            stateHash(*runPartitionScenario(grain)), kPartitionHash);
-    }
 }
-
 
 // ---------------------------------------------------------------------------
 // Accuracy of extractSignedDistance after evolution, and world units
