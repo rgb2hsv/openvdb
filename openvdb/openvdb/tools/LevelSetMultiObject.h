@@ -375,6 +375,8 @@ public:
     /// @throw ValueError if @a halfWidth < 2, the voxel size is not uniform,
     /// the label background is not 0, or a label of @a labels is outside the
     /// range of @c LabelT.
+    /// @throw TypeError if the node configuration of @a labels differs from
+    /// that of the label tree (e.g. not the standard 5-4-3 layout).
     template<typename InputGridT>
     static Ptr fromLabelGrid(const InputGridT& labels, int halfWidth = 3, int grainSize = 1);
 
@@ -2134,7 +2136,9 @@ stencilIndex(int i, int j, int k)
 /// The spatial scheme (math::FIRST_BIAS, the default, or
 /// math::HJWENO5_BIAS) selects what upwindDifferences() returns; the
 /// evolver gives its stencils its own scheme
-/// (LevelSetMultiObject::setSpatialScheme). moveTo() reads the 19 points
+/// (LevelSetMultiObject::setSpatialScheme, default math::HJWENO5_BIAS, so a
+/// stencil built here with the default differs from the evolver's).
+/// moveTo() reads the 19 points
 /// only; the 12 further axis points (offsets +-2 and +-3) are read on the
 /// first HJWENO5 difference at the center, so speed functors that use no
 /// upwind differences (e.g. curvature only) never read them.
@@ -2951,7 +2955,8 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    (coordinates mod 3) only if the voxel is a simple point
 ///    (lsmo_internal::isSimplePoint, under setConnectivity()) of every
 ///    protected label in {a, b} on the labels as updated by earlier passes;
-///    a rejected voxel keeps label a with phi = 1e-3*dx and stays frozen.
+///    a rejected voxel keeps label a with phi = max(1e-3*dx, phiFloor())
+///    and stays frozen.
 ///    Orphan cleanup and band activation never change a protected label's
 ///    region except by simple changes, so its components, cavities and
 ///    tunnels are preserved. With no protected label nothing changes.
@@ -3147,7 +3152,8 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// deferred changes and before orphan cleanup, each step re-stamps them at
 /// its end time t_{n+1}: every voxel near the moved object samples the rest
 /// pose distance psi at motion(t)^-1 x; where psi < 0 it gets the kinematic
-/// label with phi = |psi| (at least 1e-3*dx; active and frozen if
+/// label with phi = |psi| (at least max(1e-3*dx, phiFloor()); active and
+/// frozen if
 /// |psi| < halfWidth*dx); a
 /// voxel of the label with psi >= 0 (the object left it) becomes passive
 /// label 0 and is redistanced; other voxels with psi < halfWidth*dx are
@@ -3156,9 +3162,9 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// topology-preserving label goes through the same simple-point test (27
 /// colored passes, setConnectivity() rule) as other protected changes,
 /// and a rejected claim leaves the voxel with the protected label (phi
-/// 1e-3*dx, frozen): the obstacle lacks that voxel this step and is
-/// re-stamped from its motion in the next. Such trapped voxels are then
-/// wrapped outward: each moves to the first voxel o along the object's
+/// max(1e-3*dx, phiFloor()), frozen): the obstacle lacks that voxel this
+/// step and is re-stamped from its motion in the next. Such trapped voxels
+/// are then wrapped outward: each moves to the first voxel o along the object's
 /// outward normal with psi(o) >= 0.5*dx that is neither kinematic nor fixed
 /// (o joins the protected label if that is a simple change, as do outer
 /// shell voxels 0.5*dx <= psi < 1.5*dx within two voxels of the trapped one
@@ -3191,7 +3197,10 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// @endcode
 /// operator(), hyperbolic() and parabolic() must be thread-safe; parabolic()
 /// is not called for inactive labels (their retreat is hyperbolic). All
-/// quantities are in world units.
+/// quantities are in world units. In a split step stableDt() is not
+/// applied to the hyperbolic part: the parabolic substeps are limited by
+/// parabolicStableDt() (stableDt() if absent) and the hyperbolic update by
+/// the motion cap only.
 ///
 /// @par Example
 /// @code
