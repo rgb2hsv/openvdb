@@ -1247,6 +1247,94 @@ TEST_F(TestLevelSetMultiObject, TripleJunction)
         << worstFar << " dx, <2 vox " << worstNear << " dx, worst RMS " << worstRms << " dx" << std::endl;
 }
 
+namespace {
+
+/// Max interface-layer error of @a g against the analytic distance to
+/// sector @a l of @a tj, in voxels, within (@a nearMax) and at least
+/// (@a farMax) 2 voxels from the junction line.
+void
+junctionInterfaceError(const FloatGrid& g, const TripleJunction& tj, int l,
+    double& nearMax, double& farMax)
+{
+    const Coord* offs = tools::lsmo_internal::faceOffsets();
+    constexpr double kNearLineVoxels = 2.0;
+    nearMax = farMax = 0.0;
+    tree::ValueAccessor<const FloatTree> acc(g.tree());
+    for (auto it = g.tree().cbeginValueOn(); it; ++it) {
+        const Coord p = it.getCoord();
+        bool iface = false;
+        for (int f = 0; f < 6 && !iface; ++f) {
+            float v;
+            if (acc.probeValue(p + offs[f], v)) iface = (v < 0.0f) != (*it < 0.0f);
+        }
+        if (!iface) continue;
+        const Vec3d w = g.indexToWorld(p);
+        const double e = std::abs(*it - tj.signedDist(w, l)) / tj.dx;
+        double& bin = tj.lineDist(w) < kNearLineVoxels ? nearMax : farMax;
+        bin = std::max(bin, e);
+    }
+}
+
+} // anonymous namespace
+
+// Closest-point junction reconstruction (ExtractSettings::closestPointJunctions):
+// on (the default) lowers the worst interface error within 2 voxels of the
+// junction line over the set and leaves the far field exact; off reproduces
+// the Godunov junction rule (worst-case numbers per junction recorded before
+// the option existed).
+TEST_F(TestLevelSetMultiObject, ClosestPointJunctions)
+{
+    EXPECT_TRUE(tools::ExtractSettings().closestPointJunctions);
+    EXPECT_EQ(tools::ExtractSettings().halfWidth, -1);
+    EXPECT_EQ(tools::ExtractSettings().grainSize, 1);
+
+    // worst <2-voxel interface error over labels 1..3 per junction, option off
+    const double kOffNear[12] = {0.187471, 0.330579, 0.214058, 0.182584, 0.191706, 0.0826463,
+        0.173923, 0.122111, 0.376864, 0.287112, 0.362498, 0.340601};
+    constexpr double kRecordedTolerance = 1e-5; // printed precision of the record
+    constexpr double kFarGate = 0.05;
+    const std::vector<TripleJunction> set = junctionSet();
+    ASSERT_EQ(set.size(), size_t(12));
+    double worst[2] = {0.0, 0.0}, worstFar[2] = {0.0, 0.0};
+    for (size_t n = 0; n < set.size(); ++n) {
+        const TripleJunction& tj = set[n];
+        auto m = tj.build();
+        double near[2] = {0.0, 0.0};
+        for (int on = 0; on < 2; ++on) {
+            tools::ExtractSettings s;
+            s.closestPointJunctions = on == 1;
+            for (int l = 1; l <= 3; ++l) {
+                FloatGrid::Ptr g = m->extractSignedDistance(l, s);
+                ASSERT_TRUE(g);
+                expectLevelSetGrid(*g, *m, 3);
+                double nm, fm;
+                junctionInterfaceError(*g, tj, l, nm, fm);
+                near[on] = std::max(near[on], nm);
+                worstFar[on] = std::max(worstFar[on], fm);
+                if (on == 1) {
+                    // the default overload is the option on
+                    FloatGrid::Ptr d = m->extractSignedDistance(l);
+                    double dn, df;
+                    junctionInterfaceError(*d, tj, l, dn, df);
+                    EXPECT_EQ(dn, nm);
+                    EXPECT_EQ(df, fm);
+                }
+            }
+            worst[on] = std::max(worst[on], near[on]);
+        }
+        std::cout << "[ClosestPointJunctions] junction " << n << ": <2 vox off " << near[0]
+                  << " dx, on " << near[1] << " dx" << std::endl;
+        EXPECT_NEAR(near[0], kOffNear[n], kRecordedTolerance) << "junction " << n;
+    }
+    std::cout << "[ClosestPointJunctions] worst <2 vox off " << worst[0] << " dx, on "
+              << worst[1] << " dx; worst >=2 vox off " << worstFar[0] << " dx, on "
+              << worstFar[1] << " dx" << std::endl;
+    EXPECT_NEAR(worst[0], 0.376864, kRecordedTolerance);
+    EXPECT_LT(worst[1], worst[0]);
+    EXPECT_LE(worstFar[1], kFarGate);
+    EXPECT_LE(worstFar[0], kFarGate);
+}
+
 TEST_F(TestLevelSetMultiObject, ExtractMatchesRoundTrip)
 {
     const double dx = 1.0;

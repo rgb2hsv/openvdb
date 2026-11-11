@@ -260,6 +260,22 @@ inline void registerMultiLevelSetGridTypes()
     }
 }
 
+/// @brief Settings of MultiLevelSet::extractSignedDistance.
+struct ExtractSettings
+{
+    /// Band half-width in voxels of the result; -1 uses the holder's
+    /// halfWidth(); otherwise at least 2.
+    int halfWidth = -1;
+    /// TBB grain size in leaves; zero or negative runs serially. The result
+    /// does not depend on it.
+    int grainSize = 1;
+    /// Rebuild the outside values next to a third label from the closest
+    /// point on a local planar reconstruction of the region's boundary
+    /// (lsmo_internal::closestPointPsi); false uses a local Godunov
+    /// extension instead (lsmo_internal::rebuildJunctionSeeds).
+    bool closestPointJunctions = true;
+};
+
 /// @brief Holder for a pair of grids describing several disjoint objects:
 /// an unsigned distance grid @c phi (distance to the nearest object
 /// interface, in world units) and a grid of integer @c labels.
@@ -406,8 +422,11 @@ public:
     /// fix would move the interface, since that fix is not a fixed point of
     /// a redistanced field). The exception is an outside seed next to a third
     /// label: its phi may be the distance to the boundary with that third
-    /// label, so it is rebuilt from inside values within proven bounds (see
-    /// lsmo_internal::rebuildJunctionSeeds). The other band voxels solve
+    /// label, so it is rebuilt from inside values within proven bounds: by
+    /// default from the closest point on a local planar reconstruction of
+    /// the region's boundary (lsmo_internal::closestPointPsi), or with
+    /// ExtractSettings::closestPointJunctions off by a local Godunov
+    /// extension (lsmo_internal::rebuildJunctionSeeds). The other band voxels solve
     /// |grad psi| = 1 from the seeds as in MultiLevelSetRedistance, on |psi|,
     /// and the sign is applied last. The result is active exactly at the
     /// voxels with |psi| < halfWidth*dx (the seeds dilated by @a halfWidth;
@@ -435,7 +454,19 @@ public:
     /// @throw ValueError if @a halfWidth is not -1 and less than 2.
     template<typename InterruptT = util::NullInterrupter>
     typename FloatGridT::Ptr extractSignedDistance(int32_t label, int halfWidth = -1,
-        int grainSize = 1, InterruptT* interrupt = nullptr) const;
+        int grainSize = 1, InterruptT* interrupt = nullptr) const
+    {
+        ExtractSettings settings;
+        settings.halfWidth = halfWidth;
+        settings.grainSize = grainSize;
+        return this->extractSignedDistance(label, settings, interrupt);
+    }
+
+    /// @brief extractSignedDistance with all settings in @a settings (see
+    /// ExtractSettings and the overload above).
+    template<typename InterruptT = util::NullInterrupter>
+    typename FloatGridT::Ptr extractSignedDistance(int32_t label,
+        const ExtractSettings& settings, InterruptT* interrupt = nullptr) const;
 
     /// @brief Sorted distinct non-zero labels over all active voxels.
     std::vector<int32_t> labelSet() const
@@ -1269,6 +1300,163 @@ struct LabelRegionDiffers
     bool requireActive;
 };
 
+/// @name Closest-point junction reconstruction (lsmo_internal::closestPointPsi)
+/// @{
+/// Half-extent in voxels of the neighborhood searched (5x5x5).
+constexpr int kClosestPointReach = 2;
+/// A plane is used only if its distance gradient estimate has length
+/// within this of 1 (dimensionless): shorter or longer ones mix the
+/// distances to two boundary sheets (a medial surface) or to two labels.
+constexpr double kClosestPointGradientTolerance = 0.05;
+/// Tolerance, in voxels, of the supporting-plane test.
+constexpr double kClosestPointSupportToleranceVoxels = 0.01;
+/// Below this squared sine of the angle between two planes they are
+/// treated as parallel (dimensionless).
+constexpr double kClosestPointParallelSin2 = 1e-6;
+/// @}
+
+/// @brief Distance from the voxel @a q outside the region {L == @a label}
+/// to that region's boundary, from a local planar reconstruction of the
+/// boundary (accessor form; see the tree form below).
+/// @details Let U be the region's active voxels within the 5x5x5
+/// neighborhood of q. Each p in U with a face neighbor outside the region
+/// gives a plane through its foot point p - phi_p*n_p, where n_p is the
+/// unit gradient of phi inside the region (per axis the central difference
+/// if both face neighbors are in U or further region voxels active in
+/// @a phi, else the one-sided difference toward the one that is; with
+/// neither, the central difference of phi in the region and -phi outside).
+/// A plane is used only if that gradient has length 1 within
+/// kClosestPointGradientTolerance. With H_p the half-space on the region's
+/// side of p's plane:
+/// - a plane is supporting if every ball of radius phi_x about x in U lies
+///   in H_p (within kClosestPointSupportToleranceVoxels). The region near q
+///   then lies in the intersection of any two supporting half-spaces, so
+///   the distance from q to that intersection (exact at a convex edge such
+///   as a junction line) is a lower bound; the largest over pairs is kept;
+/// - where the region is the union of half-spaces (a concave edge), the
+///   distance is the smallest distance from q to one of them.
+/// The estimate is the larger of the two, clamped to the proven bounds
+/// [phi_q, max(phi_q, B)], B the minimum of |q - x| - phi_x over x in U
+/// (as in rebuildJunctionSeeds). Without a usable plane it is phi_q.
+/// phi is read as max(phi, @a phiFloor).
+/// @param phi accessor of the distance tree (float values)
+/// @param labels accessor of the label tree
+/// @param dx voxel size
+/// @return the distance in world units (non-negative). Needs about 10 KB of
+/// stack and no heap memory.
+template<typename PhiAccT, typename LabelAccT>
+inline float closestPointPsi(PhiAccT& phi, LabelAccT& labels, const Coord& q, int32_t label,
+    double dx, double phiFloor)
+{
+    constexpr int R = kClosestPointReach;
+    constexpr int kMaxPoints = (2 * R + 1) * (2 * R + 1) * (2 * R + 1);
+    struct Plane { Vec3d n, f; double d; };  // inward normal, foot point - q, (f . n)
+    struct Ball { Vec3d x; double r; };      // center - q, radius
+    Plane planes[kMaxPoints];
+    Ball balls[kMaxPoints];
+    int np = 0, nb = 0;
+    const int64_t l = int64_t(label);
+    const Coord* offs = faceOffsets();
+    const double phiQ = std::max(double(phi.getValue(q)), phiFloor);
+    double ballBound = std::numeric_limits<double>::max();
+    auto inside = [&](const Coord& x) { return int64_t(labels.getValue(x)) == l; };
+    for (int k = -R; k <= R; ++k) {
+        for (int j = -R; j <= R; ++j) {
+            for (int i = -R; i <= R; ++i) {
+                const Coord p = q.offsetBy(i, j, k);
+                float v;
+                if (!inside(p) || !phi.probeValue(p, v)) continue;
+                const double phiP = std::max(double(v), phiFloor);
+                const Vec3d x = Vec3d(i, j, k) * dx;
+                ballBound = std::min(ballBound, x.length() - phiP);
+                balls[nb++] = Ball{x, phiP};
+                bool seed = false;
+                for (int f = 0; f < 6 && !seed; ++f) seed = !inside(p + offs[f]);
+                if (!seed) continue;
+                // gradient of phi inside the region (faceOffsets: -axis, +axis)
+                Vec3d g(0.0);
+                for (int axis = 0; axis < 3; ++axis) {
+                    double s[2];
+                    bool in[2];
+                    for (int side = 0; side < 2; ++side) {
+                        const Coord n = p + offs[2 * axis + side];
+                        float w;
+                        const bool nIn = inside(n);
+                        in[side] = nIn && phi.probeValue(n, w);
+                        const double phiN = std::max(double(phi.getValue(n)), phiFloor);
+                        s[side] = nIn ? phiN : -phiN;
+                    }
+                    if (in[0] && in[1]) g[axis] = 0.5 * (s[1] - s[0]);
+                    else if (in[1]) g[axis] = s[1] - phiP;
+                    else if (in[0]) g[axis] = phiP - s[0];
+                    else g[axis] = 0.5 * (s[1] - s[0]);
+                }
+                const double len = g.length();
+                if (!(std::abs(len / dx - 1.0) <= kClosestPointGradientTolerance)) continue;
+                Plane& pl = planes[np++];
+                pl.n = g / len;
+                pl.f = x - pl.n * phiP;
+                pl.d = pl.f.dot(pl.n);
+            }
+        }
+    }
+    const double hi = std::max(ballBound, phiQ);
+    if (np == 0) return float(phiQ);
+
+    // supporting planes: keep them in front
+    const double tol = kClosestPointSupportToleranceVoxels * dx;
+    double unionDist = std::numeric_limits<double>::max();
+    int ns = 0;
+    for (int a = 0; a < np; ++a) {
+        unionDist = std::min(unionDist, std::max(planes[a].d, 0.0));
+        bool support = true;
+        for (int b = 0; b < nb && support; ++b) {
+            support = (balls[b].x - planes[a].f).dot(planes[a].n) - balls[b].r >= -tol;
+        }
+        if (support) std::swap(planes[ns++], planes[a]);
+    }
+    // largest distance from q to the intersection of one or two supporting
+    // half-spaces (d > 0: q outside the half-space)
+    double lo = phiQ;
+    for (int a = 0; a < ns; ++a) {
+        const double di = planes[a].d;
+        lo = std::max(lo, di);
+        for (int b = a + 1; b < ns; ++b) {
+            const double dj = planes[b].d;
+            if (di <= 0.0 && dj <= 0.0) continue;
+            const double c = planes[a].n.dot(planes[b].n);
+            // the projection onto one plane lies in the other half-space
+            double w = -1.0;
+            if (di > 0.0 && dj - di * c <= 0.0) w = di;
+            if (dj > 0.0 && di - dj * c <= 0.0) w = std::max(w, dj);
+            if (w < 0.0) { // else the closest point is on the intersection line
+                const double s2 = 1.0 - c * c;
+                w = s2 < kClosestPointParallelSin2 ? std::max(di, dj)
+                    : std::sqrt(std::max((di * di + dj * dj - 2.0 * di * dj * c) / s2, 0.0));
+            }
+            lo = std::max(lo, w);
+        }
+    }
+    return float(std::min(std::max(lo, unionDist), hi));
+}
+
+/// @brief Tree form of closestPointPsi: ψ of the region {L == @a label} at
+/// the voxel @a q outside it, from local planes through p - phi_p*n_p over
+/// the region's boundary voxels in q's 5x5x5 neighborhood, clamped to
+/// [phi_q, min_p(|q - p| - phi_p)] (see the accessor form). Uses
+/// non-registering accessors, so it allocates nothing; callers looping over
+/// many voxels should use the accessor form.
+template<typename FloatTreeT, typename LabelTreeT>
+inline float closestPointPsi(const FloatTreeT& phi, const LabelTreeT& labels, const Coord& q,
+    int32_t label, double dx)
+{
+    static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
+        "the distance tree must have float values");
+    tree::ValueAccessor<const FloatTreeT, /*IsSafe=*/false> phiAcc(phi);
+    tree::ValueAccessor<const LabelTreeT, /*IsSafe=*/false> labAcc(labels);
+    return closestPointPsi(phiAcc, labAcc, q, label, dx, 0.0);
+}
+
 /// @brief Per-label reconstruction of seeds near junctions, for
 /// MultiLevelSet::extractSignedDistance.
 /// @details Let psi be the signed distance to the region {L == @a label}
@@ -1293,9 +1481,14 @@ struct LabelRegionDiffers
 /// lines, so the rebuilt values are only first-order accurate there; seeds
 /// whose phi_q is already exact stay within the interval but may move.
 /// Runs serially (junction seeds are few).
+///
+/// With @a closestPointPhi (the pair's distance tree), each such seed is
+/// instead set to closestPointPsi over @a closestPointPhi (capped at the
+/// background of @a out); no sweeps are needed, since every value is read
+/// from the pair.
 template<typename FloatTreeT, typename BoolTreeT, typename LabelTreeT>
 void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTreeT& labels,
-    typename LabelTreeT::ValueType label, double dx)
+    typename LabelTreeT::ValueType label, double dx, const FloatTreeT* closestPointPhi = nullptr)
 {
     static_assert(std::is_same<typename FloatTreeT::ValueType, float>::value,
         "the distance tree must have float values");
@@ -1305,8 +1498,9 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
     tree::ValueAccessor<const BoolTreeT> seedAcc(seeds);
 
     const float bg = out.background();
+    tree::ValueAccessor<const FloatTreeT> cpPhi(closestPointPhi ? *closestPointPhi : out);
     std::vector<Coord> todo;
-    std::vector<float> keep, upper;
+    std::vector<float> keep, upper, rebuilt;
     for (auto it = seeds.cbeginValueOn(); it; ++it) {
         const Coord q = it.getCoord();
         const auto lq = lab.getValue(q);
@@ -1317,6 +1511,13 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
             third = ln != label && ln != lq;
         }
         if (!third) continue;
+        if (closestPointPhi) {
+            // values are read from the pair, so the order does not matter
+            todo.push_back(q);
+            rebuilt.push_back(std::min(closestPointPsi(cpPhi, lab, q, int32_t(label), dx, 0.0),
+                bg));
+            continue;
+        }
         // upper bound from the balls inside the region (see above)
         const float phiQ = acc.getValue(q);
         double ball = double(bg);
@@ -1336,6 +1537,10 @@ void rebuildJunctionSeeds(FloatTreeT& out, const BoolTreeT& seeds, const LabelTr
         upper.push_back(float(std::max(ball, double(phiQ))));
     }
     if (todo.empty()) return;
+    if (closestPointPhi) {
+        for (size_t n = 0; n < todo.size(); ++n) acc.setValue(todo[n], rebuilt[n]);
+        return;
+    }
     for (const Coord& q : todo) acc.setValue(q, kUnknownDistance);
 
     const float tol = float(kDefaultRedistanceToleranceFraction * dx);
@@ -1570,9 +1775,11 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::build(const math::Transform& xform,
 template<typename FloatTreeT, typename LabelTreeT>
 template<typename InterruptT>
 typename MultiLevelSet<FloatTreeT, LabelTreeT>::FloatGridT::Ptr
-MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int halfWidth,
-    int grainSize, InterruptT* interrupt) const
+MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label,
+    const ExtractSettings& settings, InterruptT* interrupt) const
 {
+    int halfWidth = settings.halfWidth;
+    const int grainSize = settings.grainSize;
     if (halfWidth == -1) halfWidth = mHalfWidth;
     if (halfWidth < 2) {
         OPENVDB_THROW(ValueError,
@@ -1642,7 +1849,8 @@ MultiLevelSet<FloatTreeT, LabelTreeT>::extractSignedDistance(int32_t label, int 
     BoolTreeT seeds(false);
     lsmo_internal::seedInterface(phi, seedOp, *out, seeds, dx, grainSize,
         /*writeValues=*/false);
-    lsmo_internal::rebuildJunctionSeeds(*out, seeds, labels, inLabel, dx);
+    lsmo_internal::rebuildJunctionSeeds(*out, seeds, labels, inLabel, dx,
+        settings.closestPointJunctions ? &phi : nullptr);
     const int maxIter = int(std::ceil(halfWidth * std::sqrt(3.0)))
         + lsmo_internal::kRedistanceExtraIterations;
     const float tol = float(lsmo_internal::kDefaultRedistanceToleranceFraction * dx);

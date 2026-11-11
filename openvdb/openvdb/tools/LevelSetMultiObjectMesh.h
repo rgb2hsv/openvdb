@@ -152,6 +152,10 @@ struct MultiObjectMeshSettings
     /// may be the distance to a third label's boundary (see
     /// lsmo_internal::MeshContext::correctedOutside).
     bool junctionCorrection = true;
+    /// With junctionCorrection, estimate those vertices from the closest
+    /// point on a local planar reconstruction of the label's boundary
+    /// (lsmo_internal::closestPointPsi); false uses one local Godunov step.
+    bool closestPointJunctions = true;
     /// Also output per-vertex normals.
     bool computeNormals = false;
     /// TBB grain size in blocks of cells; zero or negative runs serially.
@@ -879,13 +883,19 @@ struct MeshContext
     /// As in MultiLevelSet::extractSignedDistance two bounds hold:
     /// psi_l(q) >= phi_q, and psi_l(q) <= |q - p| - phi_p for
     /// every voxel p of label l (its ball of radius phi_p lies in l); the
-    /// latter is taken over the 5x5x5 neighborhood of q. The estimate is one
+    /// latter is taken over the 5x5x5 neighborhood of q. With
+    /// settings.closestPointJunctions (the default) the estimate is
+    /// closestPointPsi (the closest point on a local planar reconstruction
+    /// of l's boundary, within those bounds); otherwise it is one
     /// local Godunov step on psi_l (per axis the smaller psi_l of the two
     /// face neighbors, -phi in l and +phi elsewhere), clamped to
     /// [phi_q, max(phi_q, upper bound)]. It depends only on q and l, so every
     /// cell sharing the edge places the same vertex.
     double correctedOutside(const Coord& q, LabelT l, double phiQ)
     {
+        if (settings.closestPointJunctions) {
+            return closestPointPsi(phi, lab, q, int32_t(l), dx, settings.minimumPhi);
+        }
         double upper = std::numeric_limits<double>::max();
         for (int k = -2; k <= 2; ++k)
             for (int j = -2; j <= 2; ++j)

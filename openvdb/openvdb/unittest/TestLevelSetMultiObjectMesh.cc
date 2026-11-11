@@ -1065,6 +1065,63 @@ TEST_F(TestLevelSetMultiObjectMesh, MeshJunctionCorrection)
 }
 
 
+// Closest-point junction reconstruction (closestPointJunctions, on by
+// default, with junctionCorrection on): lowers the worst vertex error over the
+// junction set compared with the Godunov estimate, which the option off
+// reproduces (recorded before the option existed). Vertices move along their
+// edges only: vertex and triangle counts, closedness and Euler characteristic
+// are unchanged, and no triangle is folded.
+TEST_F(TestLevelSetMultiObjectMesh, MeshClosestPointJunctions)
+{
+    EXPECT_TRUE(tools::MultiObjectMeshSettings().closestPointJunctions);
+    constexpr double kRecordedOffWorst = 0.279997; // worst over the set, option off
+    constexpr double kRecordedTolerance = 1e-5;    // printed precision of the record
+    const auto set = lsmo_test::junctionSet();
+    double worst[2] = {0.0, 0.0};
+    for (size_t n = 0; n < set.size(); ++n) {
+        const lsmo_test::TripleJunction& tj = set[n];
+        auto m = tj.build();
+        double err[2] = {0.0, 0.0};
+        std::map<int32_t, LabelMesh> meshes[2];
+        for (int on = 0; on < 2; ++on) {
+            tools::MultiObjectMeshSettings s;
+            s.closestPointJunctions = on == 1;
+            tools::lsmo_internal::MeshStats stats;
+            meshes[on] = meshWithStats(*m, s, stats);
+            ASSERT_EQ(meshes[on].size(), size_t(3));
+            for (const auto& kv : meshes[on]) {
+                EXPECT_TRUE(closedManifold(kv.second, tj.dx)) << "junction " << n;
+                for (const Vec3s& p : kv.second.points) {
+                    const Vec3d w(p);
+                    const Vec3d x = m->phi()->transform().worldToIndex(w);
+                    const double depth = tj.H - std::max({std::abs(x[0] + 0.5),
+                        std::abs(x[1] + 0.5), std::abs(x[2] + 0.5)});
+                    if (depth < 3.0) continue; // box faces: not part of the analytic partition
+                    err[on] = std::max(err[on], std::abs(tj.signedDist(w, kv.first)) / tj.dx);
+                }
+            }
+        }
+        for (auto a = meshes[0].begin(), b = meshes[1].begin(); a != meshes[0].end(); ++a, ++b) {
+            // same vertices (one per crossing edge); folded patches may be
+            // split differently, so only the triangle count is compared
+            EXPECT_EQ(a->second.triangles.size(), b->second.triangles.size()) << "junction " << n;
+            EXPECT_EQ(a->second.points.size(), b->second.points.size()) << "junction " << n;
+            EXPECT_EQ(countFolded(b->second, *m, b->first), size_t(0)) << "junction " << n;
+            EXPECT_EQ(lsmo_test::meshTopology(a->second, tj.dx).euler,
+                lsmo_test::meshTopology(b->second, tj.dx).euler) << "junction " << n;
+        }
+        std::cout << "[MeshClosestPointJunctions] junction " << n << ": max vertex error off "
+                  << err[0] << " dx, on " << err[1] << " dx" << std::endl;
+        worst[0] = std::max(worst[0], err[0]);
+        worst[1] = std::max(worst[1], err[1]);
+    }
+    std::cout << "[MeshClosestPointJunctions] worst over " << set.size() << " junctions: off "
+              << worst[0] << " dx, on " << worst[1] << " dx" << std::endl;
+    EXPECT_NEAR(worst[0], kRecordedOffWorst, kRecordedTolerance);
+    EXPECT_LT(worst[1], worst[0]);
+}
+
+
 // Review focus 2 and 3: empty input, label ids, requested labels.
 TEST_F(TestLevelSetMultiObjectMesh, MeshEmptyAndLabelIds)
 {
