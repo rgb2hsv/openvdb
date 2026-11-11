@@ -3355,11 +3355,14 @@ insideCentroid(const FloatGrid& sdf, const CoordBBox& box)
     return w > 0.0 ? sum / w : sum;
 }
 
+constexpr double kCubeDx = 1.0; // voxel size of the cube scenario
+
 struct CubeRunResult
 {
     std::vector<lsmo_test::DigitalTopology> topo; // cube, per chunk
     double shift = 0.0;      // centroid x shift of label 1 (diagnostic)
-    double frontShift = 0.0; // leading-face shift: change of max x over label-1 voxels
+    double frontShift = 0.0; // leading-face shift along the centerline column (sub-voxel)
+    double maxXShift = 0.0;  // change of max x over all label-1 voxels (diagnostic)
     bool changed = false;    // cube topology differed from (1, 0, 1) at some chunk
     double firstChange = -1.0;                // end time of the first changed chunk
     lsmo_test::DigitalTopology firstChangeTopo; // cube topology at that chunk
@@ -3429,6 +3432,33 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
         return mx;
     };
     const int front0 = labelMaxX();
+    // Leading face along the cube's centerline column (y, z) = (20, 20),
+    // next to its center (19.5, 19.5): the last sub-voxel zero crossing
+    // (- to +) of the extracted psi_1 along x. The orbits stay clear of it:
+    // the sphere centers circle the orbit axis through (19.67, 18.33) at
+    // radii 9.7-11.6, so a sphere of radius 4 comes no closer than 5.7
+    // voxels to the axis, and this column is 1.7 voxels from it.
+    const Coord column(0, 20, 20);
+    auto centerFront = [&]() {
+        FloatGrid::Ptr sdf = m->extractSignedDistance(1);
+        tree::ValueAccessor<const FloatTree> acc(sdf->tree());
+        double front = std::numeric_limits<double>::quiet_NaN();
+        for (int x = domain.min()[0]; x < domain.max()[0]; ++x) {
+            const float a = acc.getValue(Coord(x, column[1], column[2]));
+            const float b = acc.getValue(Coord(x + 1, column[1], column[2]));
+            if (a < 0.0f && !(b < 0.0f)) front = (x + double(a) / double(a - b)) * dx;
+        }
+        return front;
+    };
+    {
+        const Vec3d c = orbitCenter();
+        for (const Coord& sc : kOrbitSpheres) {
+            const double r = std::hypot(sc[1] - c[1], sc[2] - c[2]);
+            const double dc = std::hypot(column[1] - c[1], column[2] - c[2]);
+            EXPECT_GT(r - 4.0 - 1.0, dc) << "an orbit crosses the centerline column";
+        }
+    }
+    const double centerFront0 = centerFront();
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
     forces.setCurvatureWeight(0.0f);
@@ -3535,11 +3565,13 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
         if (!(chunkOk && valid && overlaps == 0 && badCover == 0)) break;
     }
     res.shift = labelCentroidX() - x0;
-    res.frontShift = double(labelMaxX() - front0);
+    res.frontShift = centerFront() - centerFront0;
+    res.maxXShift = double(labelMaxX() - front0);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::cout << log << ": " << steps << " steps, " << secs << " s, t " << t
               << ", active phi below minimumPhi*dx (summed over chunks) " << res.belowFloor
-              << ", leading-face shift " << res.frontShift << ", centroid shift " << res.shift
+              << ", leading-face shift (centerline) " << res.frontShift
+              << ", max-x shift (diagnostic) " << res.maxXShift << ", centroid shift " << res.shift
               << std::endl;
     if (protect) {
         for (int s = 0; s < 3; ++s) {
@@ -3563,10 +3595,12 @@ TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
         SCOPED_TRACE(lsmo_test::connectivityName(rule));
         const CubeRunResult prot = runCubeThroughSpheres(true, rule);
         EXPECT_FALSE(prot.changed);
-        // Leading face (max x of label 1), not the centroid: topology
-        // protection leaves label-1 material tethered around the spheres the
-        // cube has passed, so the centroid lags; it is printed only.
-        EXPECT_NEAR(prot.frontShift, distance, 2.0);
+        // Leading face along the centerline column, not the centroid:
+        // topology protection leaves label-1 material tethered around the
+        // spheres the cube has passed, so the centroid lags (printed only);
+        // the max x over all label-1 voxels also sees material the wrap
+        // left ahead of the face in a sphere's column (printed only).
+        EXPECT_NEAR(prot.frontShift, distance, 2.0 * kCubeDx);
         for (int s = 0; s < 3; ++s) {
             // also asserted at every chunk; volume and components are printed only
             EXPECT_LE(prot.maxCentroidError[s], 1.0) << "sphere " << 2 + s;
@@ -3600,7 +3634,7 @@ TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
         SCOPED_TRACE(lsmo_test::connectivityName(rule));
         const CubeRunResult prot = runCubeThroughSpheres(true, rule, 1, 30.0);
         EXPECT_FALSE(prot.changed);
-        EXPECT_NEAR(prot.frontShift, 30.0, 2.0);
+        EXPECT_NEAR(prot.frontShift, 30.0, 2.0 * kCubeDx);
     }
     // fixed label 2 next to growing label 1
     auto m = makeTwoSpheres(1.0);
