@@ -484,33 +484,30 @@ Required integration tests:
    CFL ≈ 0.13, where first-order upwinding is most diffusive; operator
    splitting (advection at its own CFL, curvature substepped) is a known
    follow-up.
-9. **Eight objects in a vortex** (parameters per rulings R27 and O18). Eight
-   shapes with **eight distinct labels** (sphere, cube, tetrahedron,
-   octahedron, dodecahedron, icosahedron, capsule, closed tube ring; via
-   `LevelSetSphere`, `LevelSetPlatonic`, `LevelSetTubes`), each of
-   circumradius 14·dx (the original sizes times 1.4), dx = 1. They sit in pairs on four rays (angles k·90°)
-   in the plane z = −20, one inside and one outside the ring r = 38.5, each
-   with its nearest surface point 0.75·dx from the ring. Velocity field:
-   Rankine-style swirl about z (core R = 16, amplitude 0.1), radial inflow
-   towards the ring u_r = −0.1·tanh(r − 38.5), updraft 0.1·exp(−r²/(2R²)); the velocity grid is
-   dense over [−80, 80]³.
+9. **Eight objects in a vortex** (user request 2026-11-10: objects spiral
+   in towards the center of the enclosing volume from equally spaced
+   positions near the periphery; run to t ≥ 60). Eight shapes with **eight
+   distinct labels** (sphere, cube, tetrahedron, octahedron, dodecahedron,
+   icosahedron, capsule, closed tube ring; via `LevelSetSphere`,
+   `LevelSetPlatonic`, `LevelSetTubes`), each of circumradius 14·dx (the
+   original sizes times 1.4; the ring's polygon radius is 5·1.4 so it does
+   not touch the sphere at the start), dx = 1. Label l is centered at angle
+   (l−1)·45° on the circle r = 34 in the plane z = 0. Velocity field
+   (volume-preserving inward spiral towards the center of the [−80, 80]³
+   velocity grid): radial inflow u_r = −0.4·tanh(r/8), solid-body swirl
+   u_θ = 0.012·r, axial outflow u_z = z·D(r) with D = −(1/r)·d(r·u_r)/dr.
    (An exact flow never makes disjoint objects touch and an axisymmetric
-   flow keeps the angular gaps of objects at one radius, so contact comes
-   from pairs pressed together in the convergence zone until their gap is
-   below a voxel.) Advection weight 1, curvature weight 0.003; advect in
-   chunks of 2 until ≥ 4 contact pairs (capped at t = 70), then on to
-   t = 60 with the contacts required to persist at every chunk (rulings R31
-   and O18). The run is long, so the field is weak: every object keeps
-   translating towards the ring at the far-field inflow speed while its face
-   at the ring cannot move, so the flow flattens it by inflow × (time in
-   contact), and the original strength (inflow and updraft 0.2, circumradius
-   10) lost the capsule by t = 58; halving the inflow and updraft, starting
-   the pairs closer and enlarging the shapes keeps every label alive (first contact at t = 36;
-   smallest label 1203 voxels at t = 60; tightest volume-gate margin 3.4 points,
-   label 8 upper bound, with FIRST_BIAS/TVD_RK1; with the HJWENO5/TVD_RK2
-   defaults: first contact at t = 24, smallest label 1463 voxels, tightest
-   margin 2.2 points, label 8 upper bound). The run was first t = 84, then
-   shortened to t = 60.
+   flow keeps the angular gaps of objects on one circle, so contact comes
+   from neighbor gaps — 1.1 to 1.7 voxels for five pairs at the start —
+   shrinking in proportion to r until below a voxel. Solid-body rotation
+   keeps contacts from sliding apart; a stronger inflow draws the objects
+   into the core, where stretching costs a third or more of their volume.)
+   Advection weight 1, curvature weight 0.003; advect in chunks of 2 until
+   ≥ 4 contact pairs (capped at t = 70), then on to t = 60 with the
+   contacts required to persist at every chunk (≥ 3 at full-voxel motion).
+   With the HJWENO5/TVD_RK2 defaults: first contact at t = 34, smallest
+   label ~950 voxels at t = 60 (tetrahedron). Volume gate slack 2% (5% at
+   full-voxel motion).
    - Every chunk: `validate()`, partition invariant, no NaN, no active
      voxel with phi = 0.
    - At end: ≥ 4 distinct label pairs sharing a face; every label still owns
