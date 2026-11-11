@@ -12,6 +12,7 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetMultiObject.h>
+#include "LevelSetMultiObjectFrames.h"
 #include <openvdb/tree/LeafManager.h>
 #include <openvdb/tools/LevelSetPlatonic.h>
 #include <openvdb/tools/LevelSetSphere.h>
@@ -358,7 +359,7 @@ struct Vortex
     /// chunk with >= 4 pairs (-1 if none).
     /// @a configure is applied to the evolver before the run (e.g. to
     /// select its schemes; the defaults otherwise).
-    using Evolver = openvdb::tools::LevelSetMultiObject<MLS, Forces>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, Forces>;
     template<typename PerChunk>
     double run(MLS& m, const openvdb::Vec3SGrid::Ptr& vel, size_t& steps, double& tContact,
         PerChunk&& perChunk, const std::function<void(Evolver&)>& configure = {}) const

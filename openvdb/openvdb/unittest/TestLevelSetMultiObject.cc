@@ -108,7 +108,7 @@ struct DetectionSpeed
 
 TEST_F(TestLevelSetMultiObject, NoClampSpeedOption)
 {
-    using Evolver = tools::LevelSetMultiObject<MLS, DetectionSpeed>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, DetectionSpeed>;
     static_assert(!HasSetClampSpeed<Evolver>::value, "setClampSpeed must not exist");
     static_assert(!HasClampSpeed<Evolver>::value, "clampSpeed must not exist");
     SUCCEED();
@@ -272,7 +272,7 @@ runWithLabelTree()
     forces.setPressure(FloatGrid::create(1.0f), 1.0f);
     forces.setCurvatureWeight(0.1f);
     forces.setFixedLabels({3});
-    tools::LevelSetMultiObject<MLST, ForcesT> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLST, ForcesT> lsmo(*m, forces);
     // 1.5 x the time of five full steps
     double t5 = 0.0;
     for (int n = 0; n < 5; ++n) t5 += lsmo.step(1.0f);
@@ -378,7 +378,7 @@ TEST_F(TestLevelSetMultiObject, Int16RangeThrows)
     {
         auto m = makeTwoSpheres(1.0);
         lsmo_test::Forces forces;
-        tools::LevelSetMultiObject<MLS, lsmo_test::Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, lsmo_test::Forces> lsmo(*m, forces);
         FloatGrid::Ptr sdf = tools::createLevelSetSphere<FloatGrid>(3.0f, Vec3f(0), 1.0f);
         auto still = [](double) { return math::Mat4d::identity(); };
         EXPECT_THROW(lsmo.setKinematicLabel(kTooLarge, sdf, still), ValueError);
@@ -2000,7 +2000,7 @@ TEST_F(TestLevelSetMultiObject, PartitionInvariant)
     auto m = MLS::fromLabelGrid(*labels);
     ASSERT_EQ(m->labelSet(), (std::vector<int32_t>{1, 2, 3, 4}));
     RandomSpeed speed({1, 2, 3, 4}, 20261108u);
-    tools::LevelSetMultiObject<MLS, RandomSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, RandomSpeed> lsmo(*m, speed);
     for (int n = 0; n < 75; ++n) {
         const float dt = lsmo.step(1.0f);
         ASSERT_GT(dt, 0.0f);
@@ -2046,7 +2046,7 @@ runPressureGrowth(double motion)
     const double dx = m->voxelSize();
     ConstantSpeed speed;
     speed.s = -1.0f; // dpsi/dt = -1: the object grows at unit speed
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
     applyMotion(lsmo, motion);
     const auto start = std::chrono::steady_clock::now();
     const size_t steps = lsmo.advect(0.0, 6.0);
@@ -2072,7 +2072,7 @@ runCurvatureFlow(double motion)
     const double dx = m->voxelSize();
     Forces forces;
     forces.setCurvatureWeight(1.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     applyMotion(lsmo, motion);
     const size_t steps = lsmo.advect(0.0, 30.0);
     std::string msg;
@@ -2093,7 +2093,7 @@ runUniformAdvection(double motion)
     const double dx = m->voxelSize();
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     applyMotion(lsmo, motion);
     const Vec3d c0 = centroid(zeroCrossings(*m->extractSignedDistance(1)));
     const size_t steps = lsmo.advect(0.0, 7.5);
@@ -2135,7 +2135,7 @@ TEST_F(TestLevelSetMultiObject, PerLabelAdvection)
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
     forces.setAdvection(2, Vec3SGrid::create(Vec3s(0.0f, 1.0f, 0.0f)), 1.0f);
     EXPECT_THROW(forces.setAdvection(3, Vec3SGrid::ConstPtr(), 1.0f), ValueError);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     auto center = [&](int32_t l) { return centroid(zeroCrossings(*m->extractSignedDistance(l))); };
     const Vec3d a0 = center(1), b0 = center(2);
     lsmo.advect(0.0, 5.0);
@@ -2174,7 +2174,7 @@ TEST_F(TestLevelSetMultiObject, KinematicLabelBasics)
     }
     auto m = MLS::fromLabelGrid(*labels);
     Forces forces; // no speeds: the block moves only where the sphere pushes it
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     EXPECT_THROW(lsmo.setKinematicLabel(0, FloatGrid::create(), [](double) {
         return math::Mat4d::identity(); }), ValueError);
     EXPECT_THROW(lsmo.setKinematicLabel(2, FloatGrid::ConstPtr(), [](double) {
@@ -2244,7 +2244,7 @@ TEST_F(TestLevelSetMultiObject, KinematicFixedWall)
     auto m = MLS::fromLabelGrid(*labels);
     Forces forces;
     forces.setFixedLabels({3});
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     lsmo.setKinematicLabel(2, tools::createLevelSetSphere<FloatGrid>(float(r), Vec3f(c0), 1.0f),
         [](double t) {
             math::Mat4d mm = math::Mat4d::identity();
@@ -2346,7 +2346,7 @@ runFieldScenario(const Vec3d& shift, bool force, double dx = 1.0, bool extension
     forces.setPressure(makePressureField(xf, dx), 1.0f);
     forces.setAdvection(makeVelocityField(xf, dx), 1.0f);
     forces.setCurvatureWeight(0.1f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     lsmo.advect(0.0, 3.0 * dx);
     return m;
 }
@@ -2430,7 +2430,7 @@ runFixedLabels(double motion)
     ConstantSpeed speed;
     speed.s = -1.0f;
     speed.fixed = {2};
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
     applyMotion(lsmo, motion);
     for (int n = 0; n < 30; ++n) {
         // dt = min(0.75, motion*cfl): at the default motion 0.5 sphere 1
@@ -2470,7 +2470,7 @@ TEST_F(TestLevelSetMultiObject, BandMaintenance)
     const double dx = m->voxelSize();
     ConstantSpeed speed;
     speed.s = -1.0f;
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
     double t = 0.0;
     int n = 0;
     while (t < 6.0) {
@@ -2505,7 +2505,7 @@ TEST_F(TestLevelSetMultiObject, EmptyStep)
     const LabelTree labBefore(m.labels()->tree());
     ConstantSpeed speed;
     speed.s = -1.0f;
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(m, speed);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(m, speed);
     EXPECT_EQ(lsmo.step(0.5f), 0.5f);
     EXPECT_TRUE(m.phi()->tree().hasSameTopology(phiBefore));
     EXPECT_TRUE(m.labels()->tree().hasSameTopology(labBefore));
@@ -2534,7 +2534,7 @@ TEST_F(TestLevelSetMultiObject, StepPeakMemory)
         auto m = MLS::fromSignedGrids(in, 3);
         ConstantSpeed speed;
         speed.s = -1.0f;
-        tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+        lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
         lsmo.setTemporalScheme(scheme);
         EXPECT_EQ(lsmo.scratchMemUsage(), size_t(0));
         for (int n = 0; n < 16; ++n) {
@@ -2562,7 +2562,7 @@ TEST_F(TestLevelSetMultiObject, InterruptMidAdvect)
     ConstantSpeed speed;
     speed.s = -1.0f;
     CountingInterrupter interrupter;
-    tools::LevelSetMultiObject<MLS, ConstantSpeed, CountingInterrupter> lsmo(*m, speed, &interrupter);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed, CountingInterrupter> lsmo(*m, speed, &interrupter);
     // uninterrupted, t = 15 needs at least 15 steps (dt <= cfl*dx)
     const size_t steps = lsmo.advect(0.0, 15.0);
     EXPECT_LT(steps, size_t(15));
@@ -2581,7 +2581,7 @@ TEST_F(TestLevelSetMultiObject, SplitStepInterrupt)
     Forces forces;
     forces.setCurvatureWeight(1.0f);
     CountingInterrupter interrupter;
-    tools::LevelSetMultiObject<MLS, Forces, CountingInterrupter> lsmo(*m, forces, &interrupter);
+    lsmo_frames::FrameEvolver<MLS, Forces, CountingInterrupter> lsmo(*m, forces, &interrupter);
     const size_t steps = lsmo.advect(0.0, 30.0);
     EXPECT_EQ(steps, size_t(1));
     EXPECT_EQ(interrupter.calls, 3);
@@ -2607,7 +2607,7 @@ TEST_F(TestLevelSetMultiObject, ThinFeatureVanishes)
     Forces forces;
     forces.setCurvatureWeight(1.0f);
     forces.setPressure(FloatGrid::create(-1.0f), 1.0f); // inward
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     for (int n = 0; n < 45; ++n) {
         lsmo.step(1.0f);
         std::string msg;
@@ -2633,7 +2633,7 @@ TEST_F(TestLevelSetMultiObject, EvolverSerialMatchesParallel)
     auto a = MLS::fromLabelGrid(*labels);
     auto b = MLS::fromLabelGrid(*labels);
     RandomSpeed speed({1, 2, 3}, 7u);
-    tools::LevelSetMultiObject<MLS, RandomSpeed> serial(*a, speed), parallel(*b, speed);
+    lsmo_frames::FrameEvolver<MLS, RandomSpeed> serial(*a, speed), parallel(*b, speed);
     serial.setGrainSize(0);
     for (int n = 0; n < 15; ++n) {
         EXPECT_EQ(serial.step(1.0f), parallel.step(1.0f));
@@ -2687,7 +2687,7 @@ runContactNoCascade(double motion)
     auto m = MLS::fromLabelGrid(*labels);
     LabelSpeed speed;
     speed.speeds = {{1, -0.5f}, {2, -1.0f}};
-    tools::LevelSetMultiObject<MLS, LabelSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, LabelSpeed> lsmo(*m, speed);
     applyMotion(lsmo, motion);
     const double cap = lsmo.maxInterfaceMotion();
     auto extent = [&]() {
@@ -2778,7 +2778,7 @@ TEST_F(TestLevelSetMultiObject, WallRetreat)
     LabelSpeed speed;
     speed.speeds = {{1, 1.0f}};
     speed.fixed = {2};
-    tools::LevelSetMultiObject<MLS, LabelSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, LabelSpeed> lsmo(*m, speed);
     const Coord wallSide(7, 8, 8), retreat(8, 8, 8);
     const float wallPhi = m->phi()->tree().getValue(wallSide);
     ASSERT_EQ(m->labels()->tree().getValue(retreat), 1);
@@ -2950,7 +2950,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectAdvection)
     auto m = makeSphere(kEqRadius, kEqCenter);
     Forces forces;
     forces.setAdvection(vel, 1.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     pinFirstOrder(lsmo, &forces); // compared against the first-order reference
     const size_t steps = lsmo.advect(0.0, 30.0);
     // exact solution: the sphere rotated by 0.05*30 = 1.5 radians about z
@@ -2971,7 +2971,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
     auto m = makeSphere(kEqRadius, kEqCenter);
     Forces forces;
     forces.setCurvatureWeight(1.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     pinFirstOrder(lsmo, &forces); // compared against the first-order reference
     const size_t steps = lsmo.advect(0.0, 30.0);
     // exact: r^2 = r0^2 - 2t at the unmoved center
@@ -2996,7 +2996,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     Forces forces;
     forces.setAdvection(vel, 1.0f);
     forces.setCurvatureWeight(1.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     pinFirstOrder(lsmo, &forces); // compared against the first-order reference
     EXPECT_TRUE(lsmo.splitting()); // the default for a split speed functor
     const size_t steps = lsmo.advect(0.0, 15.0);
@@ -3013,7 +3013,7 @@ TEST_F(TestLevelSetMultiObject, SchemeDefaultsAndSetters)
 {
     auto m = makeSphere(8.0);
     Forces forces;
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     EXPECT_EQ(lsmo.spatialScheme(), math::HJWENO5_BIAS);
     EXPECT_EQ(lsmo.temporalScheme(), math::TVD_RK2);
     for (math::BiasedGradientScheme s : {math::SECOND_BIAS, math::THIRD_BIAS, math::WENO5_BIAS}) {
@@ -3038,7 +3038,7 @@ TEST_F(TestLevelSetMultiObject, Weno5NeedsHalfWidth3)
     ASSERT_EQ(m->halfWidth(), 2);
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
-    using Evolver = tools::LevelSetMultiObject<MLS, Forces>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, Forces>;
     // the default HJWENO5 needs a band of 3 voxels: construction throws
     EXPECT_THROW(Evolver(*m, forces), ValueError);
     EXPECT_THROW(Evolver(*m, forces, math::HJWENO5_BIAS), ValueError);
@@ -3115,7 +3115,7 @@ TEST_F(TestLevelSetMultiObject, Weno5ReducesAdvectionError)
         auto m = makeSphere(kEqRadius, kEqCenter);
         Forces forces;
         forces.setAdvection(vel, 1.0f);
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         if (k == 0) pinFirstOrder(lsmo);
         const auto start = std::chrono::steady_clock::now();
         const size_t steps = lsmo.advect(0.0, 30.0);
@@ -3170,7 +3170,7 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
         forces.setCurvatureWeight(weight);
         forces.setFixedLabels({2});
         ASSERT_EQ(forces.parabolicStableDt(1.0f), pStable);
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         ASSERT_TRUE(lsmo.splitting());
         std::vector<float> dts;
         int firstContact = -1;
@@ -3211,7 +3211,7 @@ TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
         Forces forces;
         forces.setPressure(pressure, 1.0f);
         forces.setCurvatureWeight(weight);
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         ASSERT_TRUE(lsmo.splitting());
         const double tEnd = 6.0;
         std::vector<float> dts;
@@ -3491,7 +3491,7 @@ bool allPhiFinite(const MLS& m)
 
 TEST_F(TestLevelSetMultiObject, VolumeConstraintApi)
 {
-    using Evolver = tools::LevelSetMultiObject<MLS, LabelSpeed>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, LabelSpeed>;
     // labelVolume: a sphere of radius 8 (dx 1 and 0.5) within 1% of 4/3 pi r^3;
     // an absent label has volume 0
     const double r = 8.0;
@@ -3564,7 +3564,7 @@ TEST_F(TestLevelSetMultiObject, VolumeConstraintCancelsDrift)
         auto m = makeSphere(8.0);
         LabelSpeed speed;
         speed.speeds[1] = 0.5f;
-        tools::LevelSetMultiObject<MLS, LabelSpeed> e(*m, speed);
+        lsmo_frames::FrameEvolver<MLS, LabelSpeed> e(*m, speed);
         const double v0 = e.labelVolume(1);
         if (k == 1) e.preserveInitialVolume(1);
         e.advect(0.0, 10.0);
@@ -3593,7 +3593,7 @@ TEST_F(TestLevelSetMultiObject, VolumeConstraintVanishingLabel)
     auto m = MLS::fromSignedGrids(in);
     LabelSpeed speed;
     speed.speeds[1] = 2.0f;
-    tools::LevelSetMultiObject<MLS, LabelSpeed> e(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, LabelSpeed> e(*m, speed);
     e.preserveInitialVolume(2);
     e.setVolumeConstraint(3, 0.0);
     const double v2 = e.labelVolume(2);
@@ -3915,7 +3915,7 @@ TEST_F(TestLevelSetMultiObject, ConnectivityRuleMatters)
     EXPECT_NE(bad26.message.find("rule FG26_BG6"), std::string::npos) << bad26.message;
     // the evolver's rule is what connectivityOf reports
     Forces forces;
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*corner, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*corner, forces);
     for (Conn conn : kAllConn) {
         lsmo.setConnectivity(conn);
         EXPECT_EQ(lsmo_test::connectivityOf(lsmo), conn);
@@ -4141,7 +4141,7 @@ runCubeThroughSpheres(bool protect, Conn rule, int grainSize = 1, double tEnd = 
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
     forces.setCurvatureWeight(0.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     lsmo.setGrainSize(grainSize);
     applyMotion(lsmo, motion);
     for (int s = 0; s < 3; ++s) {
@@ -4321,7 +4321,7 @@ TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
     {
         auto m = makeSphere(8.0);
         Forces forces;
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         ASSERT_EQ(lsmo.spatialScheme(), math::HJWENO5_BIAS);
         ASSERT_EQ(lsmo.temporalScheme(), math::TVD_RK2);
     }
@@ -4334,7 +4334,7 @@ TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
     ConstantSpeed speed;
     speed.s = -1.0f;
     speed.fixed = {2};
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
     for (int n = 0; n < 30; ++n) {
         lsmo.step(0.75f);
         std::string msg;
@@ -4411,7 +4411,7 @@ runPartitionScenario(int grainSize, int steps)
     }
     auto m = MLS::fromLabelGrid(*labels);
     RandomSpeed speed({1, 2, 3, 4}, 20261108u);
-    tools::LevelSetMultiObject<MLS, RandomSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, RandomSpeed> lsmo(*m, speed);
     lsmo.setGrainSize(grainSize);
     for (int n = 0; n < steps; ++n) lsmo.step(1.0f);
     return m;
@@ -4445,7 +4445,7 @@ evolveCubeThroughSpheres(Conn rule, int grainSize, double tEnd)
     Forces forces;
     forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
     forces.setCurvatureWeight(0.0f);
-    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
     lsmo.setGrainSize(grainSize);
     for (int s = 0; s < 3; ++s) {
         lsmo.setKinematicLabel(2 + s, tools::createLevelSetSphere<FloatGrid>(4.0f,
@@ -4644,7 +4644,7 @@ TEST_F(TestLevelSetMultiObject, ExtractAccuracyAfterEvolution)
         extractSelfConsistency(*m, 1, iface0, rms0);
         Forces forces;
         c.setup(forces);
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         const size_t steps = lsmo.advect(0.0, c.t1);
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << c.name << ": " << msg;
@@ -4735,7 +4735,7 @@ TEST_F(TestLevelSetMultiObject, SpeedExtensionKeepsDistance)
         Forces forces;
         forces.setSpeedExtension(on == 1);
         forces.setAdvection(makeShearField(m->phi()->transform()), 1.0f);
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         const size_t steps = lsmo.advect(0.0, kT1);
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << msg;
@@ -4759,7 +4759,7 @@ TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)
         ASSERT_DOUBLE_EQ(m->voxelSize(), dx);
         Forces forces;
         forces.setPressure(FloatGrid::create(1.0f), 1.0f); // outward at unit speed
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         const size_t steps = lsmo.advect(0.0, 6.0);
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << msg;
@@ -4773,7 +4773,7 @@ TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)
         auto m = makeSphere(8.0, Vec3d(0.0), dx);
         Forces forces;
         forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         const Vec3d c0 = centroid(zeroCrossings(*m->extractSignedDistance(1)));
         const size_t steps = lsmo.advect(0.0, 7.5);
         std::string msg;
@@ -4792,7 +4792,7 @@ TEST_F(TestLevelSetMultiObject, WorldUnitsHalfVoxel)
         Forces forces;
         forces.setCurvatureWeight(1.0f);
         EXPECT_FLOAT_EQ(forces.stableDt(float(dx)), float(dx * dx / 6.0));
-        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
         const size_t steps = lsmo.advect(0.0, 30.0);
         std::string msg;
         ASSERT_TRUE(m->validate(&msg)) << msg;
@@ -4841,7 +4841,7 @@ void
 expectIncrementalMatchesFull(const std::string& name, const MakeT& make, const SpeedT& speed,
     const ConfigT& config, double tEnd, double chunk, bool check = true)
 {
-    using Evolver = tools::LevelSetMultiObject<MLS, SpeedT>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, SpeedT>;
     MLS::Ptr full = make(), incr = make();
     const double dx = full->voxelSize();
     // the default HJWENO5 needs halfWidth >= 3: narrower bands run FIRST_BIAS
@@ -4985,7 +4985,7 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
             Forces forces;
             forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
             forces.setCurvatureWeight(0.0f);
-            auto config = [](tools::LevelSetMultiObject<MLS, Forces>& e) {
+            auto config = [](lsmo_frames::FrameEvolver<MLS, Forces>& e) {
                 for (int s = 0; s < 3; ++s) {
                     e.setKinematicLabel(2 + s, tools::createLevelSetSphere<FloatGrid>(4.0f,
                         Vec3f(kOrbitSpheres[s].asVec3d()), 1.0f), orbitMotion);
@@ -5014,7 +5014,7 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
             };
             LabelSpeed speed; // all zero
             auto ball = [](double y0, double v) {
-                return [y0, v](tools::LevelSetMultiObject<MLS, LabelSpeed>& e) {
+                return [y0, v](lsmo_frames::FrameEvolver<MLS, LabelSpeed>& e) {
                     e.setKinematicLabel(2, tools::createLevelSetSphere<FloatGrid>(4.0f,
                         Vec3f(12.0f, float(y0), 12.0f), 1.0f), [v](double t) {
                             math::Mat4d m = math::Mat4d::identity();
@@ -5040,7 +5040,7 @@ TEST_F(TestLevelSetMultiObject, MaxInterfaceMotionApi)
 {
     auto m = makeSphere(8.0);
     ConstantSpeed speed;
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
     EXPECT_EQ(lsmo.maxInterfaceMotion(), tools::lsmo_internal::kDefaultMaxInterfaceMotionVoxels);
     lsmo.setMaxInterfaceMotion(tools::lsmo_internal::kFullVoxelMotion);
     EXPECT_EQ(lsmo.maxInterfaceMotion(), 1.0);
@@ -5142,7 +5142,7 @@ TEST_F(TestLevelSetMultiObject, ExternalEditsMarked)
     // abort in the dirty-region check, and the incremental run keeps
     // matching a full-redistance run (labels identical, phi within the
     // redistance tolerance, as in IncrementalRedistanceMatchesFull).
-    using Evolver = tools::LevelSetMultiObject<MLS, Forces>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, Forces>;
     MLS::Ptr incr = makeEditScene(), full = makeEditScene();
     const double dx = incr->voxelSize();
     Forces forces;
@@ -5277,7 +5277,7 @@ TEST_F(TestLevelSetMultiObject, FeatureCombination)
     // redistance) is checked after every chunk (expectComboInvariants) and
     // against a full-redistance run (labels and topology identical, phi
     // within 1e-4*dx, halfWidth 3); a grain-64 run ends bit-identical to it.
-    using Evolver = tools::LevelSetMultiObject<MLS, Forces>;
+    using Evolver = lsmo_frames::FrameEvolver<MLS, Forces>;
     for (double curvature : {0.3, 1.5}) {
         for (double motion : {0.5, 1.0}) {
             std::ostringstream os;
@@ -5387,7 +5387,7 @@ TEST_F(TestLevelSetMultiObject, StepBenchmark)
                 forces.setAdvection(vortex.velocity(), 1.0f);
                 forces.setCurvatureWeight(float(vortex.curvature));
                 if (configs[k].legacy) forces.setSpeedExtension(false);
-                tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+                lsmo_frames::FrameEvolver<MLS, Forces> lsmo(*m, forces);
                 configureBench(lsmo, configs[k]);
                 const auto start = std::chrono::steady_clock::now();
                 res[k].steps = lsmo.advect(0.0, kEnd);
@@ -5400,7 +5400,7 @@ TEST_F(TestLevelSetMultiObject, StepBenchmark)
                 active = m->phi()->activeVoxelCount();
                 ConstantSpeed speed;
                 speed.s = -1.0f;
-                tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+                lsmo_frames::FrameEvolver<MLS, ConstantSpeed> lsmo(*m, speed);
                 configureBench(lsmo, configs[k]);
                 const auto start = std::chrono::steady_clock::now();
                 res[k].steps = lsmo.advect(0.0, kEnd);
