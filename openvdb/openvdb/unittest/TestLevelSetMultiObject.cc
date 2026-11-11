@@ -5186,6 +5186,148 @@ TEST_F(TestLevelSetMultiObject, ExternalEditsMarked)
 }
 
 
+namespace {
+
+// Feature combination: a topology-protected hollow cube (label 1, one
+// component, one cavity, holding label 4), a volume-constrained sphere
+// (label 2) driven toward it by its own advection field, and a kinematic
+// sphere (label 3) moving through the cube wall into the cavity, under a
+// shared advection field and curvature.
+MLS::Ptr
+makeComboScene()
+{
+    constexpr int kCube = 18, kWall = 3;
+    Int32Grid::Ptr labels = Int32Grid::create(0);
+    auto acc = labels->getAccessor();
+    for (auto p = CoordBBox(Coord(0), Coord(kCube - 1)).begin(); p; ++p) {
+        const bool inner = CoordBBox(Coord(kWall), Coord(kCube - 1 - kWall)).isInside(*p);
+        acc.setValue(*p, inner ? 4 : 1);
+    }
+    const Coord c2(29, 9, 9);
+    for (auto p = CoordBBox(c2 - Coord(7), c2 + Coord(7)).begin(); p; ++p) {
+        if ((*p - c2).asVec3d().length() < 6.0) acc.setValue(*p, 2);
+    }
+    return MLS::fromLabelGrid(*labels, 3);
+}
+
+// to t = 14: the kinematic sphere enters the cube wall at t = 6 and the
+// cavity at about t = 9; the constrained sphere reaches the cube at about
+// t = 8
+constexpr double kComboEnd = 14.0, kComboChunk = 2.0;
+
+// Configure @a e for the combination (curvature is in the forces).
+template<typename EvolverT>
+void
+configureCombo(EvolverT& e, double motion)
+{
+    e.setMaxInterfaceMotion(motion);
+    e.setTopologyPreservingLabels({1});
+    e.preserveInitialVolume(2);
+    e.setKinematicLabel(3, tools::createLevelSetSphere<FloatGrid>(4.0f, Vec3f(0.0f), 1.0f, 3.0f),
+        [](double t) {
+            math::Mat4d m = math::Mat4d::identity();
+            m.setTranslation(Vec3d(-10.0 + t, 9.0, 9.0));
+            return m;
+        });
+}
+
+Forces
+comboForces(double curvature)
+{
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(0.3f, 0.0f, 0.0f)), 1.0f);
+    forces.setAdvection(2, Vec3SGrid::create(Vec3s(-0.8f, 0.0f, 0.0f)), 1.0f);
+    forces.setCurvatureWeight(float(curvature));
+    return forces;
+}
+
+// Invariants of the combination after a chunk: validate, partition, phi
+// floor, no active phi = 0, the protected cube keeps one component and one
+// cavity.
+template<typename EvolverT>
+void
+expectComboInvariants(const MLS& m, const EvolverT& e)
+{
+    // the cube (0..17, moving +x at 0.3) and the spheres near it
+    const CoordBBox domain(Coord(-16), Coord(40));
+    std::string msg;
+    EXPECT_TRUE(m.validate(&msg)) << msg;
+    Index64 overlaps = 0, badCover = 0;
+    partitionErrors(m, overlaps, badCover);
+    EXPECT_EQ(overlaps, Index64(0));
+    EXPECT_EQ(badCover, Index64(0));
+    EXPECT_TRUE(e.validateTopologyFloor());
+    Index64 zeros = 0;
+    for (auto it = m.phi()->tree().cbeginValueOn(); it; ++it) zeros += (*it == 0.0f);
+    EXPECT_EQ(zeros, Index64(0));
+    const auto cube = lsmo_test::digitalTopology(*m.labels(), 1, domain,
+        tools::MultiObjectConnectivity::FG26_BG6);
+    EXPECT_EQ(cube.components, 1);
+    EXPECT_EQ(cube.cavities, 1);
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, FeatureCombination)
+{
+    // Topology preservation, a volume constraint, per-label advection, a
+    // kinematic label and curvature together, with the default HJWENO5 /
+    // TVD-RK2 schemes, at half- and full-voxel motion and at a weak (0.3)
+    // and a strong (1.5, split steps) curvature. A serial run (incremental
+    // redistance) is checked after every chunk (expectComboInvariants) and
+    // against a full-redistance run (labels and topology identical, phi
+    // within 1e-4*dx, halfWidth 3); a grain-64 run ends bit-identical to it.
+    using Evolver = tools::LevelSetMultiObject<MLS, Forces>;
+    for (double curvature : {0.3, 1.5}) {
+        for (double motion : {0.5, 1.0}) {
+            std::ostringstream os;
+            os << "FeatureCombination/curvature " << curvature << "/motion " << motion;
+            const std::string name = os.str();
+            SCOPED_TRACE(name);
+            const auto start = std::chrono::steady_clock::now();
+            const Forces forces = comboForces(curvature);
+            MLS::Ptr serial = makeComboScene(), parallel = makeComboScene(),
+                full = makeComboScene();
+            const double dx = serial->voxelSize();
+            Evolver es(*serial, forces), ep(*parallel, forces), ef(*full, forces);
+            es.setGrainSize(0);
+            ep.setGrainSize(64);
+            ef.setFullRedistance(true);
+            for (Evolver* e : {&es, &ep, &ef}) configureCombo(*e, motion);
+            size_t steps = 0;
+            double worst = 0.0;
+            for (double t = 0.0; t < kComboEnd - 1e-9; t += kComboChunk) {
+                SCOPED_TRACE("t " + std::to_string(t + kComboChunk));
+                const size_t n = es.advect(t, t + kComboChunk);
+                EXPECT_GT(n, size_t(0));
+                steps += n;
+                ep.advect(t, t + kComboChunk);
+                ef.advect(t, t + kComboChunk);
+                expectComboInvariants(*serial, es);
+                EXPECT_EQ(treeDifferences(full->labels()->tree(), serial->labels()->tree()),
+                    Index64(0));
+                ASSERT_TRUE(full->phi()->tree().hasSameTopology(serial->phi()->tree()));
+                tree::ValueAccessor<const FloatTree> acc(serial->phi()->tree());
+                for (auto it = full->phi()->tree().cbeginValueOn(); it; ++it) {
+                    worst = std::max(worst,
+                        std::abs(double(*it) - double(acc.getValue(it.getCoord()))));
+                }
+                EXPECT_LE(worst, 1e-4 * dx);
+                if (::testing::Test::HasFailure()) break;
+            }
+            EXPECT_EQ(stateHash(*serial), stateHash(*parallel));
+            EXPECT_EQ(es.redistanceCapHits(), size_t(0));
+            EXPECT_EQ(ef.redistanceCapHits(), size_t(0));
+            std::cout << name << ": " << steps << " steps, max |phi_full - phi_incr| "
+                      << worst / dx << " dx, euler fallbacks " << es.eulerFallbacks() << ", "
+                      << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start).count()
+                      << " s" << std::endl;
+        }
+    }
+}
+
+
 ////////////////////////////////////////
 // Step benchmark (informational: prints only, asserts nothing about time).
 
