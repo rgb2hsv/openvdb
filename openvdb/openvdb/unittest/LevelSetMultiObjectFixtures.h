@@ -239,42 +239,57 @@ contactPairs(const MultiLevelSetT& m)
     return pairs;
 }
 
-/// Vortex field:
-/// - Rankine-style swirl about z: u_theta = swirl*(r/R) for r < R,
-///   swirl*(R/r) outside (divergence-free);
-/// - radial inflow towards the ring r = rs: u_r = -inflow*tanh((r - rs)/w),
-///   i.e. translation at ~inflow away from the ring and a convergence zone of
-///   width ~w around it (compressive only inside that zone);
-/// - updraft u_z = updraft*exp(-r^2/(2 R^2)) (divergence-free).
-/// An exact flow never brings disjoint objects into contact, and an
-/// axisymmetric flow keeps the angular gaps of objects at one radius, so
-/// contact comes from objects on the same ray pressed together in the
-/// convergence zone until their gap is below a voxel.
+/// Vortex field: a divergence-free inward spiral towards the origin (the
+/// center of the velocity grid), in cylindrical coordinates (r, theta, z)
+/// about the z axis:
+/// - radial inflow u_r = -inflow*tanh(r/core): ~inflow far from the axis,
+///   vanishing linearly at it;
+/// - solid-body swirl u_theta = angularVelocity*r (rigid rotation, so
+///   neighbors on one circle do not shear past each other);
+/// - axial outflow u_z = z*D(r) with D = -(1/r) d(r u_r)/dr, which cancels
+///   the horizontal convergence: the flow preserves volume, so objects
+///   spiral in while stretching along z about the plane z = 0.
+/// An exact flow never brings disjoint objects into contact (gaps between
+/// neighbors on one circle shrink in proportion to r); contact comes from
+/// those gaps closing below a voxel as the objects are drawn inwards.
 struct Vortex
 {
     /// Schedule: chunk length, cap on the time to first contact, end time.
     static constexpr double kChunk = 2.0, kContactCap = 70.0, kEndTime = 60.0;
 
     /// Parameters (see VortexEightObjects for why they were chosen).
-    static constexpr double kShapeScale = 1.4;   ///< factor on every shape dimension
-    static constexpr double kInflow = 0.1;       ///< far-field radial speed towards the ring
-    static constexpr double kUpdraft = 0.1;      ///< peak updraft speed
+    static constexpr double kShapeScale = 1.4;      ///< factor on every shape dimension
+    static constexpr double kRingPolygonRadius = 5.0; ///< label 8 polygon radius before scaling
+    static constexpr double kStartRadius = 34.0;    ///< initial distance of centers from the axis
+    static constexpr double kInflow = 0.4;          ///< far-field radial speed towards the axis
+    static constexpr double kCoreRadius = 8.0;      ///< inflow vanishes linearly inside ~this
+    static constexpr double kAngularVelocity = 0.012; ///< swirl, radians per unit time
     static constexpr double kCurvatureWeight = 0.003;
-    static constexpr double kRingClearance = 0.75; ///< voxels from the ring to each surface
-    static constexpr int kBoxHalfWidth = 80;     ///< velocity grid is [-80, 80]^3
-    double R = 16.0, swirl = 0.1, inflow = kInflow, rs = 38.5, w = 1.0, updraft = kUpdraft,
-        z0 = -20.0;
-    double scale = kShapeScale, curvature = kCurvatureWeight, gap = kRingClearance;
+    static constexpr int kBoxHalfWidth = 80;        ///< velocity grid is [-80, 80]^3
+    static constexpr int kNumObjects = 8;
+    /// Below this r/core, convergence() uses its limit at the axis.
+    static constexpr double kAxisTolerance = 1e-6;
+    double inflow = kInflow, core = kCoreRadius, angularVelocity = kAngularVelocity,
+        r0 = kStartRadius, ringRadius = kRingPolygonRadius;
+    double scale = kShapeScale, curvature = kCurvatureWeight;
     int box = kBoxHalfWidth;
+
+    /// D(r) = -(1/r) d(r u_r)/dr, the horizontal convergence rate.
+    double convergence(double r) const
+    {
+        const double x = r / core;
+        if (x < kAxisTolerance) return 2.0 * inflow / core;
+        const double sech = 1.0 / std::cosh(x);
+        return inflow * (std::tanh(x) + x * sech * sech) / r;
+    }
     openvdb::Vec3s operator()(const openvdb::Vec3d& p) const
     {
         using openvdb::Vec3d;
         const double r = std::sqrt(p[0] * p[0] + p[1] * p[1]);
-        const double ut = swirl * (r < R ? r / R : R / r);
-        const double ur = -inflow * std::tanh((r - rs) / w);
-        const double uz = updraft * std::exp(-r * r / (2.0 * R * R));
-        Vec3d v(0.0, 0.0, uz);
-        if (r > 0.0) v += Vec3d(-p[1], p[0], 0.0) * (ut / r) + Vec3d(p[0], p[1], 0.0) * (ur / r);
+        const double ur = -inflow * std::tanh(r / core);
+        Vec3d v = Vec3d(-p[1], p[0], 0.0) * angularVelocity
+            + Vec3d(0.0, 0.0, p[2] * convergence(r));
+        if (r > 0.0) v += Vec3d(p[0], p[1], 0.0) * (ur / r);
         return openvdb::Vec3s(v);
     }
 
@@ -289,7 +304,8 @@ struct Vortex
     /// Base (pre-scale) sizes: sphere r = 10; cube side 12; tetrahedron,
     /// octahedron, dodecahedron, icosahedron with factory scale (circumradius)
     /// 10; capsule along z with radius 5 and axis endpoints +-5; closed ring
-    /// = 8-segment polygon of radius 7 in the xy plane with tube radius 3.
+    /// = 8-segment polygon of radius kRingPolygonRadius in the xy plane with
+    /// tube radius 3.
     /// Every length is multiplied by kShapeScale. No rotations.
     openvdb::FloatGrid::Ptr shape(int32_t l, const openvdb::Vec3f& c) const
     {
@@ -311,8 +327,8 @@ struct Vortex
             std::vector<Vec2I> segs;
             for (int i = 0; i < 8; ++i) {
                 const double a = i * math::pi<double>() / 4.0;
-                verts.push_back(c + Vec3f(float(7.0 * S * std::cos(a)),
-                    float(7.0 * S * std::sin(a)), 0.0f));
+                verts.push_back(c + Vec3f(float(ringRadius * S * std::cos(a)),
+                    float(ringRadius * S * std::sin(a)), 0.0f));
                 segs.push_back(Vec2I(i, (i + 1) % 8));
             }
             return tools::createLevelSetTubeComplex<FloatGrid>(verts, segs, 3.0f * S, dx, hw);
@@ -320,30 +336,16 @@ struct Vortex
         }
     }
 
-    /// Initial signed grids, labels 1-8: four rays at angles k*90 degrees in
-    /// the z = z0 plane; label k+1 inside and label k+5 outside the ring
-    /// r = rs (between voxel centers) on ray k, each placed so its surface
-    /// point nearest the ring is kRingClearance voxels from it.
+    /// Initial signed grids, labels 1-8: label l centered at angle
+    /// (l-1)*45 degrees on the circle r = r0 in the plane z = 0, i.e. equally
+    /// spaced around the periphery of the vortex.
     std::map<int32_t, openvdb::FloatGrid::ConstPtr> inputs() const
     {
         using namespace openvdb;
-        // extent of a shape centered at the origin along unit direction d: max
-        // of p.d - psi(p) over interior voxels (psi < 0)
-        auto extent = [](const FloatGrid& g, const Vec3d& d) {
-            double e = 0.0;
-            for (auto it = g.tree().cbeginValueOn(); it; ++it) {
-                if (*it < 0.0f) e = std::max(e, g.indexToWorld(it.getCoord()).dot(d) - double(*it));
-            }
-            return e;
-        };
         std::map<int32_t, FloatGrid::ConstPtr> in;
-        for (int32_t l = 1; l <= 8; ++l) {
-            const double a = ((l - 1) % 4) * math::pi<double>() / 2.0;
-            const Vec3d ray(std::cos(a), std::sin(a), 0.0);
-            const bool inner = l <= 4;
-            const double e = extent(*shape(l, Vec3f(0.0f)), inner ? ray : -ray);
-            const double rad = inner ? rs - gap - e : rs + gap + e;
-            in[l] = shape(l, Vec3f(ray * rad + Vec3d(0.0, 0.0, z0)));
+        for (int32_t l = 1; l <= kNumObjects; ++l) {
+            const double a = (l - 1) * 2.0 * math::pi<double>() / kNumObjects;
+            in[l] = shape(l, Vec3f(Vec3d(std::cos(a), std::sin(a), 0.0) * r0));
         }
         return in;
     }
