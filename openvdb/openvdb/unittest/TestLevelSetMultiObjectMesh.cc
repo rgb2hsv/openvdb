@@ -559,7 +559,7 @@ makeRandomLabels(uint32_t seed, int n, int nLabels, int block, bool randomPhi)
     if (!randomPhi) {
         for (int i = 0; i < n; ++i)
             for (int j = 0; j < n; ++j)
-                for (int k = 0; k < n; ++k) la.setValue(Coord(i, j, k), labelAt(Coord(i, j, k)));
+                for (int k = 0; k < n; ++k) la.setValue(Coord(i, j, k), static_cast<MLS::LabelT>(labelAt(Coord(i, j, k))));
         return MLS::fromLabelGrid(*lab, 3);
     }
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);
@@ -573,7 +573,7 @@ makeRandomLabels(uint32_t seed, int n, int nLabels, int block, bool randomPhi)
                 bool iface = false;
                 for (int f = 0; f < 6; ++f) iface = iface || labelAt(c + offs[f]) != labelAt(c);
                 const double u = double(rng()) / 4294967296.0;
-                la.setValue(c, labelAt(c));
+                la.setValue(c, static_cast<MLS::LabelT>(labelAt(c)));
                 pa.setValue(c, float(iface ? 0.02 + 0.96 * u : 1.0 + 1.9 * u));
             }
     return MLS::Ptr(new MLS(phi, lab, 3));

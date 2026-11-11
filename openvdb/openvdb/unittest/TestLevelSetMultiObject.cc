@@ -163,7 +163,7 @@ TEST_F(TestLevelSetMultiObject, HolderInvariantThrows)
     auto pair = [](float bg, int32_t labelBg, double dx = 0.5) {
         auto xform = math::Transform::createLinearTransform(dx);
         FloatGrid::Ptr phi = FloatGrid::create(bg);
-        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(labelBg);
+        MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(static_cast<MLS::LabelT>(labelBg));
         phi->setTransform(xform);
         lab->setTransform(xform->copy());
         phi->tree().setValueOn(Coord(0, 0, 0), 0.25f);
@@ -582,7 +582,7 @@ TEST_F(TestLevelSetMultiObject, HolderErodePrunesInactive)
     auto labelAt = [](const Coord& c) { return c[0] < 8 ? 1 : 2; };
     for (auto it = box.begin(); it; ++it) {
         pa.setValue(*it, 0.25f);
-        la.setValue(*it, labelAt(*it));
+        la.setValue(*it, static_cast<MLS::LabelT>(labelAt(*it)));
     }
     MLS m(phi, lab, 3);
     m.erode(1);
@@ -723,10 +723,10 @@ makeBall(double dx, const Vec3d& ctr, double R, int lo, int hi)
                 const int label = r < R ? 1 : 2;
                 if (std::abs(r - R) <= 3.0) {
                     pa.setValue(c, float(std::abs(r - R) * dx));
-                    la.setValue(c, label);
+                    la.setValue(c, static_cast<MLS::LabelT>(label));
                 } else {
                     pa.touchLeaf(c);
-                    la.setValueOff(c, label);
+                    la.setValueOff(c, static_cast<MLS::LabelT>(label));
                 }
             }
     return MLS::Ptr(new MLS(phi, lab, 3));
@@ -821,10 +821,10 @@ TEST_F(TestLevelSetMultiObject, RedistanceOrderIndependent)
                     const bool inside = i >= 0 && i < 24 && j >= 0 && j < 24 && k >= 0 && k < 24;
                     if (inside && std::abs(r - R) <= 4.0) {
                         pa.setValue(c, float(std::abs(r - R) * dx * (1.0 + 0.1 * ((i * 7 + j * 3 + k) % 5))));
-                        la.setValue(c, label);
+                        la.setValue(c, static_cast<MLS::LabelT>(label));
                     } else {
                         pa.touchLeaf(c);
-                        la.setValueOff(c, label);
+                        la.setValueOff(c, static_cast<MLS::LabelT>(label));
                     }
                 }
         return MLS::Ptr(new MLS(phi, lab, 3));
@@ -1361,10 +1361,10 @@ struct SectorJunction
                     const double d = std::abs(signedDist(w, l));
                     if (boxDepth(q) > 0.0 && d < halfWidth * dx) {
                         pa.setValue(q, float(d));
-                        la.setValue(q, l);
+                        la.setValue(q, static_cast<MLS::LabelT>(l));
                     } else {
                         pa.touchLeaf(q);
-                        la.setValueOff(q, l);
+                        la.setValueOff(q, static_cast<MLS::LabelT>(l));
                     }
                 }
         return MLS::Ptr(new MLS(phi, lab, halfWidth));
@@ -1444,7 +1444,7 @@ TEST_F(TestLevelSetMultiObject, ClosestPointReflexJunction)
             EXPECT_LE(farFieldDifference(*on, *off, sj), kFarTolerance);
             EXPECT_LE(nearOn, nearOff + kFarTolerance);
             EXPECT_LT(nearOn, kNearGate);
-            if (l == 1) EXPECT_GT(decisive, 0); // the 240 degree sector
+            if (l == 1) { EXPECT_GT(decisive, 0); } // the 240 degree sector
         }
     }
 }
@@ -5072,5 +5072,99 @@ TEST_F(TestLevelSetMultiObject, FullVoxelMotion)
     {
         SCOPED_TRACE("TopologyCubeThroughSpheres");
         runTopologyCubeGates(kFull);
+    }
+}
+
+
+////////////////////////////////////////
+// Step benchmark (informational: prints only, asserts nothing about time).
+
+namespace {
+
+struct BenchConfig
+{
+    const char* name;
+    bool legacy;     // the pre-optimization settings
+    double motion;   // 0: keep the default
+};
+
+struct BenchResult { size_t steps = 0; double secs = 0.0; };
+
+template<typename EvolverT>
+void
+configureBench(EvolverT& e, const BenchConfig& c)
+{
+    if (c.legacy) {
+        e.setSpatialScheme(math::FIRST_BIAS);
+        e.setTemporalScheme(math::TVD_RK1);
+        e.setSplitting(false);
+        e.setFullRedistance(true);
+        e.setMaxInterfaceMotion(0.5);
+    }
+    applyMotion(e, c.motion);
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, StepBenchmark)
+{
+    // Advances each scene (Vortex to t = 20, before first contact; the sphere
+    // growth to t = 10; shorter than the correctness runs) under three
+    // configurations:
+    // (a) the pre-optimization settings (FIRST_BIAS, TVD_RK1, no splitting,
+    // full redistance, 0.5 motion, speed extension off), (b) the defaults,
+    // (c) the defaults with setMaxInterfaceMotion(1.0). Prints ms/step,
+    // steps, total time and speedups relative to (a).
+    const BenchConfig configs[3] = {
+        {"(a) pre-plan", true, 0.0}, {"(b) defaults", false, 0.0},
+        {"(c) defaults + motion 1.0", false, 1.0}};
+    for (int scene = 0; scene < 2; ++scene) {
+        const char* sceneName = scene == 0 ? "Vortex" : "SphereGrowth";
+        const double kEnd = scene == 0 ? 20.0 : 10.0;
+        BenchResult res[3];
+        Index64 active = 0;
+        for (int k = 0; k < 3; ++k) {
+            if (scene == 0) {
+                const Vortex vortex;
+                auto m = MLS::fromSignedGrids(vortex.inputs(), 3);
+                active = m->phi()->activeVoxelCount();
+                Forces forces;
+                forces.setAdvection(vortex.velocity(), 1.0f);
+                forces.setCurvatureWeight(float(vortex.curvature));
+                if (configs[k].legacy) forces.setSpeedExtension(false);
+                tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+                configureBench(lsmo, configs[k]);
+                const auto start = std::chrono::steady_clock::now();
+                res[k].steps = lsmo.advect(0.0, kEnd);
+                res[k].secs = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                std::string msg;
+                EXPECT_TRUE(m->validate(&msg)) << msg;
+            } else {
+                auto m = makeSphere(100.0);
+                active = m->phi()->activeVoxelCount();
+                ConstantSpeed speed;
+                speed.s = -1.0f;
+                tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+                configureBench(lsmo, configs[k]);
+                const auto start = std::chrono::steady_clock::now();
+                res[k].steps = lsmo.advect(0.0, kEnd);
+                res[k].secs = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                std::string msg;
+                EXPECT_TRUE(m->validate(&msg)) << msg;
+            }
+            EXPECT_GT(res[k].steps, size_t(0));
+        }
+        std::cout << "StepBenchmark: " << sceneName << ", t = " << kEnd << ", " << active
+                  << " active voxels at start" << std::endl;
+        for (int k = 0; k < 3; ++k) {
+            const double ms = 1e3 * res[k].secs / double(std::max(res[k].steps, size_t(1)));
+            const double ms0 = 1e3 * res[0].secs / double(std::max(res[0].steps, size_t(1)));
+            std::cout << "StepBenchmark:   " << configs[k].name << ": " << res[k].steps
+                      << " steps, " << ms << " ms/step, " << res[k].secs << " s total, "
+                      << "per-step speedup " << ms0 / ms << "x, total speedup "
+                      << res[0].secs / res[k].secs << "x" << std::endl;
+        }
     }
 }

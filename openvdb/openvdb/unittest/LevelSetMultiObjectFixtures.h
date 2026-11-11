@@ -141,10 +141,10 @@ struct TripleJunction
                     const double d = std::abs(signedDist(w, l));
                     if (boxDepth(q) > 0.0 && d < halfWidth * dx) {
                         pa.setValue(q, float(d));
-                        la.setValue(q, l);
+                        la.setValue(q, static_cast<MLS::LabelT>(l));
                     } else {
                         pa.touchLeaf(q);
-                        la.setValueOff(q, l);
+                        la.setValueOff(q, static_cast<MLS::LabelT>(l));
                     }
                 }
         return MLS::Ptr(new MLS(phi, lab, halfWidth));

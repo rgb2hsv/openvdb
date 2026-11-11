@@ -169,6 +169,8 @@ constexpr double kDefaultMinimumPhiFraction = 1e-3;
 /// Minimum phi of barrier and kinematic-stamp voxels, as a fraction of dx;
 /// keeps a voxel on an obstacle surface from having phi = 0.
 constexpr double kBarrierPhiFraction = 1e-3;
+// (Also the replacement for non-positive redistance results and for ties in
+// the projection, so that a voxel never gets phi = 0.)
 /// Inner bound of the obstacle shell that may join a protected label, as a
 /// distance to the obstacle in voxels.
 constexpr double kObstacleShellInnerVoxels = 0.5;
@@ -1202,7 +1204,9 @@ public:
     /// the whole band). It reproduces redistance(freeze) to within the
     /// tolerance in the tested scenes for halfWidth <= 3; wider bands can
     /// differ by up to about 1e-2*dx. Use redistance(freeze) where the full
-    /// solve's result is required.
+    /// solve's result is required. The evolver passes leaf-granular masks
+    /// (every active voxel of each leaf that holds a changed voxel's
+    /// neighborhood), so the solved set is a superset of that region.
     /// @return the number of Jacobi iterations performed (0 if nothing is
     /// solved).
     int redistance(const BoolTreeT& freeze, const BoolTreeT& dirty)
@@ -2226,7 +2230,8 @@ public:
     /// @brief World position of the closest point on the zero level set of
     /// psi of the current label, x - psi*grad psi/|grad psi|^2, with x the
     /// world position of the center voxel and grad psi the central-difference
-    /// gradient(); x itself where |grad psi|^2 < 1e-8 (no defined normal).
+    /// gradient(); x itself where |grad psi|^2 < kSpeedExtensionMinGradSqr (no
+    /// defined normal).
     /// Computed once per moveTo().
     Vec3d closestInterfacePoint() const
     {
@@ -2492,8 +2497,9 @@ private:
 /// interpolation (8 voxel reads) per field and voxel instead of one direct
 /// read for fields on the level set's transform; the sample is shared by
 /// the labels of an interface, but not across TVD-RK2 stages (each stage
-/// samples at the closest point of its own psi). Where |grad psi|^2 < 1e-8 the voxel center is
-/// used. Off, fields are sampled at the voxel center, as in the reference
+/// samples at the closest point of its own psi). Where |grad psi|^2 is below
+/// lsmo_internal::kSpeedExtensionMinGradSqr the voxel center is used. Off,
+/// fields are sampled at the voxel center, as in the reference
 /// implementation.
 ///
 /// It satisfies the SpeedT concept of LevelSetMultiObject. Label 0 is
@@ -3053,6 +3059,13 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    with psi_l^n by the same rule on the time-n state; its candidates are
 ///    restricted to the time-n label and time-n 26-neighbor labels (and the
 ///    current label), so no label advances more than one voxel per step.
+///    The stage-2 cap is twice the motion cap (2*cfl*dx at full-voxel
+///    motion), the projected set is correspondingly deeper, and the update
+///    keeps the stage-1 result when dt*max|F^(1)| exceeds it. A voxel whose
+///    only candidates are its own label and passive label 0 is not frozen
+///    here (it is redistanced), so at full-voxel motion a voxel adjacent
+///    only to label 0 is unfrozen in the redistance, unlike at half-voxel
+///    motion.
 /// Topology preservation (simple-point test in colored passes), orphan
 /// cleanup, the phi floor, band maintenance and the incremental redistance
 /// are unchanged.
@@ -4077,7 +4090,7 @@ private:
     {
         if (l == 0 || this->isFixed(l)) { c.zero = true; return; } // passive 0 / wall
         for (int i = 0; i < c.n; ++i) if (c.label[i] == l) return;
-        c.label[c.n++] = l; // at most 7 distinct labels
+        c.label[c.n++] = l; // up to 27 distinct labels (26-neighborhood plus own at motion 1.0)
     }
 
     float evalSpeed(StencilT& s, const Coord& ijk, int32_t label, Term term) const

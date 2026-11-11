@@ -9,3 +9,28 @@ OpenVDB:
     Distance Field", MICCAI 2012.
   - Added tools::multiObjectToMesh, topology-constrained multi-label
     contouring.
+  - tools::LevelSetMultiObject optimizations: auxiliary leaf buffers and
+    pooled per-leaf scratch (scratchMemUsage()), direct field reads on
+    aligned transforms, incremental redistancing (setFullRedistance() selects
+    the full solve), Strang operator splitting with an adaptive decision and
+    interruptible sub-updates (setSplitting()), a speed extension that
+    samples advection and pressure at the closest interface point
+    (setSpeedExtension()), closest-point reconstruction at triple junctions
+    (ExtractSettings::closestPointJunctions and
+    MultiObjectMeshSettings::closestPointJunctions, on by default),
+    per-label volume constraints (setVolumeConstraint(),
+    preserveInitialVolume(), clearVolumeConstraints(),
+    setVolumeRelaxation(), labelVolume()), and optional full-voxel interface
+    motion per step (setMaxInterfaceMotion(1.0); the default is 0.5).
+  Improvements:
+  - tools::LevelSetMultiObject labels are 16-bit by default
+    (tools::Int16LabelTree and Int16LabelGrid). Labels are limited to
+    +-32767; call tools::registerMultiLevelSetGridTypes() before writing
+    label grids to a file.
+  - tools::LevelSetMultiObject now defaults to the HJWENO5 spatial scheme
+    and TVD-RK2 time integration (setSpatialScheme(), setTemporalScheme()).
+    HJWENO5 requires a halfWidth of at least 3; use the constructor overload
+    that takes the scheme with math::FIRST_BIAS for a halfWidth of 2.
+  Bug Fixes / API Changes:
+  - Removed the clamp-speed option of tools::LevelSetMultiObject
+    (setClampSpeed()).
