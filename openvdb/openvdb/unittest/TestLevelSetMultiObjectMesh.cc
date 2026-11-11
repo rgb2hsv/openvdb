@@ -559,7 +559,10 @@ makeRandomLabels(uint32_t seed, int n, int nLabels, int block, bool randomPhi)
     if (!randomPhi) {
         for (int i = 0; i < n; ++i)
             for (int j = 0; j < n; ++j)
-                for (int k = 0; k < n; ++k) la.setValue(Coord(i, j, k), static_cast<MLS::LabelT>(labelAt(Coord(i, j, k))));
+                for (int k = 0; k < n; ++k) {
+                    la.setValue(Coord(i, j, k),
+                        static_cast<MLS::LabelT>(labelAt(Coord(i, j, k))));
+                }
         return MLS::fromLabelGrid(*lab, 3);
     }
     FloatGrid::Ptr phi = FloatGrid::create(3.0f);

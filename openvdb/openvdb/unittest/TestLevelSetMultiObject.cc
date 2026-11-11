@@ -5108,6 +5108,9 @@ configureBench(EvolverT& e, const BenchConfig& c)
 
 TEST_F(TestLevelSetMultiObject, StepBenchmark)
 {
+    if (!std::getenv("OPENVDB_MOGAC_BENCHMARK")) {
+        GTEST_SKIP() << "informational; set OPENVDB_MOGAC_BENCHMARK=1 to run";
+    }
     // Advances each scene (Vortex to t = 20, before first contact; the sphere
     // growth to t = 10; shorter than the correctness runs) under three
     // configurations:

@@ -31,6 +31,6 @@ OpenVDB:
     and TVD-RK2 time integration (setSpatialScheme(), setTemporalScheme()).
     HJWENO5 requires a halfWidth of at least 3; use the constructor overload
     that takes the scheme with math::FIRST_BIAS for a halfWidth of 2.
-  Bug Fixes / API Changes:
+  API Changes:
   - Removed the clamp-speed option of tools::LevelSetMultiObject
     (setClampSpeed()).

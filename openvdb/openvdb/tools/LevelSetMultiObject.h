@@ -167,10 +167,10 @@ constexpr double kSpeedExtensionMinGradSqr = 1e-8;
 /// Default minimum phi of protected-label voxels, as a fraction of dx.
 constexpr double kDefaultMinimumPhiFraction = 1e-3;
 /// Minimum phi of barrier and kinematic-stamp voxels, as a fraction of dx;
-/// keeps a voxel on an obstacle surface from having phi = 0.
+/// keeps a voxel on an obstacle surface from having phi = 0. Also the value
+/// written for non-positive redistance results and for ties in the
+/// projection, so an active voxel never gets phi = 0.
 constexpr double kBarrierPhiFraction = 1e-3;
-// (Also the replacement for non-positive redistance results and for ties in
-// the projection, so that a voxel never gets phi = 0.)
 /// Inner bound of the obstacle shell that may join a protected label, as a
 /// distance to the obstacle in voxels.
 constexpr double kObstacleShellInnerVoxels = 0.5;
