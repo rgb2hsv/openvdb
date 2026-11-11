@@ -356,14 +356,18 @@ struct Vortex
     /// >= 4 pairs, -1 before); returning false stops the run.
     /// @return the final time; @a tContact receives the time of the first
     /// chunk with >= 4 pairs (-1 if none).
+    /// @a configure is applied to the evolver before the run (e.g. to
+    /// select its schemes; the defaults otherwise).
+    using Evolver = openvdb::tools::LevelSetMultiObject<MLS, Forces>;
     template<typename PerChunk>
     double run(MLS& m, const openvdb::Vec3SGrid::Ptr& vel, size_t& steps, double& tContact,
-        PerChunk&& perChunk) const
+        PerChunk&& perChunk, const std::function<void(Evolver&)>& configure = {}) const
     {
         Forces forces;
         forces.setAdvection(vel, 1.0f);
         forces.setCurvatureWeight(float(curvature));
-        openvdb::tools::LevelSetMultiObject<MLS, Forces> lsmo(m, forces);
+        Evolver lsmo(m, forces);
+        if (configure) configure(lsmo);
         double t = 0.0;
         steps = 0;
         tContact = -1.0;

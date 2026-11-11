@@ -507,11 +507,16 @@ Required integration tests:
    10) lost the capsule by t = 58; halving the inflow and updraft, starting
    the pairs closer and enlarging the shapes keeps every label alive (first contact at t = 36;
    smallest label 1203 voxels at t = 60; tightest volume-gate margin 3.4 points,
-   label 8 upper bound). The run was first t = 84, then shortened to t = 60.
-   - Every chunk: `validate()`, partition invariant, no NaN.
+   label 8 upper bound, with FIRST_BIAS/TVD_RK1; with the HJWENO5/TVD_RK2
+   defaults: first contact at t = 24, smallest label 1463 voxels, tightest
+   margin 2.2 points, label 8 upper bound). The run was first t = 84, then
+   shortened to t = 60.
+   - Every chunk: `validate()`, partition invariant, no NaN, no active
+     voxel with phi = 0.
    - At end: ≥ 4 distinct label pairs sharing a face; every label still owns
      at least one voxel; with refLoss the volume loss of the same shape
-     advected alone by `LevelSetAdvection` (FIRST_BIAS/TVD_RK1) in the same
+     advected alone by `LevelSetAdvection` with the evolver's schemes
+     (HJWENO5/TVD_RK2 by default) in the same
      field over the same time, each label's voxel-count loss lies in
      [1.1·min(refLoss, 0) − 2%, 1.1·max(refLoss, 0) + 2%] (ruling R31).
    - Different labels never merge; contact means shared interfaces.

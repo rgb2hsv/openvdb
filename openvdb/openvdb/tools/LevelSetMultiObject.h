@@ -75,6 +75,7 @@
 #include <openvdb/math/Transform.h>
 #include <openvdb/tree/LeafManager.h>
 #include <openvdb/tree/ValueAccessor.h>
+#include <openvdb/math/FiniteDifference.h>// for D1<FD_HJWENO5>, D1<BD_HJWENO5>
 #include <openvdb/math/Math.h>
 #include <openvdb/math/Mat4.h>
 #include "Interpolation.h"// for BoxSampler
@@ -184,6 +185,15 @@ constexpr double kAdvectTimeRelativeEpsilon = 1e-6;
 /// Relative tolerance on the end time of one phase (parabolic half or
 /// hyperbolic part) of a split step (dimensionless).
 constexpr double kSplitPhaseRelativeEpsilon = 1e-6;
+/// Axis reach of the HJWENO5 upwind differences, and so the smallest band
+/// half width that supports them (voxels).
+constexpr int kWeno5StencilRadius = 3;
+/// TVD-RK2 second stage: factor on the projected-set threshold
+/// (kMaxInterfaceMotionVoxels*dx) and on the motion cap its speeds must
+/// respect (dimensionless; see LevelSetMultiObject).
+constexpr double kRk2StageMotionFactor = 2.0;
+/// TVD-RK2: weight of each of the two stage values in their average.
+constexpr float kRk2AverageWeight = 0.5f;
 /// Primes of CoordHash, one per component (the usual spatial-hash primes).
 constexpr uint64_t kCoordHashPrimeX = 73856093u;
 constexpr uint64_t kCoordHashPrimeY = 19349669u;
@@ -761,7 +771,11 @@ inline float jacobiUpdate(const Coord& p, float old, FloatAccT& acc, SeedAccT& s
     }
     if (n == 0) return old;
     float upd = float(solveGodunov(abar, coef, n, dx));
-    if (signedReflection) upd = std::max(upd, 0.0f);
+    // A non-positive result means the reflected data put p on the other
+    // side of the interface (its label disagrees with them, e.g. a voxel
+    // just activated or relabeled): p keeps its label at the barrier
+    // distance, never at phi = 0 (which belongs to no label).
+    if (signedReflection && !(upd > 0.0f)) upd = float(kBarrierPhiFraction * dx);
     return std::min(old, upd);
 }
 
@@ -779,7 +793,8 @@ inline float jacobiUpdate(const Coord& p, float old, FloatAccT& acc, SeedAccT& s
 /// sides of a moving interface) a face neighbor q of p
 /// contributes +phi_q if !differs(p, q), -phi_q if differs(p, q) and q is a
 /// seed, and nothing otherwise; the second-order term then also needs q on
-/// p's side, and results are clamped to >= 0. This is exact for planar
+/// p's side, and non-positive results become kBarrierPhiFraction*dx (phi is
+/// never 0). This is exact for planar
 /// interfaces whose frozen voxels lie on either side.
 /// @param differs copied once per task; called as differs(p, q).
 /// @param grainSize TBB grain size in leaves; zero or negative runs serially.
@@ -1810,12 +1825,21 @@ stencilIndex(int i, int j, int k)
 
 
 /// @brief Read-only 19-point stencil of psi_l = (L==l ? -phi : +phi) values
-/// at time n (the main buffers).
+/// at time n (the main buffers), extended to +-3 voxels along the axes for
+/// HJWENO5 upwind differences.
 /// @details The layout of the values is that of math::CurvatureStencil and
 /// the curvature arithmetic is identical to
 /// math::CurvatureStencil::meanCurvatureNormGrad. Voxels outside the active
 /// band read the phi background with the sign given by their label.
 /// All derivatives are in world units. Not thread-safe; use one per thread.
+///
+/// The spatial scheme (math::FIRST_BIAS, the default, or
+/// math::HJWENO5_BIAS) selects what upwindDifferences() returns; the
+/// evolver gives its stencils its own scheme
+/// (LevelSetMultiObject::setSpatialScheme). moveTo() reads the 19 points
+/// only; the 12 further axis points (offsets +-2 and +-3) are read on the
+/// first HJWENO5 difference at the center, so speed functors that use no
+/// upwind differences (e.g. curvature only) never read them.
 ///
 /// The stencil also samples auxiliary grids (velocity, pressure, ...) at its
 /// center voxel through sampleAtCenter(), which caches the result per center
@@ -1828,15 +1852,32 @@ public:
     using FloatTreeT = typename MultiLevelSetT::FloatGridT::TreeType;
     using LabelTreeT = typename MultiLevelSetT::LabelGridT::TreeType;
 
-    explicit LabelAwareStencil(const MultiLevelSetT& mls)
+    /// @throw ValueError if @a scheme is neither math::FIRST_BIAS nor
+    /// math::HJWENO5_BIAS, or is math::HJWENO5_BIAS and the band of @a mls
+    /// is narrower than 3 voxels (halfWidth() < 3).
+    explicit LabelAwareStencil(const MultiLevelSetT& mls,
+        math::BiasedGradientScheme scheme = math::FIRST_BIAS)
         : mTransform(mls.phi()->transform())
         , mPhiAcc(mls.phi()->tree())
         , mLabelAcc(mls.labels()->tree())
         , mDx(float(mls.voxelSize()))
         , mCenter(0, 0, 0)
+        , mScheme(scheme)
     {
+        if (scheme != math::FIRST_BIAS && scheme != math::HJWENO5_BIAS) {
+            OPENVDB_THROW(ValueError, "LabelAwareStencil: unsupported spatial scheme "
+                << math::biasedGradientSchemeToString(scheme));
+        }
+        if (scheme == math::HJWENO5_BIAS && mls.halfWidth() < lsmo_internal::kWeno5StencilRadius) {
+            OPENVDB_THROW(ValueError, "LabelAwareStencil: HJWENO5 needs a half width of at least "
+                << lsmo_internal::kWeno5StencilRadius);
+        }
         for (float& v : mValues) v = 0.0f;
+        for (auto& axis : mAxis) for (float& v : axis) v = 0.0f;
     }
+
+    /// The scheme of upwindDifferences().
+    math::BiasedGradientScheme spatialScheme() const { return mScheme; }
 
     /// @brief Fill the stencil around @a ijk with psi of @a label.
     void moveTo(const Coord& ijk, int32_t label)
@@ -1847,6 +1888,7 @@ public:
         }
         mCenter = ijk;
         mLabel = label;
+        mAxisLoaded = false;
         static const Coord offs[19] = {
             Coord(0,0,0), Coord(-1,0,0), Coord(1,0,0), Coord(0,-1,0), Coord(0,1,0),
             Coord(0,0,-1), Coord(0,0,1),
@@ -1905,14 +1947,45 @@ public:
                      mValues[6] - mValues[5]) * inv2Dx;
     }
 
-    /// @brief One-sided differences in world units: dneg = (psi0 - psi-)/dx,
-    /// dpos = (psi+ - psi0)/dx for x, y, z.
+    /// @brief One-sided (backward @a dneg, forward @a dpos) differences of
+    /// psi for x, y, z in world units, by the stencil's scheme:
+    /// upwindDifferencesFirstOrder() or upwindDifferencesWeno5().
     void upwindDifferences(float dneg[3], float dpos[3]) const
+    {
+        if (mScheme == math::HJWENO5_BIAS) this->upwindDifferencesWeno5(dneg, dpos);
+        else this->upwindDifferencesFirstOrder(dneg, dpos);
+    }
+
+    /// @brief First-order one-sided differences in world units:
+    /// dneg = (psi0 - psi-)/dx, dpos = (psi+ - psi0)/dx for x, y, z.
+    void upwindDifferencesFirstOrder(float dneg[3], float dpos[3]) const
     {
         const float invDx = 1.0f / mDx;
         for (int a = 0; a < 3; ++a) {
             dneg[a] = (mValues[0] - mValues[1 + 2 * a]) * invDx;
             dpos[a] = (mValues[2 + 2 * a] - mValues[0]) * invDx;
+        }
+    }
+
+    /// @brief Fifth-order HJ-WENO one-sided differences in world units
+    /// (math::D1<BD_HJWENO5> for @a dneg, math::D1<FD_HJWENO5> for @a dpos)
+    /// of psi along x, y, z, from the values at offsets -3..3 on each axis
+    /// (read on the first call at this center; outside the band they are
+    /// the background with the sign of their label). The weights are formed
+    /// on psi/dx, so their smoothness tolerance does not depend on the
+    /// voxel size. Usable with either scheme (with FIRST_BIAS the band must
+    /// still be at least 3 voxels wide for exact far reads).
+    void upwindDifferencesWeno5(float dneg[3], float dpos[3]) const
+    {
+        this->loadAxis();
+        const float invDx = 1.0f / mDx;
+        for (int a = 0; a < 3; ++a) {
+            const float um3 = mAxis[a][0] * invDx, um2 = mAxis[a][1] * invDx;
+            const float um1 = mValues[1 + 2 * a] * invDx, u0 = mValues[0] * invDx;
+            const float up1 = mValues[2 + 2 * a] * invDx;
+            const float up2 = mAxis[a][2] * invDx, up3 = mAxis[a][3] * invDx;
+            dneg[a] = math::D1<math::BD_HJWENO5>::difference(um3, um2, um1, u0, up1, up2);
+            dpos[a] = math::D1<math::FD_HJWENO5>::difference(up3, up2, up1, u0, um1, um2);
         }
     }
 
@@ -1984,6 +2057,23 @@ private:
         }
     };
 
+    /// Read psi at offsets -3, -2, +2, +3 on each axis (once per center).
+    void loadAxis() const
+    {
+        if (mAxisLoaded) return;
+        constexpr int kOffsets[4] = {-3, -2, 2, 3};
+        static_assert(kOffsets[3] == lsmo_internal::kWeno5StencilRadius, "HJWENO5 reach");
+        for (int a = 0; a < 3; ++a) {
+            for (int n = 0; n < 4; ++n) {
+                Coord c = mCenter;
+                c[a] += kOffsets[n];
+                const float d = mPhiAcc.getValue(c);
+                mAxis[a][n] = (static_cast<int32_t>(mLabelAcc.getValue(c)) == mLabel) ? -d : d;
+            }
+        }
+        mAxisLoaded = true;
+    }
+
     template<typename GridT>
     typename GridT::ValueType sample(const GridT& grid, FieldCache<GridT>& caches,
         bool forceSampling) const
@@ -2009,6 +2099,10 @@ private:
     Coord mCenter;
     int32_t mLabel = 0;
     float mValues[19];
+    math::BiasedGradientScheme mScheme;
+    /// psi at offsets -3, -2, +2, +3 along x, y, z (loadAxis)
+    mutable float mAxis[3][4];
+    mutable bool mAxisLoaded = false;
     mutable FieldCache<FloatGrid> mScalarCache;
     mutable FieldCache<Vec3SGrid> mVectorCache;
 };
@@ -2020,6 +2114,9 @@ private:
 /// @details For label l at a voxel it returns dpsi_l/dt =
 /// w_c*kappa*|grad psi| (clamped to the maximum curvature force)
 /// - (upwind advection v . grad psi) - (upwind pressure F*|grad psi|).
+/// The upwind terms use the stencil's one-sided differences
+/// (LabelAwareStencil::upwindDifferences), so their order is the spatial
+/// scheme the evolver selects (HJWENO5 by default, or first order).
 /// It satisfies the SpeedT concept of LevelSetMultiObject. Label 0 is
 /// handled by the evolver as passive (its value is the complement of the
 /// other candidates, so it never needs a speed), so isFixed(0) is false
@@ -2143,8 +2240,8 @@ public:
             + this->pressureTerm(s, dneg, dpos);
     }
 
-    /// @brief The first-order-in-space part of operator(): advection,
-    /// pressure and the speed of inactive labels.
+    /// @brief The hyperbolic part of operator() (first derivatives only):
+    /// advection, pressure and the speed of inactive labels.
     float hyperbolic(const Coord& ijk, int32_t label,
         const LabelAwareStencil<MultiLevelSetT>& s) const
     {
@@ -2412,7 +2509,7 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// @brief Multi-object level set evolver (multi-object geodesic active
 /// contours, MOGAC).
 ///
-/// @details One forward Euler step of step() does:
+/// @details One forward Euler update (TVD_RK1) of step() does:
 /// -# <b>Projected set and candidates.</b> Every active voxel that is not of
 ///    a fixed label and has phi <= 0.5*dx or a face neighbor (active or
 ///    not) of a different label is projected: these are the only voxels
@@ -2488,6 +2585,39 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 /// Voxels of fixed labels never change label or phi and no label can
 /// capture them; a step with no non-zero candidate and no kinematic label
 /// anywhere changes nothing.
+///
+/// <b>Spatial and temporal schemes.</b> The stencils given to the speed
+/// functor use the spatial scheme setSpatialScheme() (default
+/// math::HJWENO5_BIAS: fifth-order HJ-WENO one-sided differences from psi
+/// at offsets -3..3 along each axis, which needs halfWidth >= 3; or
+/// math::FIRST_BIAS). With setTemporalScheme(math::TVD_RK2) (the default)
+/// each unsplit update and each hyperbolic update of a split step is a
+/// TVD-RK2 (Heun) update of the time step dt chosen above:
+/// -# the time-n phi and labels of every leaf are kept;
+/// -# stage 1 is a full forward Euler update as above (projection with
+///    passive label 0 and fixed walls, topology preservation, the phi
+///    floor, orphan cleanup, redistance and band maintenance); kinematic
+///    labels stay at their time-n position;
+/// -# stage 2 evaluates the speeds F^(1) on the stage-1 state and projects
+///    the average v_l = (psi_l^n + psi_l^(1) + dt*F_l^(1))/2 by the same
+///    two-smallest rule (passive label 0 the complement -min v_l), again
+///    with topology preservation, the phi floor, kinematic labels at
+///    t_{n+1}, orphan cleanup, redistance and band maintenance. Its
+///    projected set is twice as deep (phi <= 2*0.5*dx or a face neighbor of
+///    another label) because its values move by up to
+///    |psi^n - psi^(1)|/2 + dt*|F^(1)|/2, and a voxel's candidates are
+///    limited to the labels a forward Euler update from time n could give
+///    it (its time-n label and face labels) plus its stage-1 label, so no
+///    label advances more than one voxel per step at a junction (where
+///    psi of a label that is not a neighbor is only a lower bound).
+///    If dt*max|F^(1)| exceeds twice the motion cap (2*0.5*cfl*dx), the
+///    projected set would not suffice: the update keeps the stage-1 result
+///    (forward Euler; counted by eulerFallbacks()).
+///
+/// Parabolic substeps of split steps are always forward Euler (they are
+/// held to the curvature stability limit, so their time error is small);
+/// math::TVD_RK1 makes every update forward Euler. TVD-RK2 doubles the speed evaluations and the
+/// redistances of an update.
 ///
 /// <b>Operator splitting.</b> With a split speed functor (one that also
 /// provides hyperbolic() and parabolic(), see SpeedT concept) and
@@ -2593,11 +2723,23 @@ public:
     using LabelT = typename LabelTreeT::ValueType;
     using StencilT = LabelAwareStencil<MultiLevelSetT>;
 
-    /// @a mls and @a speed must outlive the evolver.
+    /// @a mls and @a speed must outlive the evolver. The spatial scheme is
+    /// math::HJWENO5_BIAS (see the overload below for halfWidth 2).
+    /// @throw ValueError if halfWidth() < 3 (HJWENO5 needs a 3-voxel band).
     LevelSetMultiObject(MultiLevelSetT& mls, const SpeedT& speed, InterruptT* interrupt = nullptr)
+        : LevelSetMultiObject(mls, speed, math::HJWENO5_BIAS, interrupt)
+    {
+    }
+    /// @brief Evolver with spatial scheme @a spatialScheme (see
+    /// setSpatialScheme(); math::FIRST_BIAS for a band of halfWidth 2).
+    /// @throw ValueError for an unsupported scheme, or for
+    /// math::HJWENO5_BIAS if halfWidth() < 3.
+    LevelSetMultiObject(MultiLevelSetT& mls, const SpeedT& speed,
+        math::BiasedGradientScheme spatialScheme, InterruptT* interrupt = nullptr)
         : mMls(mls), mSpeed(speed), mInterrupter(interrupt)
         , mTolerance(float(lsmo_internal::kDefaultRedistanceToleranceFraction * mls.voxelSize()))
     {
+        this->setSpatialScheme(spatialScheme);
     }
 
     /// @brief CFL number (default 0.999).
@@ -2618,6 +2760,41 @@ public:
     /// 1e-2*dx beyond; true makes the result exact.
     void setFullRedistance(bool on) { mFullRedistance = on; }
     bool fullRedistance() const { return mFullRedistance; }
+    /// @brief Spatial scheme of the stencils given to the speed functor,
+    /// i.e. of LabelAwareStencil::upwindDifferences(): math::HJWENO5_BIAS
+    /// (the default; needs halfWidth() >= 3) or math::FIRST_BIAS.
+    /// @throw ValueError for another scheme, or for math::HJWENO5_BIAS on a
+    /// band narrower than 3 voxels (the constructors check it too).
+    void setSpatialScheme(math::BiasedGradientScheme scheme)
+    {
+        if (scheme != math::FIRST_BIAS && scheme != math::HJWENO5_BIAS) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: unsupported spatial scheme "
+                << math::biasedGradientSchemeToString(scheme));
+        }
+        const math::BiasedGradientScheme previous = mSpatialScheme;
+        mSpatialScheme = scheme;
+        try {
+            this->checkSpatialScheme();
+        } catch (...) {
+            mSpatialScheme = previous;
+            throw;
+        }
+    }
+    math::BiasedGradientScheme spatialScheme() const { return mSpatialScheme; }
+    /// @brief Time integration of the hyperbolic updates (and of the
+    /// unsplit ones): math::TVD_RK2 (the default) or math::TVD_RK1 (forward
+    /// Euler); see the class documentation. Parabolic substeps of split
+    /// steps are always forward Euler.
+    /// @throw ValueError for another scheme.
+    void setTemporalScheme(math::TemporalIntegrationScheme scheme)
+    {
+        if (scheme != math::TVD_RK1 && scheme != math::TVD_RK2) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: unsupported temporal scheme "
+                << math::temporalIntegrationSchemeToString(scheme));
+        }
+        mTemporalScheme = scheme;
+    }
+    math::TemporalIntegrationScheme temporalScheme() const { return mTemporalScheme; }
     /// @brief Strang splitting of a split speed functor's hyperbolic and
     /// parabolic parts (default true; see the class documentation): a step
     /// is split only when speed.parabolicStableDt(dx) is below the
@@ -2745,8 +2922,9 @@ public:
     MultiObjectConnectivity connectivity() const { return mConnectivity; }
 
     /// @brief Peak bytes of the evolver's own working memory during the last
-    /// step: the auxiliary leaf buffers of both trees plus the per-leaf
-    /// scratch (candidate lists, masks) that is kept and reused across steps.
+    /// step: the auxiliary leaf buffers of both trees, the time-n copy of
+    /// the leaves kept by a TVD-RK2 update, plus the per-leaf scratch
+    /// (candidate lists, masks) that is kept and reused across steps.
     /// Temporaries of the redistance pass are not included. 0 before the
     /// first step.
     size_t scratchMemUsage() const { return mPeakScratchBytes; }
@@ -2760,9 +2938,14 @@ public:
     /// (MultiLevelSetRedistance::iterationCap); normally 0, but wide bands
     /// with topology-preserving or kinematic labels can reach it.
     size_t redistanceCapHits() const { return mRedistanceCapHits; }
+    /// @brief TVD-RK2 updates since construction that ended with their
+    /// first (forward Euler) stage because the second stage's speeds
+    /// exceeded its motion cap (see the class documentation).
+    size_t eulerFallbacks() const { return mEulerFallbacks; }
 
-    /// @brief One forward Euler step of at most @a maxDt (world time), or
-    /// one Strang-split step (see the class documentation).
+    /// @brief One step of at most @a maxDt (world time), unsplit or
+    /// Strang-split, each update forward Euler or TVD-RK2 (see the class
+    /// documentation).
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
     /// changes if nothing can move, 0 if @a maxDt <= 0; less than the step
     /// if a split step was interrupted (see the class documentation).
@@ -2942,6 +3125,40 @@ private:
         return n;
     }
 
+    /// The time-n values of every phi leaf (phi and label, active or not),
+    /// kept from the start of a TVD-RK2 update to its second stage and then
+    /// released.
+    struct StageState
+    {
+        static constexpr Index kLeafSize = FloatTreeT::LeafNodeType::SIZE;
+        struct Leaf
+        {
+            std::array<float, kLeafSize> phi;
+            std::array<LabelT, kLeafSize> label;
+        };
+        std::vector<Leaf> leaves;
+        std::unordered_map<Coord, size_t, lsmo_internal::CoordHash> index;
+
+        /// The leaf at @a origin, null if there was none at time n.
+        const Leaf* find(const Coord& origin) const
+        {
+            const auto it = index.find(origin);
+            return it == index.end() ? nullptr : &leaves[it->second];
+        }
+        void release()
+        {
+            std::vector<Leaf>().swap(leaves);
+            decltype(index)().swap(index);
+        }
+        size_t memUsage() const
+        {
+            // nodes (value plus about two pointers and a hash) and buckets
+            return leaves.capacity() * sizeof(Leaf) + index.size()
+                * (sizeof(typename decltype(index)::value_type) + 3 * sizeof(void*))
+                + index.bucket_count() * sizeof(void*);
+        }
+    };
+
     /// Per-leaf scratch owned by the evolver and reused across steps: lists
     /// keep their storage (see recycle()), the per-leaf arrays grow only
     /// when the leaf count grows, and mask leaves are recycled.
@@ -2957,6 +3174,8 @@ private:
         /// frozen active voxels of the last redistance
         LeafMasks prevSeeds;
         std::vector<std::unique_ptr<BoolLeafT>> freeLeaves;
+        /// time n during a TVD-RK2 update (empty otherwise)
+        StageState stage;
 
         /// Empty @a v for reuse. Slots reused by other leaves would keep
         /// growing to the largest list they ever held, so a list holding
@@ -3028,6 +3247,7 @@ private:
             for (const LeafData& d : data) n += vectorBytes(d.entries) + vectorBytes(d.cand);
             n += vectorBytes(deferred);
             n += size_t(freeze.memUsage()) + dirty.memUsage() + prevSeeds.memUsage();
+            n += stage.memUsage();
             n += freeLeaves.capacity() * sizeof(std::unique_ptr<BoolLeafT>)
                 + freeLeaves.size() * sizeof(BoolLeafT);
             return n;
@@ -3239,15 +3459,39 @@ private:
         }
     }
     /// Steps 1-2 of the class documentation on the current state: freeze
-    /// mask, projected set, candidates and their @a term speeds (scratch).
-    Evaluation evaluate(Term term);
+    /// mask, projected set (voxels with phi <= @a projectedVoxels*dx or a
+    /// face neighbor of another label), candidates and their @a term speeds
+    /// (scratch). With @a stage0 (the time-n state of a TVD-RK2 update) the
+    /// candidates are those of its second stage.
+    Evaluation evaluate(Term term,
+        double projectedVoxels = lsmo_internal::kMaxInterfaceMotionVoxels,
+        const StageState* stage0 = nullptr);
     /// @a dt limited so that interfaces move at most half a voxel.
     float motionLimit(const Evaluation& e, float dt) const;
     /// @a dt limited so that kinematic objects move at most half a voxel.
     float kinematicLimit(float dt) const;
     /// Steps 4-6 with time step @a dt, on the last evaluate(); kinematic
-    /// labels are stamped at @a stampTime if @a stamp.
-    void update(float dt, bool any, bool stamp, double stampTime);
+    /// labels are stamped at @a stampTime if @a stamp. With @a stage0 (the
+    /// time-n state of a TVD-RK2 update) the projection is that of its
+    /// second stage.
+    void update(float dt, bool any, bool stamp, double stampTime,
+        const StageState* stage0 = nullptr);
+    /// One update of @a term over @a dt from the evaluation @a e of the
+    /// current state: forward Euler (update()), or TVD-RK2 for the
+    /// hyperbolic and full terms if selected; kinematic labels are stamped
+    /// at @a stampTime by its last stage if @a stamp.
+    void integrate(Term term, const Evaluation& e, float dt, bool stamp, double stampTime);
+    /// Keep the time-n state in Scratch::stage.
+    void takeStage();
+    /// @throw ValueError if the spatial scheme needs a wider band.
+    void checkSpatialScheme() const
+    {
+        if (mSpatialScheme == math::HJWENO5_BIAS
+            && mMls.halfWidth() < lsmo_internal::kWeno5StencilRadius) {
+            OPENVDB_THROW(ValueError, "LevelSetMultiObject: HJWENO5 needs a half width of at"
+                " least " << lsmo_internal::kWeno5StencilRadius << " (set FIRST_BIAS)");
+        }
+    }
     /// Strang step of @a dt: parabolic(dt/2), hyperbolic(dt), parabolic(dt/2).
     float splitStep(float dt);
     /// Sub-updates of @a term over @a duration, each of at most @a target
@@ -3262,11 +3506,13 @@ private:
     /// labels at mTime + @a elapsed, advance the time. @return @a elapsed.
     float finishInterrupted(float elapsed);
 
-    /// Two-smallest projection of @a e (own label @a own, time-n
-    /// @a phiN) with candidates @a cand; false if @a e has no non-zero
-    /// candidate.
-    static bool project(const VoxelEntry& e, int32_t own, float phiN, const Candidate* cand,
-        float dt, int32_t& label, float& phi)
+    /// Two-smallest projection of @a e with candidates @a cand: v_l =
+    /// base(l) + dt*F_l (base(l) = psi_l of the voxel for forward Euler);
+    /// false if @a e has no non-zero candidate.
+    /// An exact tie (phi 0) gets phi = @a barrier instead.
+    template<typename BaseT>
+    static bool project(const VoxelEntry& e, const Candidate* cand, float dt, const BaseT& base,
+        float barrier, int32_t& label, float& phi)
     {
         if (e.n == 0) return false;
         const float inf = std::numeric_limits<float>::infinity();
@@ -3283,14 +3529,15 @@ private:
         };
         for (int i = 0; i < e.n; ++i) {
             const int32_t l = cand[i].first;
-            const float psi = (l == own) ? -phiN : phiN;
-            const float v = psi + dt * cand[i].second;
+            const float v = base(l) + dt * cand[i].second;
             consider(l, v);
             minV = std::min(minV, v);
         }
         if (e.zero) consider(0, -minV); // passive label 0: complement
         label = l1;
         phi = (count > 1) ? std::abs(0.5f * (v1 - v2)) : std::abs(v1);
+        // an exact tie belongs to no label: never write phi = 0
+        if (phi == 0.0f) phi = barrier;
         return true;
     }
 
@@ -3329,6 +3576,9 @@ private:
     bool mInterrupted = false;
     int mRedistanceIterations = 0;
     size_t mRedistanceCapHits = 0;
+    size_t mEulerFallbacks = 0;
+    math::BiasedGradientScheme mSpatialScheme = math::HJWENO5_BIAS;
+    math::TemporalIntegrationScheme mTemporalScheme = math::TVD_RK2;
     /// whether the pair was last redistanced by this evolver (incremental
     /// redistancing needs a redistanced state outside the dirty region)
     bool mPrimed = false;
@@ -3369,8 +3619,8 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
     dt = this->kinematicLimit(this->motionLimit(e, dt));
 
     // 4-6. projection, deferred changes, kinematic labels at t_{n+1}, orphan
-    // cleanup, band maintenance
-    this->update(dt, e.any, /*stamp=*/true, mTime + double(dt));
+    // cleanup, band maintenance (per stage for TVD-RK2)
+    this->integrate(Term::Full, e, dt, /*stamp=*/true, mTime + double(dt));
     mTime += dt;
     return dt;
 }
@@ -3378,12 +3628,13 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::step(float maxDt)
 
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 typename LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::Evaluation
-LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term)
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term,
+    double projectedVoxels, const StageState* stage0)
 {
     FloatTreeT& phi = mMls.phi()->tree();
     LabelTreeT& labels = mMls.labels()->tree();
     const double dx = mMls.voxelSize();
-    const float halfDx = float(lsmo_internal::kMaxInterfaceMotionVoxels * dx);
+    const float projectedPhi = float(projectedVoxels * dx);
     const Coord* offs = lsmo_internal::faceOffsets();
 
     // The label tree needs a leaf wherever phi has one (normally a no-op).
@@ -3415,6 +3666,17 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term)
         VoxelEntry entries[kLeafSize];
         int32_t candLabels[kLeafSize * kMaxCandidates];
         size_t numEntries = 0, numCand = 0;
+        // TVD-RK2 second stage: time-n label of voxel q (its current label
+        // if q had no leaf at time n), through the last leaf looked up
+        const typename StageState::Leaf* leaf0 = nullptr;
+        Coord origin0 = leaf.origin();
+        if (stage0) leaf0 = stage0->find(origin0);
+        auto label0 = [&](const Coord& q, int32_t current) {
+            const Coord o = LeafMasks::originOf(q);
+            if (o != origin0) { origin0 = o; leaf0 = stage0->find(o); }
+            return leaf0 ? static_cast<int32_t>(leaf0->label[BoolLeafT::coordToOffset(q)])
+                         : current;
+        };
         for (auto it = leaf.cbeginValueOn(); it; ++it) {
             const Coord p = it.getCoord();
             const int32_t own = static_cast<int32_t>(lab.getValue(p));
@@ -3428,11 +3690,29 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term)
                 nb[f] = static_cast<int32_t>(lab.getValue(p + offs[f]));
                 seed |= nb[f] != own;
             }
-            if (!seed && *it > halfDx) continue;
+            if (!seed && *it > projectedPhi) continue;
             if (maskLeaf) maskLeaf->setValueOn(it.pos());
             CandidateSet c;
             this->addCandidate(c, own);
-            for (int f = 0; f < 6; ++f) this->addCandidate(c, nb[f]);
+            if (stage0) {
+                // Second stage: only labels a forward Euler step from time n
+                // could give the voxel (its time-n label and face labels),
+                // and the current one. psi of a label that reached a face
+                // neighbor only in the first stage is not known at time n
+                // (+phi there is a lower bound), and taking it would let
+                // that label advance two voxels in one step.
+                int32_t near0[7];
+                near0[0] = label0(p, own);
+                for (int f = 0; f < 6; ++f) near0[1 + f] = label0(p + offs[f], nb[f]);
+                this->addCandidate(c, near0[0]);
+                for (int f = 0; f < 6; ++f) {
+                    if (std::find(near0, near0 + 7, nb[f]) != near0 + 7) {
+                        this->addCandidate(c, nb[f]);
+                    }
+                }
+            } else {
+                for (int f = 0; f < 6; ++f) this->addCandidate(c, nb[f]);
+            }
             if (c.n == 0) continue; // only passive label 0: cannot change
             VoxelEntry& e = entries[numEntries++];
             e.offset = uint16_t(it.pos());
@@ -3443,7 +3723,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::evaluate(Term term)
         if (numEntries == 0) return;
         d.entries.assign(entries, entries + numEntries);
         d.cand.reserve(numCand);
-        StencilT stencil(mMls);
+        StencilT stencil(mMls, mSpatialScheme);
         const int32_t* l = candLabels;
         for (size_t k = 0; k < numEntries; ++k) {
             const Coord p = leaf.offsetToGlobalCoord(entries[k].offset);
@@ -3499,7 +3779,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::kinematicLimit(float dt
 template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
 void
 LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
-    float dt, bool any, bool stamp, double stampTime)
+    float dt, bool any, bool stamp, double stampTime, const StageState* stage0)
 {
     FloatTreeT& phi = mMls.phi()->tree();
     LabelTreeT& labels = mMls.labels()->tree();
@@ -3529,12 +3809,32 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
             const auto& labN = buffers.labelBuffer(i, 0); // time n until the swap
             auto* dirtyLeaf = scratch.dirty.probe(leaf.origin());
             OPENVDB_ASSERT(dirtyLeaf);
+            // TVD-RK2 second stage: time-n leaf (none: far from the
+            // interface at time n, background phi of the current label)
+            const typename StageState::Leaf* leaf0 =
+                stage0 ? stage0->find(leaf.origin()) : nullptr;
+            const float bg = phi.background();
+            constexpr float kHalf = lsmo_internal::kRk2AverageWeight;
+            const float barrier = float(lsmo_internal::kBarrierPhiFraction * mMls.voxelSize());
             const Candidate* cand = d.cand.data();
             for (const VoxelEntry& e : d.entries) {
                 const int32_t own = static_cast<int32_t>(labN.getValue(e.offset));
                 const float phiN = leaf.getValue(e.offset);
                 int32_t l; float v;
-                const bool moved = project(e, own, phiN, cand, dt, l, v);
+                bool moved;
+                if (stage0) {
+                    // v_l = (psi_l^n + psi_l^(1) + dt*F_l^(1)) / 2
+                    const float phi0 = leaf0 ? leaf0->phi[e.offset] : bg;
+                    const int32_t own0 =
+                        leaf0 ? static_cast<int32_t>(leaf0->label[e.offset]) : own;
+                    moved = project(e, cand, kHalf * dt, [&](int32_t c) {
+                        return kHalf * (((c == own) ? -phiN : phiN)
+                            + ((c == own0) ? -phi0 : phi0));
+                    }, barrier, l, v);
+                } else {
+                    moved = project(e, cand, dt,
+                        [&](int32_t c) { return (c == own) ? -phiN : phiN; }, barrier, l, v);
+                }
                 cand += e.n;
                 if (!moved) continue;
                 if (this->involvesProtected(own, l)) {
@@ -3564,6 +3864,66 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::update(
     this->bandMaintenance(freeze);
     mPeakScratchBytes = std::max(mPeakScratchBytes, scratch.memUsage());
     OPENVDB_ASSERT(mMls.validate());
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::integrate(
+    Term term, const Evaluation& e, float dt, bool stamp, double stampTime)
+{
+    if (mTemporalScheme != math::TVD_RK2 || term == Term::Parabolic
+        || !(e.any && e.maxSpeed > 0.0f && dt > 0.0f)) {
+        this->update(dt, e.any, stamp, stampTime);
+        return;
+    }
+    // TVD-RK2 (Heun): u1 = u0 + dt*L(u0); u = (u0 + u1 + dt*L(u1))/2, each
+    // stage a full update (projection, protection, floor, redistance)
+    this->takeStage();
+    // stage 1: forward Euler predictor; kinematic labels stay at time n
+    this->update(dt, /*any=*/true, /*stamp=*/false, 0.0);
+    // stage 2 on u1: a projected set twice as deep and twice the motion cap
+    // (its values move by at most |u0 - u1|/2 + dt*|F(u1)|/2)
+    const Evaluation e2 = this->evaluate(term,
+        lsmo_internal::kRk2StageMotionFactor * lsmo_internal::kMaxInterfaceMotionVoxels,
+        &mScratch.stage);
+    const double cap = lsmo_internal::kRk2StageMotionFactor
+        * lsmo_internal::kMaxInterfaceMotionVoxels * mCfl * mMls.voxelSize();
+    if (e2.any && double(dt) * double(e2.maxSpeed) <= cap) {
+        this->update(dt, /*any=*/true, stamp, stampTime, &mScratch.stage);
+    } else {
+        // the second stage would leave the projected set: keep u1 (Euler)
+        if (e2.any) ++mEulerFallbacks;
+        if (stamp && !mKinematic.empty()) this->update(0.0f, /*any=*/false, true, stampTime);
+    }
+    mScratch.stage.release();
+}
+
+
+template<typename MultiLevelSetT, typename SpeedT, typename InterruptT>
+void
+LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::takeStage()
+{
+    const FloatTreeT& phi = mMls.phi()->tree();
+    const LabelTreeT& labels = mMls.labels()->tree();
+    StageState& st = mScratch.stage;
+    tree::LeafManager<const FloatTreeT> leafs(phi);
+    const size_t n = leafs.leafCount();
+    st.leaves.resize(n);
+    st.index.clear();
+    st.index.reserve(n);
+    for (size_t i = 0; i < n; ++i) st.index.emplace(leafs.leaf(i).origin(), i);
+    forEachIndex(n, [&](size_t i) {
+        const auto& leaf = leafs.leaf(i);
+        const auto* labLeaf = labels.probeConstLeaf(leaf.origin());
+        typename StageState::Leaf& out = st.leaves[i];
+        for (Index k = 0; k < StageState::kLeafSize; ++k) {
+            out.phi[k] = leaf.getValue(k);
+            out.label[k] = labLeaf ? labLeaf->getValue(k)
+                                   : labels.getValue(leaf.offsetToGlobalCoord(k));
+        }
+    });
+    mPeakScratchBytes = std::max(mPeakScratchBytes, mScratch.memUsage());
 }
 
 
@@ -3607,7 +3967,7 @@ LevelSetMultiObject<MultiLevelSetT, SpeedT, InterruptT>::splitPhase(
         const bool last = !(remaining > eps);
         const bool stamp = stampAtEnd && last && !mKinematic.empty();
         // a sub-update in which nothing moves is skipped
-        if ((e.any && e.maxSpeed > 0.0f) || stamp) this->update(dt, e.any, stamp, stampTime);
+        if ((e.any && e.maxSpeed > 0.0f) || stamp) this->integrate(term, e, dt, stamp, stampTime);
         if (interruptible && (!last || checkAfterLast) && util::wasInterrupted(mInterrupter)) {
             interrupted = true;
             break;

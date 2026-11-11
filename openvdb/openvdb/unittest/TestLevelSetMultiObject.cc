@@ -2125,27 +2125,37 @@ TEST_F(TestLevelSetMultiObject, StepPeakMemory)
     // memory of the pair (a deep copy of both trees alone would be about 1x, on
     // top of the candidate lists), also once the pooled scratch has been reused
     // over many steps of a growing band. Pair bytes are taken before each step
-    // (tree.memUsage, an approximation of the allocated bytes).
-    std::map<int32_t, FloatGrid::ConstPtr> in;
-    in[1] = tools::createLevelSetSphere<FloatGrid>(15.0f, Vec3f(-16.0f, 0.0f, 0.0f), 1.0f);
-    in[2] = tools::createLevelSetSphere<FloatGrid>(15.0f, Vec3f(16.0f, 0.0f, 0.0f), 1.0f);
-    auto m = MLS::fromSignedGrids(in, 3);
-    ConstantSpeed speed;
-    speed.s = -1.0f;
-    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
-    EXPECT_EQ(lsmo.scratchMemUsage(), size_t(0));
-    for (int n = 0; n < 16; ++n) {
-        const size_t pairBytes = size_t(m->phi()->memUsage() + m->labels()->memUsage());
-        ASSERT_GT(lsmo.step(1.0f), 0.0f);
-        const size_t scratch = lsmo.scratchMemUsage();
-        std::cout << "StepPeakMemory: step " << n << " pair " << pairBytes << " B, scratch "
-                  << scratch << " B (" << double(scratch) / double(pairBytes) << "x)"
-                  << std::endl;
-        EXPECT_GT(scratch, size_t(0)) << "step " << n;
-        EXPECT_LE(double(scratch), 1.3 * double(pairBytes)) << "step " << n;
+    // (tree.memUsage, an approximation of the allocated bytes). TVD-RK2 keeps
+    // the time-n state for its second stage, so it may also use the phi
+    // tree's bytes on top.
+    for (math::TemporalIntegrationScheme scheme : {math::TVD_RK1, math::TVD_RK2}) {
+        const std::string name = scheme == math::TVD_RK1 ? "TVD_RK1" : "TVD_RK2";
+        std::map<int32_t, FloatGrid::ConstPtr> in;
+        in[1] = tools::createLevelSetSphere<FloatGrid>(15.0f, Vec3f(-16.0f, 0.0f, 0.0f), 1.0f);
+        in[2] = tools::createLevelSetSphere<FloatGrid>(15.0f, Vec3f(16.0f, 0.0f, 0.0f), 1.0f);
+        auto m = MLS::fromSignedGrids(in, 3);
+        ConstantSpeed speed;
+        speed.s = -1.0f;
+        tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+        lsmo.setTemporalScheme(scheme);
+        EXPECT_EQ(lsmo.scratchMemUsage(), size_t(0));
+        for (int n = 0; n < 16; ++n) {
+            const size_t phiBytes = size_t(m->phi()->memUsage());
+            const size_t pairBytes = phiBytes + size_t(m->labels()->memUsage());
+            ASSERT_GT(lsmo.step(1.0f), 0.0f);
+            const size_t scratch = lsmo.scratchMemUsage();
+            const double bound = 1.3 * double(pairBytes)
+                + (scheme == math::TVD_RK2 ? double(phiBytes) : 0.0);
+            std::cout << "StepPeakMemory " << name << ": step " << n << " pair " << pairBytes
+                      << " B, phi " << phiBytes << " B, scratch " << scratch << " B ("
+                      << double(scratch) / double(pairBytes) << "x pair, bound "
+                      << bound / double(pairBytes) << "x)" << std::endl;
+            EXPECT_GT(scratch, size_t(0)) << name << " step " << n;
+            EXPECT_LE(double(scratch), bound) << name << " step " << n;
+        }
+        std::string msg;
+        EXPECT_TRUE(m->validate(&msg)) << msg;
     }
-    std::string msg;
-    EXPECT_TRUE(m->validate(&msg)) << msg;
 }
 
 TEST_F(TestLevelSetMultiObject, InterruptMidAdvect)
@@ -2442,13 +2452,15 @@ makeRotation()
 }
 
 void
-referenceAdvect(FloatGrid& ref, const Vec3SGrid& vel, double t0, double t1)
+referenceAdvect(FloatGrid& ref, const Vec3SGrid& vel, double t0, double t1,
+    math::BiasedGradientScheme spatial = math::FIRST_BIAS,
+    math::TemporalIntegrationScheme temporal = math::TVD_RK1)
 {
     using Field = tools::DiscreteField<Vec3SGrid>;
     Field field(vel);
     tools::LevelSetAdvection<FloatGrid, Field> adv(ref, field);
-    adv.setSpatialScheme(math::FIRST_BIAS);
-    adv.setTemporalScheme(math::TVD_RK1);
+    adv.setSpatialScheme(spatial);
+    adv.setTemporalScheme(temporal);
     adv.advect(float(t0), float(t1));
 }
 
@@ -2503,6 +2515,16 @@ checkEquivalence(const char* name, const MLS& m, const FloatGrid& ref, size_t st
     EXPECT_LE(dm.symDiff, 1.1 * dr.symDiff);
 }
 
+// The schemes of the first-order reference (LevelSetAdvection with
+// FIRST_BIAS / TVD_RK1), for the equivalence tests.
+template<typename EvolverT>
+void
+pinFirstOrder(EvolverT& e)
+{
+    e.setSpatialScheme(math::FIRST_BIAS);
+    e.setTemporalScheme(math::TVD_RK1);
+}
+
 } // anonymous namespace
 
 TEST_F(TestLevelSetMultiObject, SingleObjectAdvection)
@@ -2516,6 +2538,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectAdvection)
     Forces forces;
     forces.setAdvection(vel, 1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    pinFirstOrder(lsmo); // compared against the first-order reference
     const size_t steps = lsmo.advect(0.0, 30.0);
     // exact solution: the sphere rotated by 0.05*30 = 1.5 radians about z
     const double angle = 0.05 * 30.0;
@@ -2536,6 +2559,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCurvature)
     Forces forces;
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    pinFirstOrder(lsmo); // compared against the first-order reference
     const size_t steps = lsmo.advect(0.0, 30.0);
     // exact: r^2 = r0^2 - 2t at the unmoved center
     checkEquivalence("SingleObjectCurvature", *m, *ref, steps, 0.0, nullptr,
@@ -2560,6 +2584,7 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     forces.setAdvection(vel, 1.0f);
     forces.setCurvatureWeight(1.0f);
     tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    pinFirstOrder(lsmo); // compared against the first-order reference
     EXPECT_TRUE(lsmo.splitting()); // the default for a split speed functor
     const size_t steps = lsmo.advect(0.0, 15.0);
     // exact: r^2 = r0^2 - 2t about the center rotated by 0.05*15 radians.
@@ -2569,6 +2594,131 @@ TEST_F(TestLevelSetMultiObject, SingleObjectCombined)
     // advection to CFL ~0.13, where first-order upwinding is most diffusive.
     checkEquivalence("SingleObjectCombined", *m, *ref, steps, 0.05 * 15.0, nullptr,
         std::sqrt(kEqRadius * kEqRadius - 2.0 * 15.0), 0.1 * m->voxelSize());
+}
+
+TEST_F(TestLevelSetMultiObject, SchemeDefaultsAndSetters)
+{
+    auto m = makeSphere(8.0);
+    Forces forces;
+    tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+    EXPECT_EQ(lsmo.spatialScheme(), math::HJWENO5_BIAS);
+    EXPECT_EQ(lsmo.temporalScheme(), math::TVD_RK2);
+    for (math::BiasedGradientScheme s : {math::SECOND_BIAS, math::THIRD_BIAS, math::WENO5_BIAS}) {
+        EXPECT_THROW(lsmo.setSpatialScheme(s), ValueError) << s;
+    }
+    EXPECT_THROW(lsmo.setTemporalScheme(math::TVD_RK3), ValueError);
+    lsmo.setSpatialScheme(math::FIRST_BIAS);
+    lsmo.setTemporalScheme(math::TVD_RK1);
+    EXPECT_EQ(lsmo.spatialScheme(), math::FIRST_BIAS);
+    EXPECT_EQ(lsmo.temporalScheme(), math::TVD_RK1);
+    // a stencil made without a scheme is first order
+    tools::LabelAwareStencil<MLS> s(*m);
+    EXPECT_EQ(s.spatialScheme(), math::FIRST_BIAS);
+    EXPECT_THROW(tools::LabelAwareStencil<MLS>(*m, math::WENO5_BIAS), ValueError);
+}
+
+TEST_F(TestLevelSetMultiObject, Weno5NeedsHalfWidth3)
+{
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(8.0f, Vec3f(0.0f), 1.0f, 2.0f);
+    auto m = MLS::fromSignedGrids(in, 2);
+    ASSERT_EQ(m->halfWidth(), 2);
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(1.0f, 0.0f, 0.0f)), 1.0f);
+    using Evolver = tools::LevelSetMultiObject<MLS, Forces>;
+    // the default HJWENO5 needs a band of 3 voxels: construction throws
+    EXPECT_THROW(Evolver(*m, forces), ValueError);
+    EXPECT_THROW(Evolver(*m, forces, math::HJWENO5_BIAS), ValueError);
+    EXPECT_THROW(tools::LabelAwareStencil<MLS>(*m, math::HJWENO5_BIAS), ValueError);
+    Evolver lsmo(*m, forces, math::FIRST_BIAS);
+    EXPECT_EQ(lsmo.spatialScheme(), math::FIRST_BIAS);
+    EXPECT_THROW(lsmo.setSpatialScheme(math::HJWENO5_BIAS), ValueError);
+    EXPECT_EQ(lsmo.spatialScheme(), math::FIRST_BIAS); // unchanged by the throw
+    EXPECT_GT(lsmo.step(1.0f), 0.0f);
+    std::string msg;
+    EXPECT_TRUE(m->validate(&msg)) << msg;
+}
+
+TEST_F(TestLevelSetMultiObject, StencilWeno5Plane)
+{
+    // psi of label 1 on a tilted plane is linear: HJWENO5 one-sided
+    // differences reproduce the gradient exactly on both sides (they read
+    // +-3 voxels along each axis), as do the first-order ones.
+    const Vec3d n = Vec3d(0.3, -0.5, 0.8).unitSafe();
+    const double dx = 0.5;
+    auto xform = math::Transform::createLinearTransform(dx);
+    FloatGrid::Ptr phi = FloatGrid::create(float(3.0 * dx));
+    MLS::LabelGridT::Ptr lab = MLS::LabelGridT::create(0);
+    phi->setTransform(xform);
+    lab->setTransform(xform->copy());
+    {
+        auto pa = phi->getAccessor();
+        auto la = lab->getAccessor();
+        for (auto p = CoordBBox(Coord(-12), Coord(12)).begin(); p; ++p) {
+            const double d = n.dot(xform->indexToWorld(*p)) + 0.1 * dx; // signed, label 1 < 0
+            if (std::abs(d) >= 3.0 * dx) continue;
+            pa.setValue(*p, float(std::abs(d)));
+            la.setValue(*p, d < 0.0 ? 1 : 2);
+        }
+    }
+    MLS m(phi, lab, 3);
+    tools::LabelAwareStencil<MLS> s(m, math::HJWENO5_BIAS);
+    EXPECT_EQ(s.spatialScheme(), math::HJWENO5_BIAS);
+    s.moveTo(Coord(0), 1);
+    float dneg[3], dpos[3], wneg[3], wpos[3], fneg[3], fpos[3];
+    s.upwindDifferences(dneg, dpos);
+    s.upwindDifferencesWeno5(wneg, wpos);
+    s.upwindDifferencesFirstOrder(fneg, fpos);
+    for (int a = 0; a < 3; ++a) {
+        EXPECT_NEAR(wneg[a], n[a], 1e-4) << a;
+        EXPECT_NEAR(wpos[a], n[a], 1e-4) << a;
+        EXPECT_NEAR(fneg[a], n[a], 1e-4) << a;
+        EXPECT_NEAR(fpos[a], n[a], 1e-4) << a;
+        EXPECT_EQ(dneg[a], wneg[a]) << a; // the stencil's scheme
+        EXPECT_EQ(dpos[a], wpos[a]) << a;
+    }
+    // first-order stencil: upwindDifferences is the first-order one
+    tools::LabelAwareStencil<MLS> f(m);
+    f.moveTo(Coord(0), 1);
+    f.upwindDifferences(dneg, dpos);
+    for (int a = 0; a < 3; ++a) {
+        EXPECT_EQ(dneg[a], fneg[a]) << a;
+        EXPECT_EQ(dpos[a], fpos[a]) << a;
+    }
+}
+
+TEST_F(TestLevelSetMultiObject, Weno5ReducesAdvectionError)
+{
+    // The SingleObjectAdvection scenario (rigid rotation by 1.5 radians):
+    // HJWENO5 / TVD-RK2 (the defaults) end closer to the exact sphere than
+    // FIRST_BIAS / TVD-RK1, symmetric difference below 0.6x.
+    Vec3SGrid::Ptr vel = makeRotation();
+    const double angle = 0.05 * 30.0;
+    FloatGrid::Ptr exact = tools::createLevelSetSphere<FloatGrid>(float(kEqRadius),
+        Vec3f(float(kEqCenter[0] * std::cos(angle)), float(kEqCenter[0] * std::sin(angle)), 0.0f),
+        1.0f);
+    double err[2];
+    for (int k = 0; k < 2; ++k) {
+        auto m = makeSphere(kEqRadius, kEqCenter);
+        Forces forces;
+        forces.setAdvection(vel, 1.0f);
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        if (k == 0) pinFirstOrder(lsmo);
+        const auto start = std::chrono::steady_clock::now();
+        const size_t steps = lsmo.advect(0.0, 30.0);
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const ZeroSetDiff d = compareZeroSets(*m->extractSignedDistance(1), *exact);
+        err[k] = d.symDiff;
+        std::cout << "Weno5ReducesAdvectionError: " << (k == 0 ? "FIRST_BIAS/TVD_RK1" :
+            "HJWENO5_BIAS/TVD_RK2") << ": " << steps << " steps, " << 1e3 * secs / double(steps)
+                  << " ms/step, symmetric difference vs exact " << d.symDiff << " Hausdorff "
+                  << d.hausdorff << " dx, Euler fallbacks " << lsmo.eulerFallbacks()
+                  << std::endl;
+    }
+    EXPECT_LT(err[1], 0.6 * err[0]);
 }
 
 TEST_F(TestLevelSetMultiObject, SplittingFixedAndPassive)
@@ -2734,14 +2884,16 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
     //   contact); halving the inflow and updraft, and starting the pairs
     //   closer, cuts that squeeze while the larger shapes make its relative
     //   effect smaller (curvature was not the main loss: the loss matches
-    //   the reference's). Contact then comes at t = 36 and the smallest
-    //   label keeps 1203 voxels at t = 60 (tetrahedron, label 3); the
-    //   tightest volume-gate margin is 3.4 points (label 8, upper bound).
+    //   the reference's). With the default schemes (HJWENO5 / TVD-RK2)
+    //   contact comes at t = 24 (t = 36 with FIRST_BIAS / TVD-RK1) and the
+    //   smallest label keeps 1463 voxels at t = 60 (tetrahedron, label 3);
+    //   the tightest volume-gate margin is 2.2 points (label 8, upper bound).
     // - Advect in chunks of 2 until >= 4 contact pairs (capped at t = 70),
     //   then on to t = 60 (Vortex::kEndTime); contacts must stay >= 4 at every chunk after
     //   first contact.
     // Volume gate (two-sided): with refLoss the loss of the same
-    // shape advected alone by LevelSetAdvection (FIRST_BIAS / TVD_RK1) in the
+    // shape advected alone by LevelSetAdvection with the evolver's schemes
+    // (the defaults, HJWENO5 / TVD-RK2) in the
     // same field over the same time, each label's voxel loss lies in
     // [1.1*min(refLoss, 0) - 2%, 1.1*max(refLoss, 0) + 2%].
     // (Shapes, placement, field and schedule: lsmo_test::Vortex.)
@@ -2757,6 +2909,8 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
     double tContact = -1.0;
     std::set<std::pair<int32_t, int32_t>> pairs;
     const auto start = std::chrono::steady_clock::now();
+    math::BiasedGradientScheme spatial = math::UNKNOWN_BIAS;
+    math::TemporalIntegrationScheme temporal = math::UNKNOWN_TIS;
     // Keep going to the end time; contacts must persist after first contact.
     const double t = vortex.run(*m, vel, steps, tContact,
         [&](double tc, size_t n, const std::set<std::pair<int32_t, int32_t>>& p, int after) {
@@ -2767,13 +2921,18 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
             EXPECT_EQ(overlaps, Index64(0)) << "t " << tc;
             EXPECT_EQ(badCover, Index64(0)) << "t " << tc;
             EXPECT_EQ(countNaN(*m->phi()), Index64(0)) << "t " << tc;
+            // phi = 0 belongs to no label: the evolver never writes it
+            Index64 zeros = 0;
+            for (auto it = m->phi()->tree().cbeginValueOn(); it; ++it) zeros += *it == 0.0f;
+            EXPECT_EQ(zeros, Index64(0)) << "t " << tc;
             pairs = p;
             std::cout << "Vortex: t " << tc << " steps " << n << " contacts " << p.size();
             for (auto& lv : labelVoxelCounts(*m)) std::cout << " " << lv.first << ":" << lv.second;
             std::cout << std::endl;
             if (after >= 1) { EXPECT_GE(p.size(), size_t(4)) << "t " << tc; }
             return !::testing::Test::HasFailure();
-        });
+        },
+        [&](Vortex::Evolver& e) { spatial = e.spatialScheme(); temporal = e.temporalScheme(); });
     ASSERT_FALSE(::testing::Test::HasFailure());
     std::cout << "Vortex: >= 4 contact pairs first at t " << tContact << std::endl;
     const double secs = std::chrono::duration<double>(
@@ -2785,10 +2944,11 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
 
     const std::map<int32_t, Index64> vol1 = labelVoxelCounts(*m);
     for (int32_t l = 1; l <= 8; ++l) {
-        // reference: the same shape alone, LevelSetAdvection to the same t
+        // reference: the same shape alone, LevelSetAdvection with the
+        // evolver's schemes to the same t
         FloatGrid::Ptr ref = in.at(l)->deepCopy();
         const double r0 = double(insideVoxelCount(*ref));
-        referenceAdvect(*ref, *vel, 0.0, t);
+        referenceAdvect(*ref, *vel, 0.0, t, spatial, temporal);
         const double refLoss = 1.0 - double(insideVoxelCount(*ref)) / r0;
         const double v0 = double(vol0.at(l));
         const double v1 = vol1.count(l) ? double(vol1.at(l)) : 0.0;
@@ -2800,6 +2960,82 @@ TEST_F(TestLevelSetMultiObject, VortexEightObjects)
         EXPECT_LE(loss, 1.1 * std::max(refLoss, 0.0) + 0.02) << "label " << l;
         EXPECT_GE(loss, 1.1 * std::min(refLoss, 0.0) - 0.02) << "label " << l;
     }
+}
+
+
+TEST_F(TestLevelSetMultiObject, Weno5ReducesVortexLoss)
+{
+    // The VortexEightObjects run with the defaults (HJWENO5 / TVD-RK2) and
+    // with FIRST_BIAS / TVD-RK1. The field is not divergence-free, so the
+    // shapes' volumes change by the flow itself; the error of label l is
+    // |loss_l - refLoss_l| (losses 1 - V(t)/V(0) in voxels), with refLoss_l
+    // that of the same shape advected alone by LevelSetAdvection with
+    // HJWENO5 / TVD-RK2 (the high-order reference, the same for both runs).
+    // The worst error of the default run is below 0.6x the first-order
+    // run's. (The error against each run's own same-scheme reference is
+    // printed only.)
+    const Vortex vortex;
+    Vec3SGrid::Ptr vel = vortex.velocity();
+    const std::map<int32_t, FloatGrid::ConstPtr> in = vortex.inputs();
+    struct Run { double t = 0.0; std::map<int32_t, double> loss; };
+    Run runs[2];
+    for (int k = 0; k < 2; ++k) {
+        auto m = MLS::fromSignedGrids(in, 3);
+        const std::map<int32_t, Index64> vol0 = labelVoxelCounts(*m);
+        size_t steps = 0;
+        double tContact = -1.0;
+        const auto start = std::chrono::steady_clock::now();
+        runs[k].t = vortex.run(*m, vel, steps, tContact,
+            [&](double, size_t, const std::set<std::pair<int32_t, int32_t>>&, int) { return true; },
+            [k](Vortex::Evolver& e) { if (k == 0) pinFirstOrder(e); });
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << msg;
+        const std::map<int32_t, Index64> vol1 = labelVoxelCounts(*m);
+        for (int32_t l = 1; l <= 8; ++l) {
+            const double v1 = vol1.count(l) ? double(vol1.at(l)) : 0.0;
+            runs[k].loss[l] = 1.0 - v1 / double(vol0.at(l));
+        }
+        std::cout << "Weno5ReducesVortexLoss: " << (k == 0 ? "FIRST_BIAS/TVD_RK1" :
+            "HJWENO5_BIAS/TVD_RK2") << ": t " << runs[k].t << ", " << steps << " steps, "
+                  << 1e3 * secs / double(steps) << " ms/step, first contact " << tContact
+                  << std::endl;
+    }
+    ASSERT_EQ(runs[0].t, runs[1].t);
+    // single-shape references: [0] FIRST_BIAS / TVD_RK1, [1] HJWENO5 / TVD_RK2
+    std::map<int32_t, double> refLoss[2];
+    for (int k = 0; k < 2; ++k) {
+        for (int32_t l = 1; l <= 8; ++l) {
+            FloatGrid::Ptr g = in.at(l)->deepCopy();
+            const double r0 = double(insideVoxelCount(*g));
+            referenceAdvect(*g, *vel, 0.0, runs[k].t, k == 0 ? math::FIRST_BIAS : math::HJWENO5_BIAS,
+                k == 0 ? math::TVD_RK1 : math::TVD_RK2);
+            refLoss[k][l] = 1.0 - double(insideVoxelCount(*g)) / r0;
+        }
+    }
+    double worst[2] = {0.0, 0.0}, worstOwn[2] = {0.0, 0.0};
+    std::cout << "Weno5ReducesVortexLoss: label | loss FIRST/RK1, HJWENO5/RK2 | reference loss"
+                 " FIRST/RK1, HJWENO5/RK2 | error vs HJWENO5/RK2 reference FIRST, HJWENO5"
+                 " | error vs own-scheme reference FIRST, HJWENO5 (percent)" << std::endl;
+    for (int32_t l = 1; l <= 8; ++l) {
+        double err[2], own[2];
+        for (int k = 0; k < 2; ++k) {
+            err[k] = std::abs(runs[k].loss[l] - refLoss[1][l]);
+            own[k] = std::abs(runs[k].loss[l] - refLoss[k][l]);
+            worst[k] = std::max(worst[k], err[k]);
+            worstOwn[k] = std::max(worstOwn[k], own[k]);
+        }
+        std::cout << "Weno5ReducesVortexLoss: " << l << " | " << 100.0 * runs[0].loss[l] << ", "
+                  << 100.0 * runs[1].loss[l] << " | " << 100.0 * refLoss[0][l] << ", "
+                  << 100.0 * refLoss[1][l] << " | " << 100.0 * err[0] << ", " << 100.0 * err[1]
+                  << " | " << 100.0 * own[0] << ", " << 100.0 * own[1] << std::endl;
+    }
+    std::cout << "Weno5ReducesVortexLoss: worst error vs HJWENO5/RK2 reference: FIRST "
+              << 100.0 * worst[0] << ", HJWENO5 " << 100.0 * worst[1] << " ("
+              << worst[1] / worst[0] << "x); vs own-scheme reference: FIRST "
+              << 100.0 * worstOwn[0] << ", HJWENO5 " << 100.0 * worstOwn[1] << std::endl;
+    EXPECT_LT(worst[1], 0.6 * worst[0]);
 }
 
 
@@ -3346,6 +3582,50 @@ TEST_F(TestLevelSetMultiObject, TopologyCubeThroughSpheres)
     }
 }
 
+TEST_F(TestLevelSetMultiObject, Rk2StagesRespectProtection)
+{
+    // Every TVD-RK2 stage is a full update (projection with passive label 0
+    // and fixed walls, topology protection, phi floor): with the default
+    // schemes a protected cube keeps its topology through the kinematic
+    // spheres (TopologyCubeThroughSpheres runs the whole path), and a fixed
+    // label never changes (FixedLabels).
+    {
+        auto m = makeSphere(8.0);
+        Forces forces;
+        tools::LevelSetMultiObject<MLS, Forces> lsmo(*m, forces);
+        ASSERT_EQ(lsmo.spatialScheme(), math::HJWENO5_BIAS);
+        ASSERT_EQ(lsmo.temporalScheme(), math::TVD_RK2);
+    }
+    for (Conn rule : {Conn::FG26_BG6, Conn::FG6_BG26}) {
+        SCOPED_TRACE(lsmo_test::connectivityName(rule));
+        const CubeRunResult prot = runCubeThroughSpheres(true, rule, 1, 30.0);
+        EXPECT_FALSE(prot.changed);
+        EXPECT_NEAR(prot.frontShift, 30.0, 2.0);
+    }
+    // fixed label 2 next to growing label 1
+    auto m = makeTwoSpheres(1.0);
+    std::map<Coord, float> before;
+    for (auto it = m->labels()->tree().cbeginValueOn(); it; ++it) {
+        if (*it == 2) before[it.getCoord()] = m->phi()->tree().getValue(it.getCoord());
+    }
+    ConstantSpeed speed;
+    speed.s = -1.0f;
+    speed.fixed = {2};
+    tools::LevelSetMultiObject<MLS, ConstantSpeed> lsmo(*m, speed);
+    for (int n = 0; n < 30; ++n) {
+        lsmo.step(0.75f);
+        std::string msg;
+        ASSERT_TRUE(m->validate(&msg)) << "step " << n << ": " << msg;
+    }
+    Index64 changed = 0;
+    for (const auto& kv : before) {
+        const float phi = m->phi()->tree().getValue(kv.first);
+        if (m->labels()->tree().getValue(kv.first) != 2
+            || std::memcmp(&phi, &kv.second, sizeof(float)) != 0) ++changed;
+    }
+    EXPECT_EQ(changed, Index64(0));
+}
+
 TEST_F(TestLevelSetMultiObject, TopologySerialMatchesParallel)
 {
     // The colored passes make the protected result independent of the
@@ -3483,9 +3763,10 @@ TEST_F(TestLevelSetMultiObject, HashedContainersKeepResults)
     // (std::map/std::set) the evolver used on its hot paths before they
     // became hashed ones: the switch must not change any result, for any
     // grain size. (A legitimate numerical change elsewhere re-records them.)
-    constexpr uint64_t kVortexHash = 0x91492b1ffb06703dull;
-    constexpr uint64_t kCubeHash[2] = {0x8b7ce4b2a0056e19ull, 0xb246f92014f05228ull}; // FG26, FG6
-    constexpr uint64_t kPartitionHash = 0x9b3bc454962e6cbeull;
+    // (re-recorded for the HJWENO5 / TVD-RK2 defaults)
+    constexpr uint64_t kVortexHash = 0x6de2c5997a259e61ull;
+    constexpr uint64_t kCubeHash[2] = {0xe768c85d9259c2a7ull, 0x77c900ec3774e44bull}; // FG26, FG6
+    constexpr uint64_t kPartitionHash = 0x1ce11d129535607eull;
     // end times of the recorded cube runs and of the serial vs parallel check
     // (the control cube, unprotected, first changes topology at t = 32 for
     // FG26_BG6 and t = 34 for FG6_BG26 in TopologyCubeThroughSpheres; the
@@ -3715,7 +3996,10 @@ expectIncrementalMatchesFull(const std::string& name, const MakeT& make, const S
     using Evolver = tools::LevelSetMultiObject<MLS, SpeedT>;
     MLS::Ptr full = make(), incr = make();
     const double dx = full->voxelSize();
-    Evolver ef(*full, speed), ei(*incr, speed);
+    // the default HJWENO5 needs halfWidth >= 3: narrower bands run FIRST_BIAS
+    const math::BiasedGradientScheme spatial =
+        full->halfWidth() < 3 ? math::FIRST_BIAS : math::HJWENO5_BIAS;
+    Evolver ef(*full, speed, spatial), ei(*incr, speed, spatial);
     config(ef);
     config(ei);
     ef.setFullRedistance(true);
@@ -3779,6 +4063,7 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
         // second-order Jacobi depends on the order in which voxels are
         // reached; see the class documentation)
         const bool check = hw <= 3;
+        // (bands of halfWidth 2 run FIRST_BIAS, see expectIncrementalMatchesFull)
         auto compare = [&](const std::string& name, const auto& make, const auto& speed,
             const auto& config, double tEnd, double chunk, double tShort) {
             expectIncrementalMatchesFull(name + h, make, speed, config,
@@ -3901,3 +4186,4 @@ TEST_F(TestLevelSetMultiObject, IncrementalRedistanceMatchesFull)
         }
     }
 }
+
