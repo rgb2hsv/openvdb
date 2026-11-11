@@ -12,8 +12,9 @@ Steps (each can be skipped):
                <out>/<sim>/png/frame_%05d.png   one image per step, fixed camera
                <out>/<sim>/<sim>.mp4            the frames as an H.264 video
                <out>/<sim>/meshes/initial.ply   first frame's mesh
-               <out>/<sim>/meshes/midway.ply    middle frame's mesh
+               <out>/<sim>/meshes/midway.ply    mesh nearest half the simulated time
                <out>/<sim>/meshes/final.ply     last frame's mesh
+               <out>/<sim>/meshes/key_frames.txt  step and time of those three
              then deletes <out>/frames unless --keep-frames.
 
 Each object (label) has its own color, fixed for the whole simulation. The
@@ -125,6 +126,20 @@ def read_times(sim_dir):
     return times
 
 
+def frame_number(name):
+    return int(name[len("frame_"):-len(".ply")])
+
+
+def midway_index(files, times):
+    """Index in @a files of the frame whose time is nearest the middle of the
+    simulated interval; the middle frame when the times are unknown."""
+    known = [(i, times[frame_number(f)]) for i, f in enumerate(files) if frame_number(f) in times]
+    if len(known) < 2:
+        return len(files) // 2
+    half = 0.5 * (known[0][1] + known[-1][1])
+    return min(known, key=lambda it: abs(it[1] - half))[0]
+
+
 class VideoWriter:
     """Streams raw RGB frames to ffmpeg. Output goes through a pipe because a
     snap-packaged ffmpeg cannot open files outside $HOME."""
@@ -168,9 +183,13 @@ def render_sim(sim_dir, out_dir, fps):
     os.makedirs(png_dir)
     os.makedirs(mesh_dir)
 
-    # initial / midway / final meshes, copied as written by the test
-    for key, idx in zip(KEY_FRAMES, (0, len(files) // 2, len(files) - 1)):
-        shutil.copyfile(os.path.join(sim_dir, files[idx]), os.path.join(mesh_dir, key + ".ply"))
+    # initial / midway / final meshes, copied as written by the test; midway
+    # is the frame nearest half the simulated time (steps are not uniform)
+    with open(os.path.join(mesh_dir, "key_frames.txt"), "w") as log:
+        for key, idx in zip(KEY_FRAMES, (0, midway_index(files, times), len(files) - 1)):
+            shutil.copyfile(os.path.join(sim_dir, files[idx]), os.path.join(mesh_dir, key + ".ply"))
+            t = times.get(frame_number(files[idx]))
+            log.write(f"{key} step {idx} t {'unknown' if t is None else f'{t:.6g}'}\n")
 
     # fixed camera: union of the bounds of all frames; legend of all labels
     lo = np.full(3, np.inf)
@@ -218,7 +237,7 @@ def render_sim(sim_dir, out_dir, fps):
                                      show_scalar_bar=False, specular=0.3)
         if text is not None:
             pl.remove_actor(text, render=False)
-        frame = int(name[len("frame_"):-len(".ply")])
+        frame = frame_number(name)
         t = f"   t = {times[frame]:.3f}" if frame in times else ""
         text = pl.add_text(f"{sim}   step {n}/{len(files) - 1}{t}", position="upper_left",
                            font_size=TITLE_FONT_SIZE, color="black")
