@@ -148,23 +148,32 @@ public:
     }
 
     /// Same loop as the base class advect(), stepping through this->step().
+    /// With an interrupter it runs the base class advect() unchanged (whose
+    /// interrupter checks depend on state private to the base class) and
+    /// dumps only the states before and after it.
     size_t advect(double t0, double t1)
     {
         if (!frameDir()) return Base::advect(t0, t1);
-        if (mInterrupter) mInterrupter->start("Evolving multi-object level set");
+        if (mInterrupter) {
+            if (mFrame == 0) {
+                this->setTime(t0);
+                this->dump();
+            }
+            const size_t n = Base::advect(t0, t1);
+            if (n > 0) this->dump();
+            return n;
+        }
         size_t n = 0;
         double t = t0;
         const double eps = openvdb::tools::lsmo_internal::kAdvectTimeRelativeEpsilon
             * std::max(1.0, std::abs(t1));
         while (t1 - t > eps) {
-            if (openvdb::util::wasInterrupted(mInterrupter)) break;
             this->setTime(t);
             const float dt = this->step(float(t1 - t));
             if (!(dt > 0.0f)) break;
             t += dt;
             ++n;
         }
-        if (mInterrupter) mInterrupter->end();
         return n;
     }
 
