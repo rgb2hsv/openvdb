@@ -5076,6 +5076,86 @@ TEST_F(TestLevelSetMultiObject, FullVoxelMotion)
 }
 
 
+namespace {
+
+// Two spheres side by side (labels 1 and 2) and a small one (label 3)
+// above them, half width 3.
+MLS::Ptr
+makeEditScene()
+{
+    std::map<int32_t, FloatGrid::ConstPtr> in;
+    in[1] = tools::createLevelSetSphere<FloatGrid>(7.0f, Vec3f(-6.0f, 0.0f, 0.0f), 1.0f, 3.0f);
+    in[2] = tools::createLevelSetSphere<FloatGrid>(7.0f, Vec3f(6.0f, 0.0f, 0.0f), 1.0f, 3.0f);
+    in[3] = tools::createLevelSetSphere<FloatGrid>(4.0f, Vec3f(0.0f, 10.0f, 0.0f), 1.0f, 3.0f);
+    return MLS::fromSignedGrids(in, 3);
+}
+
+// External edits of @a m: dilate the band by one voxel and rename label
+// @a from to @a to (every voxel and tile, active or not).
+void
+editExternally(MLS& m, int32_t from, int32_t to)
+{
+    m.dilate(1);
+    using LabelT = LabelTree::ValueType;
+    for (auto it = m.labels()->tree().beginValueAll(); it; ++it) {
+        if (*it == LabelT(from)) it.setValue(LabelT(to));
+    }
+}
+
+} // anonymous namespace
+
+TEST_F(TestLevelSetMultiObject, ExternalEditsMarked)
+{
+    // Edits of the pair between advect() calls (MultiLevelSet::dilate() and
+    // a relabel) announced with markExternallyModified(): the next step
+    // re-solves the whole band, so builds with OPENVDB_ENABLE_ASSERTS do not
+    // abort in the dirty-region check, and the incremental run keeps
+    // matching a full-redistance run (labels identical, phi within the
+    // redistance tolerance, as in IncrementalRedistanceMatchesFull).
+    using Evolver = tools::LevelSetMultiObject<MLS, Forces>;
+    MLS::Ptr incr = makeEditScene(), full = makeEditScene();
+    const double dx = incr->voxelSize();
+    Forces forces;
+    forces.setAdvection(Vec3SGrid::create(Vec3s(0.5f, 0.25f, 0.0f)), 1.0f);
+    forces.setCurvatureWeight(0.2f);
+    Evolver ei(*incr, forces), ef(*full, forces);
+    ef.setFullRedistance(true);
+    constexpr double kChunk = 1.0;
+    constexpr int kChunks = 6;
+    for (int c = 0; c < kChunks; ++c) {
+        SCOPED_TRACE("chunk " + std::to_string(c));
+        if (c == 2 || c == 4) {
+            // a relabel after the first edit, back again after the second
+            const int32_t from = c == 2 ? 3 : 5, to = c == 2 ? 5 : 3;
+            editExternally(*incr, from, to);
+            editExternally(*full, from, to);
+            ei.markExternallyModified();
+            ef.markExternallyModified();
+        }
+        const double t0 = c * kChunk;
+        EXPECT_GT(ei.advect(t0, t0 + kChunk), size_t(0));
+        ef.advect(t0, t0 + kChunk);
+        std::string msg;
+        EXPECT_TRUE(incr->validate(&msg)) << msg;
+        Index64 overlaps = 0, badCover = 0;
+        partitionErrors(*incr, overlaps, badCover);
+        EXPECT_EQ(overlaps, Index64(0));
+        EXPECT_EQ(badCover, Index64(0));
+        EXPECT_EQ(treeDifferences(full->labels()->tree(), incr->labels()->tree()), Index64(0));
+        ASSERT_TRUE(full->phi()->tree().hasSameTopology(incr->phi()->tree()));
+        double maxDiff = 0.0;
+        tree::ValueAccessor<const FloatTree> acc(incr->phi()->tree());
+        for (auto it = full->phi()->tree().cbeginValueOn(); it; ++it) {
+            maxDiff = std::max(maxDiff, std::abs(double(*it) - double(acc.getValue(it.getCoord()))));
+        }
+        EXPECT_LE(maxDiff, 1e-4 * dx);
+        const std::vector<int32_t> expected = (c >= 2 && c < 4)
+            ? std::vector<int32_t>{1, 2, 5} : std::vector<int32_t>{1, 2, 3};
+        EXPECT_EQ(incr->labelSet(), expected);
+    }
+}
+
+
 ////////////////////////////////////////
 // Step benchmark (informational: prints only, asserts nothing about time).
 

@@ -2981,10 +2981,14 @@ inline bool isSimplePoint(uint32_t inMask, MultiObjectConnectivity conn)
 ///    every change of the frozen set records its voxels, and only the
 ///    leaves within halfWidth + 1 voxels of a recorded voxel are re-solved;
 ///    the others keep their values as Dirichlet data. This assumes that
-///    only the evolver changes the pair between steps; the first step, and the first after
-///    a change of the topology-preserving or kinematic labels, the phi
-///    floor or the tolerance, re-solve the whole band, as does every step
-///    with setFullRedistance(true).
+///    only the evolver changes the pair between steps: after editing the
+///    pair otherwise (e.g. MultiLevelSet::dilate(), relabeling or inserting
+///    voxels between advect() calls) call markExternallyModified(), else
+///    the edits are not re-solved (and builds with OPENVDB_ENABLE_ASSERTS
+///    abort on the next step). The first step, and the first after
+///    markExternallyModified() or a change of the topology-preserving or
+///    kinematic labels, the phi floor or the tolerance, re-solve the whole
+///    band, as does every step with setFullRedistance(true).
 ///    The halfWidth + 1 region is a heuristic, not a proof of equivalence:
 ///    the Jacobi update only lowers values while its second-order upwind
 ///    term can raise a value when a neighbor drops, so a converged result
@@ -3258,6 +3262,13 @@ public:
     /// 1e-2*dx beyond; true makes the result exact.
     void setFullRedistance(bool on) { mFullRedistance = on; }
     bool fullRedistance() const { return mFullRedistance; }
+    /// @brief Declare that the pair was changed by something other than this
+    /// evolver since its last step (e.g. MultiLevelSet::dilate() or a
+    /// relabel between advect() calls): the next step re-solves the whole
+    /// band instead of only the leaves near its own changes. Incremental
+    /// redistancing (see setFullRedistance()) assumes otherwise, and builds
+    /// with OPENVDB_ENABLE_ASSERTS abort on a step after unannounced edits.
+    void markExternallyModified() { mPrimed = false; }
     /// @brief Spatial scheme of the stencils given to the speed functor,
     /// i.e. of LabelAwareStencil::upwindDifferences(): math::HJWENO5_BIAS
     /// (the default; needs halfWidth() >= 3) or math::FIRST_BIAS.
@@ -3516,6 +3527,8 @@ public:
     /// @brief One step of at most @a maxDt (world time), unsplit or
     /// Strang-split, each update forward Euler or TVD-RK2 (see the class
     /// documentation).
+    /// Only this evolver may change the pair between steps unless
+    /// markExternallyModified() is called after the external edits.
     /// @return the time step taken; min(@a maxDt, speed.stableDt) without
     /// changes if nothing can move, 0 if @a maxDt <= 0; less than the step
     /// if a split step was interrupted (see the class documentation).
@@ -3524,7 +3537,8 @@ public:
     /// @brief Step from @a t0 to @a t1, checking the interrupter before each
     /// step (and within split steps). On interrupt the state after the last
     /// completed step or sub-update is kept (it is valid) and time() is the
-    /// time reached.
+    /// time reached. Call markExternallyModified() before advect() if the
+    /// pair was edited since the last step by anything but this evolver.
     /// @return the number of steps taken.
     size_t advect(double t0, double t1)
     {
